@@ -29,3 +29,24 @@ S2–S5, S7, S9–S14 and HW1: pending (mission plan §7.2).
 | S8 | 31/31 | 405.00 s | 754.00 s | 4.70 ms | 5.86 ms | 5.98 ms | 0.391 |
 
 Baseline chrony: **PENDING** — needs the Linux rig (`.github/workflows/corpus.yml`); the sim-harness arm above measures rusty_time only and is comparable across commits, not across implementations.
+
+## Rig validation — clknetsim interception for Rust binaries (M2 open item): CLOSED
+
+Two-node clknetsim world (chronyd `local stratum 1` serving; rtimed one-shot
+querying; node 2 configured 50 ms ahead at +20 ppm): rtimed measured offset
+-0.0500 s on 6/6 exchanges and regression frequency -20.4 ppm — configured
+values recovered inside fully simulated time. Reproduce:
+`tools/corpus/wsl_interception_probe.sh`.
+
+Two findings, both required:
+1. clknetsim's socket() hook exact-matches the socket type; Rust std passes
+   SOCK_DGRAM|SOCK_CLOEXEC and got EINVAL. Rig-only one-line mask:
+   `tools/corpus/patch_clknetsim_rust_sockets.sh`.
+2. clknetsim advances simulated time while a client blocks in poll/select; a
+   plain blocking recv returns EWOULDBLOCK forever. rtimed now readiness-polls
+   before every receive (`rusty_time_clock::net::wait_readable`) — the shape
+   the M3 event loop needs regardless.
+
+Consequence: the cross-implementation baseline arm (rusty_time vs chrony vs
+ntpd-rs under identical simulated worlds) is viable. chrony's own 001-defaults
+simulation test PASSes on the same rig.

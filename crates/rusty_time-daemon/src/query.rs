@@ -189,8 +189,21 @@ fn measure(opts: &Options) -> Result<QueryReport, String> {
         }
         report.sent += 1;
 
-        // Read until our answer or timeout: a stray datagram must not abort the run.
+        // Read until our answer or the deadline: a stray datagram must not abort
+        // the run. Readiness-poll before each recv — that is where simulated
+        // time advances under a virtual-time rig (clknetsim), and where the M3
+        // event loop will live (see rusty_time_clock::net).
+        let deadline = std::time::Instant::now() + Duration::from_millis(opts.timeout_ms.max(1));
         let response = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            match rusty_time_clock::net::wait_readable(&socket, remaining) {
+                Ok(true) => {}
+                Ok(false) => break None, // timeout
+                Err(_) => break None,
+            }
             match socket.recv(&mut buf) {
                 Ok(n) if n >= HEADER_LEN => {
                     match NtpPacket::parse(&buf[..n]) {
@@ -202,7 +215,13 @@ fn measure(opts: &Options) -> Result<QueryReport, String> {
                     }
                 }
                 Ok(_) => continue,
-                Err(_) => break None, // timeout
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue; // readiness raced; re-poll until the deadline
+                }
+                Err(_) => break None,
             }
         };
         let Some(packet) = response else { continue };

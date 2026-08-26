@@ -60,3 +60,6 @@ pub use windows::SystemClock;
 
 mod virtual_driver;
 pub use virtual_driver::VirtualDriver;
+
+#[cfg(any(unix, windows))]
+pub mod net;

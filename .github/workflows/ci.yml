@@ -71,6 +71,34 @@ jobs:
           CHRONY_DIR=~/chrony RTIMED=~/rt-target/release/rtimed \
             bash tools/corpus/nts_interop_chrony.sh
 
+  # M4 gate: chronyd must sync from us over plain NTP and in interleaved mode,
+  # with sane offset and delay — not merely negotiate the mode.
+  m4-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build chrony
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison
+          git clone --depth 1 https://gitlab.com/chrony/chrony ~/chrony
+          cd ~/chrony && ./configure && make -j"$(nproc)"
+      - name: Build rtimed + rtimec
+        run: CARGO_TARGET_DIR=~/rt-target cargo build --release -p rusty_time-daemon -p rusty_time-ctl
+      - name: chronyd syncs from rusty_time (plain + interleaved)
+        run: |
+          CHRONY_DIR=~/chrony RTIMED=~/rt-target/release/rtimed \
+            RTIMEC=~/rt-target/release/rtimec \
+            bash tools/corpus/m4_interop_chrony.sh
+
+  # S12: deterministic server-load counts. Fast, and it has caught real
+  # defects (see corpus/LEDGER.md).
+  server-load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo run --release -p rusty_time-sim -- serverload
+
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:

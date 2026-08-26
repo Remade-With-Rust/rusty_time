@@ -96,3 +96,71 @@ property master-key persistence exists to provide.
 
 No performance claim is made here; this block records correctness and interop
 only. chrony BD-style performance comparison remains PENDING the Linux rig.
+
+## M4 — server hardening, interleaved mode, control plane
+
+### TIMECORP S12 — server load (deterministic counts, `timecorp serverload`)
+
+Poisson arrivals driving the real admission policy. Counts, not durations: no
+pinning, no noise floor, exactly reproducible per seed.
+
+| scen | requests | answered | dropped | kissed | evicted | tracked | reply |
+|---|---|---|---|---|---|---|---|
+| S12a 1k clients @ 1k/s | 59635 | 14891 | 33936 | 10808 | 0 | 1000 | 43.1% |
+| S12b 100k clients @ 50k/s | 2999484 | 1239999 | 1319614 | 439871 | 1021672 | 16384 | 56.0% |
+| S12c 1 flooder + 1k clients @ 5k/s | 300279 | 14562 | 214683 | 71034 | 0 | 1000 | 28.5% |
+
+Client-table state: **104 bytes/client**, capacity 16384 => **1.6 MiB** worst case.
+Reply ratio is always < 100%: the server answers less than it is asked, which
+is the property that stops it being a reflector. Response size is also always
+<= request size (asserted in tests), so it is never an amplifier.
+
+### M4 exit gate — chronyd syncs from rusty_time: PASS
+
+`tools/corpus/m4_interop_chrony.sh`, both plain and interleaved:
+
+| mode | chrony verdict | offset | peer delay |
+|---|---|---|---|
+| plain NTP | `^*` selected, NTP tests 111 111 1111 | -4.8 us | 116 us |
+| interleaved (`xleave`) | `^*` selected, `Interleaved: Yes` | **-66 ns** | **79.6 us** |
+
+Interleaved measures better than basic, which is the entire point of the mode:
+its transmit timestamp is read after the packet is actually sent.
+
+ntpd-rs as a second client implementation: **not yet run** (pending).
+
+### Four defects this milestone found
+
+1. **The rate limiter was keyed on (address, port).** The source port is chosen
+   by the sender, so anyone could refill their bucket with a new ephemeral
+   port. Caught live: 12 requests from 3 short-lived client processes produced
+   0 drops against a burst of 8, and the client table showed 3 clients for one
+   host. Now keyed on address only, as chrony does.
+2. **Per-client limiting is defeated by table churn.** S12b (100k addresses,
+   16k table) showed the reply ratio climbing back to **100%** — every request
+   arrives from a forgotten address with a fresh bucket. Fixed with a global
+   token-bucket ceiling; S12b now sits at 56%.
+3. **Eviction was an O(capacity) scan**, so a server facing more addresses than
+   its table holds evicted on nearly every packet. S12b did not finish. Now an
+   indexed true-LRU (BTreeSet), O(log n) and deterministic — a 200k-client
+   churn test runs in 0.7 s.
+4. **Interleaved mode had two silent field errors.** The reply must echo the
+   request's *receive* field as origin (not transmit), and must report the
+   *current* receive timestamp (not the previous one). Each wrong field still
+   produced a well-formed, accepted packet: chrony reported a plausible
+   `Interleaved: Yes` while computing an offset of **+362 ms** and a peer delay
+   of **4.009 s** — exactly one poll interval, the signature of timestamps
+   paired across different exchanges.
+
+### And one defect in the gate itself
+
+The first version of the M4 interop gate **passed** while chrony was measuring
+that 362 ms error, because it only asserted `Interleaved: Yes` and `^*`. A time
+server that answers in the right shape but the wrong time has failed. The gate
+now asserts |offset| < 10 ms and delay < 10 ms in both modes, which is what
+caught the fix working.
+
+Also fixed: `ControlResponse::Clients(Vec<..>)` could not serialize at all —
+serde's internally-tagged enums reject a newtype variant wrapping a sequence,
+so the op worked in-process and returned an empty reply over the socket. Now a
+struct variant, with serialization asserted in the test.

@@ -5,6 +5,7 @@
 //! network. The resident daemon loop (discipline against the platform driver,
 //! control socket, server mode) lands across M3–M5.
 
+mod control;
 mod nts_session;
 mod query;
 mod server;

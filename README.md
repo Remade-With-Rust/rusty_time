@@ -12,16 +12,19 @@ with the run that produced it. The corpus (TIMECORP) measures rusty_time against
 
 ## Status
 
-Pre-1.0, milestone **M3** of the mission plan complete: workspace scaffold, NTPv4
-packet codec, regression sample filter, source selection, discipline loop, the
-deterministic TIMECORP simulation harness, and **NTS (RFC 8915) client and
-server** with SpaceDB-backed persistence.
+Pre-1.0, milestone **M4** of the mission plan complete: NTPv4 codec, regression
+sample filter, source selection, discipline loop, the deterministic TIMECORP
+harness, **NTS (RFC 8915) client and server** with SpaceDB-backed persistence,
+and a hardened server — per-client and global rate limiting with Kiss-o'-Death,
+**interleaved mode** (RFC 9769), `recvmmsg` batching on Linux, and an ops
+control plane driven by `rtimec`.
 
-NTS interop passes in both directions — `rtimed` authenticates against chronyd
-and time.cloudflare.com, and chronyd selects an `rtimed` server as its
-synchronisation source (see [corpus/LEDGER.md](corpus/LEDGER.md)). TLS is rustls
-on a pure-Rust crypto provider; nothing in the build needs a C toolchain, on any
-of the eight supported targets.
+Interop is verified against chrony in both directions and both modes
+(see [corpus/LEDGER.md](corpus/LEDGER.md)): chronyd selects an `rtimed` server
+as its synchronisation source over plain NTP, over NTS, and in interleaved
+mode, where it measures a **−66 ns** offset. TLS is rustls on a pure-Rust
+crypto provider; nothing in the build needs a C toolchain, on any of the eight
+supported targets.
 
 ```sh
 # Authenticated query
@@ -29,6 +32,10 @@ rtimed query time.cloudflare.com --nts
 
 # Run an NTS-capable server (self-signs a dev certificate if none is given)
 rtimed serve --nts --state /var/lib/rusty_time/state.spacedb
+
+# Ask it what it is doing
+rtimec serverstats
+rtimec clients 20
 ```
 
 ## Layout

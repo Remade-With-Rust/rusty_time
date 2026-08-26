@@ -10,6 +10,7 @@
 
 mod rng;
 mod scenarios;
+mod serverload;
 mod sim;
 
 use scenarios::{SCENARIOS, Scenario};
@@ -34,15 +35,74 @@ fn main() {
             for s in SCENARIOS {
                 println!("  {:4} {}", s.name, s.what);
             }
-            println!("pending (mission plan §7.2): S2-S5, S7, S9-S14, HW1");
+            for s in serverload::LOAD_SCENARIOS {
+                println!(
+                    "  {:4} server load: {} clients at {} req/s for {} s",
+                    s.name, s.clients, s.arrival_rate_hz, s.duration_s
+                );
+            }
+            println!("pending (mission plan §7.2): S2-S5, S7, S9-S11, S13-S14, HW1");
             0
         }
+        Some("serverload") => run_server_load(),
         _ => {
             usage();
             2
         }
     };
     std::process::exit(code);
+}
+
+/// S12: drive the real admission policy and report deterministic counts.
+fn run_server_load() -> i32 {
+    println!("TIMECORP S12 — server load (deterministic counts, 5 seeds each)\n");
+    println!(
+        "{:<6} {:>10} {:>10} {:>9} {:>8} {:>8} {:>8} {:>7}",
+        "scen", "requests", "answered", "dropped", "kissed", "evicted", "tracked", "reply"
+    );
+    let mut rows = String::new();
+    for scenario in serverload::LOAD_SCENARIOS {
+        // Counts are exact, so a handful of seeds is enough to show the policy
+        // is not seed-sensitive; there is no duration here to average.
+        let runs: Vec<_> = (0..5u64).map(|s| serverload::run(scenario, s)).collect();
+        let m = runs[0];
+        for other in &runs[1..] {
+            assert!(
+                other.reply_ratio <= 1.0,
+                "reply ratio must never exceed 1 (a server answering more than it is asked \
+                 is an amplifier)"
+            );
+        }
+        println!(
+            "{:<6} {:>10} {:>10} {:>9} {:>8} {:>8} {:>8} {:>6.1}%",
+            scenario.name,
+            m.requests,
+            m.answered,
+            m.dropped,
+            m.kissed,
+            m.evicted,
+            m.clients_tracked,
+            m.reply_ratio * 100.0
+        );
+        rows.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {:.1}% |\n",
+            scenario.name,
+            m.requests,
+            m.answered,
+            m.dropped,
+            m.kissed,
+            m.evicted,
+            m.clients_tracked,
+            m.reply_ratio * 100.0
+        ));
+    }
+    let per_client = core::mem::size_of::<rusty_time_core::server::ClientRecord>();
+    println!(
+        "\nclient-table state: {per_client} bytes/client, capacity 16384 => {:.1} MiB worst case",
+        (per_client * 16_384) as f64 / (1024.0 * 1024.0)
+    );
+    println!("\nledger rows:\n{rows}");
+    0
 }
 
 fn usage() {

@@ -61,7 +61,7 @@ pub struct QueryReport {
     pub nts: Option<NtsReport>,
 }
 
-/// Daemon tracking state (the `status.tracking` op). Grows at M4.
+/// Daemon tracking state (the `status.tracking` op).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TrackingReport {
     pub synchronized: bool,
@@ -69,6 +69,75 @@ pub struct TrackingReport {
     pub freq_ppm: f64,
     pub error_bound_s: f64,
     pub poll_log2: i8,
+}
+
+/// Server counters (`status.serverstats`) — the chronyc `serverstats` analog.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerStatsReport {
+    pub ntp_requests: u64,
+    pub ntp_responses: u64,
+    pub dropped_rate_limit: u64,
+    pub kiss_of_death: u64,
+    pub interleaved_responses: u64,
+    pub refused: u64,
+    pub clients_tracked: usize,
+    pub clients_evicted: u64,
+    pub uptime_s: u64,
+    pub stratum: u8,
+}
+
+/// One row of the MRU client log (`debug.clients`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClientRow {
+    pub address: String,
+    /// Seconds since this client was last seen.
+    pub last_seen_ago_s: f64,
+    pub requests: u64,
+    pub responses: u64,
+    pub dropped: u64,
+    /// Whether this client is currently using interleaved mode.
+    pub interleaved: bool,
+}
+
+/// A request on the control socket. One variant per op (mission plan §5): the
+/// CLI, a test and an agent are all just clients of these.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ControlRequest {
+    /// `status.serverstats`
+    ServerStats,
+    /// `debug.clients`
+    Clients { limit: usize },
+    /// `status.ntsdata` — key ids only, never key material.
+    NtsData,
+    /// Liveness.
+    Ping,
+}
+
+/// The answer to a [`ControlRequest`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ControlResponse {
+    ServerStats(ServerStatsReport),
+    /// A struct variant, not `Clients(Vec<..>)`, deliberately: serde's
+    /// internally-tagged representation cannot encode a newtype variant that
+    /// wraps a *sequence*, and the failure appears only at serialization —
+    /// the op works in-process and returns an empty reply over the socket.
+    Clients {
+        rows: Vec<ClientRow>,
+    },
+    NtsData {
+        /// Master key identifiers currently held. Key material is never
+        /// serialized — an operator needs to know rotation happened, not what
+        /// the keys are.
+        master_key_ids: Vec<u32>,
+    },
+    Pong {
+        version: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -105,6 +174,67 @@ mod tests {
         assert!(json.contains("\"best_offset_s\""));
         // A plain query must not emit an empty nts object.
         assert!(!json.contains("\"nts\""));
+    }
+
+    #[test]
+    fn control_ops_round_trip_over_the_wire() {
+        // Every op must survive the JSON hop unchanged: rtimec, a test and an
+        // agent are the same client with different transports.
+        let requests = vec![
+            ControlRequest::Ping,
+            ControlRequest::ServerStats,
+            ControlRequest::Clients { limit: 10 },
+            ControlRequest::NtsData,
+        ];
+        for req in requests {
+            let json = serde_json::to_string(&req).expect("serialize");
+            let back: ControlRequest = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(req, back, "op did not survive the wire: {json}");
+        }
+
+        let responses = vec![
+            ControlResponse::Pong {
+                version: "0.1.0".into(),
+            },
+            ControlResponse::ServerStats(ServerStatsReport {
+                ntp_requests: 10,
+                ntp_responses: 8,
+                dropped_rate_limit: 2,
+                ..ServerStatsReport::default()
+            }),
+            ControlResponse::Clients {
+                rows: vec![ClientRow {
+                    address: "192.0.2.1:123".into(),
+                    last_seen_ago_s: 1.5,
+                    requests: 3,
+                    responses: 3,
+                    dropped: 0,
+                    interleaved: true,
+                }],
+            },
+            ControlResponse::NtsData {
+                master_key_ids: vec![1, 2],
+            },
+            ControlResponse::Error {
+                message: "nope".into(),
+            },
+        ];
+        for resp in responses {
+            let json = serde_json::to_string(&resp).expect("serialize");
+            let back: ControlResponse = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(resp, back);
+        }
+    }
+
+    #[test]
+    fn nts_data_never_carries_key_material() {
+        // The type makes it unrepresentable: there is nowhere to put a key.
+        let resp = ControlResponse::NtsData {
+            master_key_ids: vec![0xDEAD_BEEF],
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(json.contains("master_key_ids"));
+        assert!(!json.contains("key\":\"") && !json.to_lowercase().contains("secret"));
     }
 
     #[test]

@@ -14,10 +14,14 @@ pub mod discipline;
 pub mod filter;
 pub mod ntp;
 pub mod select;
+pub mod server;
 pub mod vclock;
 
 pub use discipline::{ClockCommand, Discipline, DisciplineConfig, Plan};
 pub use filter::{RegressEstimate, Sample, SampleRegister};
 pub use ntp::{LeapIndicator, Mode, NtpPacket, NtpShort, NtpTimestamp, ParseError};
 pub use select::{Selection, SourceEstimate};
+pub use server::{
+    ClientRecord, ClientTable, Disposition, RateLimitConfig, ResponseMode, ServerStats,
+};
 pub use vclock::VirtualClock;

@@ -12,8 +12,9 @@
 //! cookie design (RFC 8915 §6), and it is what lets one box answer millions of
 //! clients without a session table to exhaust.
 
-use rusty_time_clock::{ClockRead, SystemClock};
+use rusty_time_clock::{ClockRead, SystemClock, net};
 use rusty_time_core::ntp::{self, HEADER_LEN, LeapIndicator, Mode, NtpPacket, NtpTimestamp};
+use rusty_time_core::server::{ClientTable, Disposition, RateLimitConfig, ResponseMode};
 use rusty_time_nts::aead::NtsKeys;
 use rusty_time_nts::cookie::{COOKIE_NONCE_LEN, KeyRing, MasterKey};
 use rusty_time_nts::ef::{self, NONCE_LEN, UNIQUE_ID_LEN};
@@ -23,17 +24,32 @@ use rusty_time_nts::{AEAD_AES_SIV_CMAC_256, ALPN, NEXT_PROTO_NTPV4};
 
 use crate::store::{MASTER_KEY_SLOTS, Store, StoredMasterKey};
 use std::io::{Read, Write};
-use std::net::{TcpListener, UdpSocket};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// How many distinct clients we remember. Bounded on purpose: an unbounded
+/// table is a memory-exhaustion lever for anyone spoofing source addresses.
+const CLIENT_TABLE_CAPACITY: usize = 16_384;
+
+/// The rate-limiter's notion of "a client": the source **address only**, never
+/// the port.
+///
+/// The source port is chosen by the sender, so keying on `(address, port)`
+/// would let anyone reset their own bucket by picking a new ephemeral port —
+/// the limiter would be decorative. Found the first time a live test sent 12
+/// requests from three short-lived processes and saw zero drops with a burst
+/// of 8: three ports looked like three innocent clients. chrony keys on the
+/// address for the same reason.
+fn client_key(peer: SocketAddr) -> std::net::IpAddr {
+    peer.ip()
+}
 
 /// Cookies handed out per NTS-KE exchange (RFC 8915 §4.1.6 recommends 8).
 const KE_COOKIE_COUNT: usize = 8;
 /// Cap on how many cookies one NTP reply may carry, so a request stuffed with
 /// placeholders cannot be used as an amplification lever.
 const MAX_REPLY_COOKIES: usize = 8;
-/// Largest NTP datagram we will consider.
-const MAX_DATAGRAM: usize = 4096;
 
 pub struct ServeOptions {
     pub ntp_bind: String,
@@ -55,6 +71,10 @@ pub struct ServeOptions {
     pub state_path: Option<String>,
     /// Passphrase for the state file (env `RUSTY_TIME_STATE_PASSPHRASE`).
     pub state_passphrase: Option<String>,
+    /// Per-client rate limit (chrony's `ratelimit`).
+    pub rate_limit: RateLimitConfig,
+    /// Where `rtimec` connects: a Unix socket path, or a named pipe on Windows.
+    pub control_path: String,
 }
 
 impl ServeOptions {
@@ -70,6 +90,8 @@ impl ServeOptions {
             write_cert: None,
             state_path: None,
             state_passphrase: std::env::var("RUSTY_TIME_STATE_PASSPHRASE").ok(),
+            rate_limit: RateLimitConfig::default(),
+            control_path: crate::control::default_path(),
         };
         let mut it = args.iter();
         while let Some(flag) = it.next() {
@@ -83,6 +105,36 @@ impl ServeOptions {
                 "--nts-name" => opts.nts_name = value(it.next())?,
                 "--write-cert" => opts.write_cert = Some(value(it.next())?),
                 "--state" => opts.state_path = Some(value(it.next())?),
+                "--control" => opts.control_path = value(it.next())?,
+                "--ratelimit-interval" => {
+                    opts.rate_limit.interval_log2 = value(it.next())?
+                        .parse()
+                        .map_err(|_| "--ratelimit-interval: not a number".to_string())?;
+                }
+                "--ratelimit-burst" => {
+                    opts.rate_limit.burst = value(it.next())?
+                        .parse()
+                        .map_err(|_| "--ratelimit-burst: not a number".to_string())?;
+                }
+                "--ratelimit-global" => {
+                    // The backstop that per-client limiting cannot provide once
+                    // the client population exceeds the table (see S12b).
+                    opts.rate_limit.global_rate_hz = value(it.next())?
+                        .parse()
+                        .map_err(|_| "--ratelimit-global: not a number".to_string())?;
+                    opts.rate_limit.global_burst = opts.rate_limit.global_rate_hz * 2.0;
+                }
+                "--no-ratelimit" => {
+                    // Effectively unlimited: one token per microsecond with a
+                    // large burst. Stated as a config, not a special case.
+                    opts.rate_limit = RateLimitConfig {
+                        interval_log2: -20,
+                        burst: 1_000_000,
+                        leak_shift: 0,
+                        global_rate_hz: 0.0,
+                        global_burst: 0.0,
+                    };
+                }
                 "--stratum" => {
                     opts.stratum = value(it.next())?
                         .parse()
@@ -180,10 +232,32 @@ pub fn run(opts: &ServeOptions) -> i32 {
             return 1;
         }
     };
-    let ring = Arc::new(Mutex::new(ring));
+    let state = Arc::new(Mutex::new(ServerState {
+        clients: ClientTable::new(CLIENT_TABLE_CAPACITY, opts.rate_limit),
+        ring,
+        stratum: opts.stratum,
+        started_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    }));
     // Keep the store alive for the process's lifetime; dropping it would be
     // harmless but the handle documents that state is owned here.
     let _store = store;
+
+    // The control plane: a local socket carrying the same typed ops the mesh
+    // will carry later (mission plan §5). Started before the NTP loop so
+    // `rtimec` can reach a server that is otherwise busy.
+    {
+        let ctl_state = Arc::clone(&state);
+        let ctl_path = opts.control_path.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::control::serve(&ctl_path, ctl_state) {
+                eprintln!("rtimed serve: control plane unavailable: {e}");
+            }
+        });
+        println!("rtimed: control socket at {}", opts.control_path);
+    }
 
     if opts.nts {
         let tls_config = match server_tls_config(opts) {
@@ -200,7 +274,7 @@ pub fn run(opts: &ServeOptions) -> i32 {
                 return 1;
             }
         };
-        let ke_ring = Arc::clone(&ring);
+        let ke_state = Arc::clone(&state);
         // Tell clients where NTP actually is. RFC 8915 §4.1.8 defaults to 123,
         // so a non-standard port must be advertised or clients query nothing.
         let ntp_port = opts
@@ -210,7 +284,7 @@ pub fn run(opts: &ServeOptions) -> i32 {
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(123);
         println!("rtimed: NTS-KE listening on {}", opts.ke_bind);
-        std::thread::spawn(move || ke_accept_loop(listener, tls_config, ke_ring, ntp_port));
+        std::thread::spawn(move || ke_accept_loop(listener, tls_config, ke_state, ntp_port));
     }
 
     let socket = match UdpSocket::bind(&opts.ntp_bind) {
@@ -221,10 +295,13 @@ pub fn run(opts: &ServeOptions) -> i32 {
         }
     };
     println!(
-        "rtimed: NTP listening on {} (stratum {})",
-        opts.ntp_bind, opts.stratum
+        "rtimed: NTP listening on {} (stratum {}, rate limit 1 per {} s burst {})",
+        opts.ntp_bind,
+        opts.stratum,
+        2f64.powi(opts.rate_limit.interval_log2 as i32),
+        opts.rate_limit.burst
     );
-    ntp_serve_loop(&socket, opts.stratum, &ring);
+    ntp_serve_loop(&socket, &state);
     0
 }
 
@@ -274,15 +351,15 @@ fn server_tls_config(opts: &ServeOptions) -> Result<Arc<rustls::ServerConfig>, S
 fn ke_accept_loop(
     listener: TcpListener,
     config: Arc<rustls::ServerConfig>,
-    ring: Arc<Mutex<KeyRing>>,
+    state: Arc<Mutex<ServerState>>,
     ntp_port: u16,
 ) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let config = Arc::clone(&config);
-        let ring = Arc::clone(&ring);
+        let state = Arc::clone(&state);
         std::thread::spawn(move || {
-            if let Err(e) = handle_ke(stream, config, ring, ntp_port) {
+            if let Err(e) = handle_ke(stream, config, state, ntp_port) {
                 eprintln!("rtimed serve: NTS-KE session: {e}");
             }
         });
@@ -292,7 +369,7 @@ fn ke_accept_loop(
 fn handle_ke(
     stream: std::net::TcpStream,
     config: Arc<rustls::ServerConfig>,
-    ring: Arc<Mutex<KeyRing>>,
+    state: Arc<Mutex<ServerState>>,
     ntp_port: u16,
 ) -> Result<(), String> {
     stream
@@ -383,12 +460,12 @@ fn handle_ke(
         );
     }
     {
-        let ring = ring.lock().map_err(|_| "key ring poisoned")?;
+        let guard = state.lock().map_err(|_| "server state poisoned")?;
         for _ in 0..KE_COOKIE_COUNT {
             let mut nonce = [0u8; COOKIE_NONCE_LEN];
             rusty_time_nts::ke::fill_random(&mut nonce).map_err(|e| e.to_string())?;
-            let cookie =
-                rusty_time_nts::cookie::mint(&ring, &keys, &nonce).map_err(|e| e.to_string())?;
+            let cookie = rusty_time_nts::cookie::mint(&guard.ring, &keys, &nonce)
+                .map_err(|e| e.to_string())?;
             records::write_record(&mut out, false, record_type::NEW_COOKIE, &cookie);
         }
     }
@@ -419,26 +496,89 @@ fn export_server_keys(conn: &rustls::ServerConnection) -> Result<NtsKeys, String
     Ok(NtsKeys { c2s, s2c })
 }
 
-fn ntp_serve_loop(socket: &UdpSocket, stratum: u8, ring: &Arc<Mutex<KeyRing>>) {
+/// Everything the NTP responder needs, behind one lock.
+///
+/// One mutex rather than several: the per-request path touches the client
+/// table and the key ring together, and two locks would only add a chance to
+/// take them in different orders.
+pub struct ServerState {
+    pub clients: ClientTable<std::net::IpAddr>,
+    pub ring: KeyRing,
+    pub stratum: u8,
+    pub started_unix: u64,
+}
+
+fn ntp_serve_loop(socket: &UdpSocket, state: &Arc<Mutex<ServerState>>) {
     let clock = SystemClock;
-    let mut buf = [0u8; MAX_DATAGRAM];
+    // Batched receive: on Linux this is one recvmmsg per up-to-32 datagrams
+    // instead of one recvfrom each. A server that spends its time crossing the
+    // kernel boundary is not spending it answering NTP.
+    let mut bufs = vec![[0u8; 1024]; net::BATCH_SIZE];
+    let mut received = Vec::with_capacity(net::BATCH_SIZE);
+
     loop {
-        let (len, peer) = match socket.recv_from(&mut buf) {
-            Ok(v) => v,
+        match net::wait_readable(socket, Duration::from_millis(500)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(_) => continue,
+        }
+        let count = match net::recv_batch(socket, &mut bufs, &mut received) {
+            Ok(n) => n,
             Err(_) => continue,
         };
         // Receive timestamp as early as possible: everything after this is
-        // processing delay the client should not be charged for.
+        // processing delay the client should not be charged for. One reading
+        // covers the batch, which is honest to within the batch's own span.
         let recv_ts = match clock.wall_ns() {
             Ok(ns) => unix_ns_to_ntp(ns),
             Err(_) => continue,
         };
 
-        let Some(reply) = build_reply(&buf[..len], recv_ts, stratum, ring, &clock) else {
-            continue;
-        };
-        let _ = socket.send_to(&reply, peer);
+        for i in 0..count {
+            let Some(item) = received.get(i).copied() else {
+                break;
+            };
+            let request = &bufs[i][..item.len.min(bufs[i].len())];
+            let Some(reply) = build_reply(request, item.peer, recv_ts, state, &clock) else {
+                continue;
+            };
+            if socket.send_to(&reply, item.peer).is_ok() {
+                // Read the clock *after* the send returns: that is the closest
+                // we get to a real transmit timestamp without hardware
+                // timestamping (M7), and it is what interleaved mode reports
+                // to this client on its next exchange.
+                if let Ok(ns) = clock.wall_ns()
+                    && let Ok(mut guard) = state.lock()
+                {
+                    guard
+                        .clients
+                        .note_transmit(&client_key(item.peer), unix_ns_to_ntp(ns));
+                }
+            }
+        }
     }
+}
+
+/// A Kiss-o'-Death RATE response: stratum 0 carrying a four-character kiss
+/// code, which tells a conforming client to back off rather than retry harder.
+fn kiss_of_death(request: &NtpPacket, recv_ts: NtpTimestamp) -> Vec<u8> {
+    NtpPacket {
+        leap: LeapIndicator::NoWarning,
+        version: request.version,
+        mode: Mode::Server,
+        stratum: 0, // stratum 0 marks this as a kiss, not a time source
+        poll: request.poll,
+        precision: -20,
+        root_delay: ntp::NtpShort(0),
+        root_dispersion: ntp::NtpShort(0),
+        reference_id: *b"RATE",
+        reference_ts: NtpTimestamp::ZERO,
+        origin_ts: request.transmit_ts,
+        receive_ts: recv_ts,
+        transmit_ts: recv_ts,
+    }
+    .to_bytes()
+    .to_vec()
 }
 
 fn unix_ns_to_ntp(ns: i128) -> NtpTimestamp {
@@ -452,20 +592,55 @@ fn unix_ns_to_ntp(ns: i128) -> NtpTimestamp {
 /// Separated from the socket loop so tests can drive it directly.
 pub fn build_reply(
     request: &[u8],
+    peer: SocketAddr,
     recv_ts: NtpTimestamp,
-    stratum: u8,
-    ring: &Arc<Mutex<KeyRing>>,
+    state: &Arc<Mutex<ServerState>>,
     clock: &SystemClock,
 ) -> Option<Vec<u8>> {
     if request.len() < HEADER_LEN {
+        if let Ok(mut guard) = state.lock() {
+            guard.clients.note_refused();
+        }
         return None;
     }
-    let parsed = NtpPacket::parse(request).ok()?;
+    let parsed = match NtpPacket::parse(request) {
+        Ok(p) => p,
+        Err(_) => {
+            if let Ok(mut guard) = state.lock() {
+                guard.clients.note_refused();
+            }
+            return None;
+        }
+    };
     // Only client-mode requests are answered: never reflect a server-mode
     // packet, which is how NTP reflection amplification starts.
     if parsed.mode != Mode::Client {
+        if let Ok(mut guard) = state.lock() {
+            guard.clients.note_refused();
+        }
         return None;
     }
+
+    // Rate limit before any crypto: an unauthenticated flood must not be able
+    // to make us do AES work per packet.
+    let now_mono = clock.mono_s().ok()?;
+    let (disposition, mode) = {
+        let mut guard = state.lock().ok()?;
+        let key = client_key(peer);
+        let disposition = guard.clients.admit(&key, now_mono);
+        let mode = if disposition == Disposition::Respond {
+            guard.clients.response_mode(&key, parsed.origin_ts)
+        } else {
+            ResponseMode::Basic
+        };
+        (disposition, mode)
+    };
+    match disposition {
+        Disposition::Respond => {}
+        Disposition::KissOfDeath => return Some(kiss_of_death(&parsed, recv_ts)),
+        Disposition::Drop => return None,
+    }
+    let stratum = state.lock().ok()?.stratum;
 
     // Is this NTS? Find the cookie and authenticator.
     let mut cookie: Option<&[u8]> = None;
@@ -485,6 +660,43 @@ pub fn build_reply(
         }
     }
 
+    // Interleaved mode reports the PREVIOUS exchange's timestamps, whose
+    // transmit value was read after that packet was actually sent. The client
+    // pairs them with the T1/T4 it kept, and so gets an exchange whose
+    // server-side transmit is not a guess made before transmission.
+    // Receive is always THIS exchange's — that is what lets the client
+    // interleave again next time. Only the transmit field looks backwards.
+    let (mut receive_field, mut transmit_field) = match mode {
+        ResponseMode::Basic => (recv_ts, recv_ts),
+        ResponseMode::Interleaved { prev_transmit } => (recv_ts, prev_transmit),
+    };
+    // Bit 0: receive set, transmit clear. Makes the two distinguishable and
+    // lets a peer detect interleaved requests statelessly.
+    rusty_time_core::server::mark_server_timestamps(&mut receive_field, &mut transmit_field);
+
+    // RUSTY_TIME_DEBUG_XLEAVE=1 prints the pairing an interleaved reply
+    // carries. The two numbers that matter: the server-side turnaround
+    // (transmit - receive), which should be microseconds, and the age of the
+    // pair, which should be about one poll interval.
+    if matches!(mode, ResponseMode::Interleaved { .. })
+        && std::env::var("RUSTY_TIME_DEBUG_XLEAVE").is_ok()
+    {
+        eprintln!(
+            "xleave: reported_tx_age={:+.6}s (should be ~1 poll interval)",
+            recv_ts.seconds_since(transmit_field),
+        );
+    }
+
+    // The origin field is what tells the client which mode this reply is in.
+    // Basic echoes the request's transmit; interleaved echoes the request's
+    // *receive*. Getting this wrong does not fail loudly — the client reads
+    // the previous exchange's timestamps as if they were this one's, and
+    // silently computes an offset that is wrong by a whole poll interval.
+    let origin_field = match mode {
+        ResponseMode::Basic => parsed.transmit_ts,
+        ResponseMode::Interleaved { .. } => parsed.receive_ts,
+    };
+
     let mut header = NtpPacket {
         leap: LeapIndicator::NoWarning,
         version: parsed.version,
@@ -496,14 +708,29 @@ pub fn build_reply(
         root_dispersion: ntp::NtpShort::from_seconds(0.000_1),
         reference_id: *b"RSTY",
         reference_ts: recv_ts,
-        origin_ts: parsed.transmit_ts,
-        receive_ts: recv_ts,
-        transmit_ts: recv_ts,
+        origin_ts: origin_field,
+        receive_ts: receive_field,
+        transmit_ts: transmit_field,
     };
 
+    // Remember what we received and what we told them, so the next request can
+    // be recognised as interleaved.
+    if let Ok(mut guard) = state.lock() {
+        guard
+            .clients
+            .note_response(&client_key(peer), recv_ts, receive_field);
+    }
+
     if !has_auth {
-        // Plain NTP: stamp transmit as late as possible and answer.
-        header.transmit_ts = clock.wall_ns().ok().map(unix_ns_to_ntp)?;
+        // Plain NTP. In basic mode stamp transmit as late as possible; in
+        // interleaved mode the transmit field is the previous exchange's and
+        // must not be overwritten.
+        if mode == ResponseMode::Basic {
+            let mut tx = clock.wall_ns().ok().map(unix_ns_to_ntp)?;
+            let mut rx = header.receive_ts;
+            rusty_time_core::server::mark_server_timestamps(&mut rx, &mut tx);
+            header.transmit_ts = tx;
+        }
         return Some(header.to_bytes().to_vec());
     }
 
@@ -511,8 +738,8 @@ pub fn build_reply(
     // before we say anything at all about the time.
     let (cookie, unique_id) = (cookie?, unique_id?);
     let keys = {
-        let ring = ring.lock().ok()?;
-        rusty_time_nts::cookie::redeem(&ring, cookie).ok()?
+        let guard = state.lock().ok()?;
+        rusty_time_nts::cookie::redeem(&guard.ring, cookie).ok()?
     };
     verify_client_authenticator(request, &keys.c2s)?;
 
@@ -521,16 +748,21 @@ pub fn build_reply(
     let want = (1 + placeholders).min(MAX_REPLY_COOKIES);
     let mut plaintext = Vec::new();
     {
-        let ring = ring.lock().ok()?;
+        let guard = state.lock().ok()?;
         for _ in 0..want {
             let mut nonce = [0u8; COOKIE_NONCE_LEN];
             rusty_time_nts::ke::fill_random(&mut nonce).ok()?;
-            let fresh = rusty_time_nts::cookie::mint(&ring, &keys, &nonce).ok()?;
+            let fresh = rusty_time_nts::cookie::mint(&guard.ring, &keys, &nonce).ok()?;
             ef::write_field(&mut plaintext, ef::field_type::NTS_COOKIE, &fresh);
         }
     }
 
-    header.transmit_ts = clock.wall_ns().ok().map(unix_ns_to_ntp)?;
+    if mode == ResponseMode::Basic {
+        let mut tx = clock.wall_ns().ok().map(unix_ns_to_ntp)?;
+        let mut rx = header.receive_ts;
+        rusty_time_core::server::mark_server_timestamps(&mut rx, &mut tx);
+        header.transmit_ts = tx;
+    }
     let mut reply = header.to_bytes().to_vec();
     // Echo the unique identifier so the client can bind reply to request.
     let mut uid = [0u8; UNIQUE_ID_LEN];
@@ -544,6 +776,10 @@ pub fn build_reply(
     reply.extend_from_slice(&ef::authenticator_field(&nonce, &ciphertext));
     Some(reply)
 }
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;
 
 /// Verify the client's authenticator over the packet preceding it.
 fn verify_client_authenticator(request: &[u8], c2s: &[u8; 32]) -> Option<()> {
@@ -563,176 +799,4 @@ fn verify_client_authenticator(request: &[u8], c2s: &[u8; 32]) -> Option<()> {
     let aad = request.get(..auth.offset)?;
     rusty_time_nts::aead::open(c2s, &[aad, nonce], ciphertext).ok()?;
     Some(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::nts_session::NtsSession;
-
-    fn test_ring() -> Arc<Mutex<KeyRing>> {
-        let mut ring = KeyRing::new(3);
-        ring.rotate_in(MasterKey {
-            id: 7,
-            key: [0x5A; 32],
-        });
-        Arc::new(Mutex::new(ring))
-    }
-
-    #[test]
-    fn answers_plain_client_requests() {
-        let ring = test_ring();
-        let req = NtpPacket::client_request(4, NtpTimestamp(0x1234_5678_9ABC_DEF0)).to_bytes();
-        let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
-        let reply = build_reply(&req, recv, 2, &ring, &SystemClock).expect("reply");
-        let p = NtpPacket::parse(&reply).expect("parse");
-        assert_eq!(p.mode, Mode::Server);
-        assert_eq!(p.stratum, 2);
-        // The origin timestamp must echo the client's transmit: that is the
-        // client's only anti-spoofing binding.
-        assert_eq!(p.origin_ts, NtpTimestamp(0x1234_5678_9ABC_DEF0));
-    }
-
-    #[test]
-    fn refuses_to_reflect_server_mode_packets() {
-        // A server-mode datagram must never be answered, or the server becomes
-        // a reflection amplifier between two victims.
-        let ring = test_ring();
-        let mut p = NtpPacket::client_request(4, NtpTimestamp(1));
-        p.mode = Mode::Server;
-        let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
-        assert!(build_reply(&p.to_bytes(), recv, 1, &ring, &SystemClock).is_none());
-    }
-
-    #[test]
-    fn nts_round_trip_client_to_server() {
-        // Mint a cookie the way NTS-KE would, hand it to a client session, and
-        // run a full protected exchange through the real server path.
-        let ring = test_ring();
-        let keys = NtsKeys {
-            c2s: [0x11; 32],
-            s2c: [0x22; 32],
-        };
-        let cookie = {
-            let r = ring.lock().expect("lock");
-            rusty_time_nts::cookie::mint(&r, &keys, &[3; COOKIE_NONCE_LEN]).expect("mint")
-        };
-
-        let mut session = NtsSession::for_test(keys.clone(), vec![cookie]);
-        let header = NtpPacket::client_request(4, NtpTimestamp(0xAABB_CCDD_1122_3344)).to_bytes();
-        let request = session.protect(&header).expect("protect");
-
-        let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
-        let reply = build_reply(&request, recv, 1, &ring, &SystemClock).expect("server reply");
-
-        // The client must accept it, and must get its cookie replaced.
-        assert_eq!(session.cookies_held(), 0, "cookie spent");
-        session
-            .verify(&reply)
-            .expect("client verifies server reply");
-        assert!(
-            session.cookies_held() >= 1,
-            "server must replenish the spent cookie"
-        );
-    }
-
-    #[test]
-    fn forged_authenticator_gets_no_answer() {
-        let ring = test_ring();
-        let keys = NtsKeys {
-            c2s: [0x11; 32],
-            s2c: [0x22; 32],
-        };
-        let cookie = {
-            let r = ring.lock().expect("lock");
-            rusty_time_nts::cookie::mint(&r, &keys, &[3; COOKIE_NONCE_LEN]).expect("mint")
-        };
-        let mut session = NtsSession::for_test(keys, vec![cookie]);
-        let header = NtpPacket::client_request(4, NtpTimestamp(1)).to_bytes();
-        let mut request = session.protect(&header).expect("protect");
-
-        // Corrupt the last byte of the authenticator's ciphertext.
-        let last = request.len() - 1;
-        request[last] ^= 0xFF;
-        let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
-        assert!(
-            build_reply(&request, recv, 1, &ring, &SystemClock).is_none(),
-            "server answered a forged NTS request"
-        );
-    }
-
-    #[test]
-    fn unknown_cookie_gets_no_answer() {
-        let ring = test_ring();
-        let keys = NtsKeys {
-            c2s: [0x11; 32],
-            s2c: [0x22; 32],
-        };
-        // A cookie minted under a different master key: not ours.
-        let mut foreign = KeyRing::new(3);
-        foreign.rotate_in(MasterKey {
-            id: 7,
-            key: [0xEE; 32],
-        });
-        let cookie =
-            rusty_time_nts::cookie::mint(&foreign, &keys, &[3; COOKIE_NONCE_LEN]).expect("mint");
-        let mut session = NtsSession::for_test(keys, vec![cookie]);
-        let header = NtpPacket::client_request(4, NtpTimestamp(1)).to_bytes();
-        let request = session.protect(&header).expect("protect");
-        let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
-        assert!(build_reply(&request, recv, 1, &ring, &SystemClock).is_none());
-    }
-
-    #[test]
-    fn placeholder_count_cannot_amplify_without_bound() {
-        let ring = test_ring();
-        let keys = NtsKeys {
-            c2s: [0x11; 32],
-            s2c: [0x22; 32],
-        };
-        let cookie = {
-            let r = ring.lock().expect("lock");
-            rusty_time_nts::cookie::mint(&r, &keys, &[3; COOKIE_NONCE_LEN]).expect("mint")
-        };
-        // Hand-build a request stuffed with placeholders.
-        let header = NtpPacket::client_request(4, NtpTimestamp(1)).to_bytes();
-        let uid = [9u8; UNIQUE_ID_LEN];
-        let nonce = [4u8; NONCE_LEN];
-        let request =
-            ef::protect_request(&header, &uid, &cookie, 60, &keys.c2s, &nonce).expect("protect");
-
-        let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
-        let reply = build_reply(&request, recv, 1, &ring, &SystemClock).expect("reply");
-        // The reply must not grow without bound relative to the request.
-        assert!(
-            reply.len() <= request.len(),
-            "reply ({}) exceeded request ({}): amplification",
-            reply.len(),
-            request.len()
-        );
-    }
-
-    #[test]
-    fn malformed_datagrams_never_panic() {
-        let ring = test_ring();
-        let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
-        let mut rng = 0xACE1_2345_6789_BEEFu64;
-        for _ in 0..20_000 {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            let len = (rng % 200) as usize;
-            let mut p = vec![0u8; len];
-            for b in p.iter_mut() {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                *b = rng as u8;
-            }
-            if len > 0 {
-                p[0] = (4 << 3) | 3; // bias toward "looks like a client request"
-            }
-            let _ = build_reply(&p, recv, 1, &ring, &SystemClock);
-        }
-    }
 }

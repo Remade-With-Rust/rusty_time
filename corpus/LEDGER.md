@@ -393,3 +393,23 @@ test asserts equality, not closeness; "close enough" is what hid it.
   read-system/read-PHC/read-system midpoint instead, which works everywhere;
   the precise ioctl is a lab-box improvement.
 
+
+## Interop closeout — ntpd-rs (the M4 pending item): PASS
+
+`tools/corpus/ntpd_rs_interop.sh`. ntpd-rs is the other memory-safe NTP daemon
+and an entirely separate codebase, so its agreement is independent evidence
+that we implement the protocol rather than a self-consistent dialect.
+
+| measure | value |
+|---|---|
+| ntpd-rs verdict | source accepted, Kalman filter converging |
+| offset it measured against us | **+0.056 ms** |
+| what rtimed logged | 2 requests, 2 responses, 0 dropped, 0 refused |
+
+Three independent implementations now synchronise from a rusty_time server:
+**chronyd** (plain, NTS, and interleaved), **ntpd-rs**, and our own wasm client
+over the HTTP gateway. In the other direction we authenticate against chronyd
+and time.cloudflare.com.
+
+With this, every correctness gate that does not require hardware or a
+performance baseline is green.

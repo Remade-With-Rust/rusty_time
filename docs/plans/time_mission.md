@@ -256,10 +256,12 @@ in `corpus/LEDGER.md` with the run that produced it (the rusty_zstd refusal disc
   Deterministic runs mean **counts and offsets, not durations** — the strongest kind of
   number, and immune to rig noise. Fairness note: clknetsim drives real daemon binaries
   through intercepted libc calls; the runner must confirm `rtimed`'s Rust std paths are
-  fully intercepted (gettime/settime/adjtimex/send/recv) **before any number is admissible
-  — this is M2's first deliverable, and if interception proves unreliable we build the
-  equivalent simulator harness against the `rusty_time-clock` seam instead (same scenarios,
-  same metrics).**
+  fully intercepted (gettime/settime/adjtimex/send/recv) **before any number is admissible.**
+  *Validated at M2 (see LEDGER.md):* interception works for Rust std binaries given
+  (a) the rig-side socket-type-flag mask (`tools/corpus/patch_clknetsim_rust_sockets.sh`)
+  and (b) readiness-polling before receives (`rusty_time_clock::net`) — simulated time
+  advances inside `poll`, so a plain blocking `recv` starves. The in-house deterministic
+  harness (`timecorp`) exists as well and is the commit-vs-commit arm.
 - **Hardware second:** a Linux lab box with GPS+PPS discipline as ground truth,
   cross-checking that simulation rankings survive contact with reality; plus per-OS smoke
   rigs (macOS, Windows) where the only baseline is that platform's chrony/W32Time behavior.
@@ -325,9 +327,9 @@ Wins may be cited; anything not in the ledger does not exist.
 
 | M | Deliverable | Exit test |
 |---|---|---|
-| M0 | Workspace scaffold, alloc seam, Deputy, CI check-matrix (§6.5), this plan merged | `cargo check` green on all 8 targets |
-| M1 | `rusty_time-core` packet + filter + selection; fuzzers; SNTP one-shot client (Linux) | syncs a test box against pool.ntp.org; fuzz corpus clean |
-| M2 | clknetsim interception validated for Rust binaries (§7.1 fairness note); discipline loop + Linux clock driver; **first TIMECORP run** vs chrony | S1/S6/S8 numbers in the ledger (losing is fine — the ledger starts) |
+| M0 ✅ 2026-08-26 | Workspace scaffold, alloc seam, Deputy, CI check-matrix (§6.5), this plan merged | `cargo check` green on all 8 targets — **met** (rusty_alloc live via the seam; Deputy `discover` enumerates 43 pinned deps; `acquire` awaits the owner's vault passphrase) |
+| M1 ✅ 2026-08-26 | `rusty_time-core` packet + filter + selection; fuzzers; SNTP one-shot client | **met** — `rtimed query pool.ntp.org`: 6/6 exchanges, 1.9 ms sd (run from Windows; the client is portable); cargo-fuzz targets + seeded robustness sweeps clean |
+| M2 ✅ 2026-08-26 | clknetsim interception validated for Rust binaries (§7.1 fairness note); discipline loop + platform clock drivers; **first TIMECORP run** | **met** — S1/S6/S8 × 31 seeds in the ledger (S6 is a recorded loss: 4/31 reach 1 ms); interception CLOSED: rtimed recovered a 50 ms/+20 ppm plant inside clknetsim (needs the rig's socket-flag patch + poll-before-recv, see LEDGER.md) |
 | M3 | NTS client + server; SpaceDB persistence (drift, cookies, keys) | NTS interop vs chrony + time.cloudflare.com |
 | M4 | Server mode + rate limiting + interleaved; `recvmmsg` batching; ops/`rtimec` control plane | S12 in ledger; chronyd/ntpd-rs clients sync from us |
 | M5 | macOS + Windows clock drivers, service integration, packaging | per-OS smoke rigs green; installers produced in CI |

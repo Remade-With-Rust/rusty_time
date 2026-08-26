@@ -130,7 +130,8 @@ is the property that stops it being a reflector. Response size is also always
 Interleaved measures better than basic, which is the entire point of the mode:
 its transmit timestamp is read after the packet is actually sent.
 
-ntpd-rs as a second client implementation: **not yet run** (pending).
+ntpd-rs as a second client implementation: **CLOSED at M7** — see the interop
+closeout at the end of this file (ntpd-rs measured +0.056 ms against us).
 
 ### Four defects this milestone found
 

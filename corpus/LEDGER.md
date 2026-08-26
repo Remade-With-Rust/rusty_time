@@ -17,8 +17,11 @@ Rules of admission:
 - A run that regresses a gate metric is still recorded. Losing is fine; the
   ledger starting is the point.
 
-Scenario status: S1, S6, S8 implemented in the deterministic harness.
-S2–S5, S7, S9–S14 and HW1: pending (mission plan §7.2).
+Scenario status: S1, S6, S8 implemented in the deterministic harness;
+S2 asserted for the wasm client (M6); S12 implemented as deterministic
+server-load counts (M4). S3–S5, S7, S9–S11, S13–S14 pending.
+**HW1 pending hardware** — it needs a GPS/PPS lab box this machine does not
+have, so the M7 exit test is not met and is not claimed.
 
 ## Run 1787766275 (unix) — arm: rusty_time (sim harness v1) — 31 seeds/scenario
 
@@ -316,4 +319,77 @@ mode and NTS apply to browser clients automatically.
 - **NTS over the gateway** â€” the plumbing routes through `build_reply`, so an
   NTS-protected browser exchange needs cookie transport to the page, which is
   M7 work.
+
+
+## M7 â€” reference clocks and hardware timestamping
+
+The mission plan's M7 exit test is "HW1 confirms sim rankings", which needs the
+GPS/PPS lab box. **This machine does not have one, so HW1 is PENDING and is not
+claimed.** What follows is what could be verified here, and what could not,
+separated deliberately.
+
+### What this machine can actually reach
+
+`tools/corpus/probe_hw_capabilities.sh` reports the honest inventory:
+
+| capability | here | evidence |
+|---|---|---|
+| PTP hardware clock | `/dev/ptp0` (Hyper-V) | **real** |
+| Kernel software RX timestamps | eth0 software-receive | **real** |
+| gpsd SHM refclock | userspace, no device needed | **real** |
+| chrony SOCK refclock | userspace, no device needed | **real** |
+| PPS (`/dev/pps*`) | absent | PENDING hardware |
+| NIC hardware timestamping | eth0 reports none | PENDING hardware |
+
+### Verified (`tools/corpus/refclock_probe.sh`)
+
+| transport | result |
+|---|---|
+| **PHC** `/dev/ptp0` | read and validated; offset âˆ’3.6 Âµs to +12.6 Âµs vs the system clock across runs, dispersion ~4 Âµs |
+| **SOCK** (chrony protocol) | 3/3 synthetic-producer samples received; offset decoded as **exactly** +0.000123000 s |
+| **SHM** (gpsd protocol) | segment read; offset **exactly** the +0.001499891 s the producer published |
+| **Kernel RX timestamps** | `SO_TIMESTAMPING` enabled, stamp returned through `recvmmsg` control data and asserted to fall inside the observed send/receive window |
+
+The SHM reader implements the protocol's count-guard: a producer writes the
+struct without a lock, so the reader checks `count` before and after and retries
+on a mismatch. A sample torn across that write would be a plausible-looking
+wrong time.
+
+### A precision defect found by demanding exactness
+
+The first SOCK round-trip returned **âˆ’0.0014998913 s** for an offset sent as
+âˆ’0.0015 â€” an error of ~110 ns. Cause: `RefclockSample` stored a *reference
+timestamp* and recovered the offset by subtracting the local time. An f64
+holding a Unix-epoch value (~1.76e9) has only ~1e-7 s of resolution left below
+the decimal point, so `local + offset âˆ’ local` does not return `offset`.
+
+That silently caps **every** reference clock at roughly 100 ns however good the
+hardware is â€” irrelevant for a network source, fatal for the PPS and PHC
+sources this milestone exists to support. The sample now stores the offset as
+the authoritative field, and SHM differences the integer seconds and
+nanoseconds separately rather than converting both times to f64 first. The
+test asserts equality, not closeness; "close enough" is what hid it.
+
+### Correctness closeout (G7)
+
+| gate | result |
+|---|---|
+| **Fuzzing** (`tools/corpus/run_fuzzers.sh`) | **PASS** â€” 45 s per target, **~30.0 M executions total**, zero crashes: `ntp_parse` 27,133,553 (590 k/s), `nts_records` 2,382,463, `config_parse` 446,799 |
+| Live NTS interop, both directions | PASS (M3) â€” chronyd and time.cloudflare.com |
+| chronyd syncs from us, plain + interleaved | PASS (M4) â€” `^*` selected, offsets âˆ’4.8 Âµs and âˆ’66 ns |
+| wasm client vs live gateway | PASS (M6) |
+| Per-OS smoke rigs | PASS (M5) â€” Linux and Windows native, macOS in CI |
+| 8-target check matrix | green |
+| Workspace tests | 165 passing, 0 failing |
+
+### Still PENDING, stated rather than implied
+
+- **HW1 lab corpus** â€” needs GPS + PPS ground truth. The M7 exit test is not met.
+- **PPS refclock** â€” implemented against RFC 2783, never executed: no `/dev/pps*`.
+- **NIC hardware timestamping** â€” the request path is wired and the kernel is
+  asked for hardware stamps, but this NIC reports none, so only the software
+  path has ever produced a timestamp here.
+- **`PTP_SYS_OFFSET_PRECISE`** â€” the PHC sampler uses the portable
+  read-system/read-PHC/read-system midpoint instead, which works everywhere;
+  the precise ioctl is a lab-box improvement.
 

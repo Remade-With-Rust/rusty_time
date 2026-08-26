@@ -56,11 +56,69 @@ pub fn wait_readable(_socket: &UdpSocket, _timeout: Duration) -> Result<bool, Cl
     Ok(true)
 }
 
-/// One received datagram: how many bytes, and from whom.
+/// One received datagram: how many bytes, from whom, and — where the kernel
+/// provides it — when it actually arrived.
 #[derive(Clone, Copy, Debug)]
 pub struct Received {
     pub len: usize,
     pub peer: std::net::SocketAddr,
+    /// Kernel receive timestamp in Unix seconds, when `SO_TIMESTAMPING` is
+    /// enabled and the stack supplied one.
+    ///
+    /// This is the timestamp that matters for accuracy: it is taken when the
+    /// packet reaches the kernel, not when userspace happens to be scheduled
+    /// to read it. The gap between those two is scheduling latency, and on a
+    /// busy machine it is the single largest error in an otherwise good
+    /// exchange.
+    pub kernel_rx_s: Option<f64>,
+}
+
+/// Ask the kernel to attach receive timestamps to datagrams on this socket.
+///
+/// Requests hardware timestamps too; the kernel simply does not supply them
+/// where the NIC cannot, and `Received::kernel_rx_s` is `None` then. Failure is
+/// not fatal — the caller falls back to reading the clock after `recv`, which
+/// is what every implementation did before this existed.
+#[cfg(target_os = "linux")]
+pub fn enable_rx_timestamps(socket: &UdpSocket) -> Result<(), ClockError> {
+    use std::os::fd::AsRawFd;
+
+    // SOF_TIMESTAMPING_* bits. Named here rather than pulled from a binding
+    // crate because the set we want is small and fixed.
+    const RX_HARDWARE: libc::c_int = 1 << 0;
+    const RX_SOFTWARE: libc::c_int = 1 << 3;
+    const SOFTWARE: libc::c_int = 1 << 4;
+    const RAW_HARDWARE: libc::c_int = 1 << 6;
+
+    let flags: libc::c_int = RX_SOFTWARE | SOFTWARE | RX_HARDWARE | RAW_HARDWARE;
+    // SAFETY: setsockopt with a valid fd, level, name, and a pointer to an
+    // int of the declared length.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPING,
+            (&raw const flags).cast::<libc::c_void>(),
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(ClockError {
+            op: "setsockopt(SO_TIMESTAMPING)",
+            detail: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn enable_rx_timestamps(_socket: &UdpSocket) -> Result<(), ClockError> {
+    // Windows has SIO_TIMESTAMPING (Win10 2004+) and macOS has SO_TIMESTAMP;
+    // neither is wired yet, and the caller's fallback is correct meanwhile.
+    Err(ClockError {
+        op: "enable_rx_timestamps",
+        detail: "kernel receive timestamps are not implemented on this platform".into(),
+    })
 }
 
 /// Adopt a listening socket the service manager already opened, if there is one.
@@ -145,6 +203,10 @@ pub fn recv_batch(
     let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(count);
     let mut addrs: Vec<libc::sockaddr_storage> = vec![unsafe { core::mem::zeroed() }; count];
     let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(count);
+    // Room for the kernel's SCM_TIMESTAMPING control message per datagram.
+    // Requested unconditionally: if timestamping was never enabled the kernel
+    // simply writes no control data and the field stays None.
+    let mut controls: Vec<[u8; CONTROL_LEN]> = vec![[0u8; CONTROL_LEN]; count];
 
     for (i, buf) in bufs.iter_mut().take(count).enumerate() {
         iovecs.push(libc::iovec {
@@ -159,6 +221,8 @@ pub fn recv_batch(
         hdr.msg_hdr.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         hdr.msg_hdr.msg_iov = iovecs[i..].as_ptr() as *mut libc::iovec;
         hdr.msg_hdr.msg_iovlen = 1;
+        hdr.msg_hdr.msg_control = controls[i].as_mut_ptr().cast::<libc::c_void>();
+        hdr.msg_hdr.msg_controllen = CONTROL_LEN as _;
         msgs.push(hdr);
     }
 
@@ -198,10 +262,60 @@ pub fn recv_batch(
         let peer =
             unsafe { sockaddr_to_rust(&*(msg.msg_hdr.msg_name as *const libc::sockaddr_storage)) };
         if let Some(peer) = peer {
-            out.push(Received { len, peer });
+            // SAFETY: the kernel filled msg_control with msg_controllen bytes
+            // of well-formed cmsgs, or set the length to zero.
+            let kernel_rx_s = unsafe { kernel_timestamp(&msg.msg_hdr) };
+            out.push(Received {
+                len,
+                peer,
+                kernel_rx_s,
+            });
         }
     }
     Ok(out.len())
+}
+
+/// Bytes reserved per datagram for control messages. One SCM_TIMESTAMPING
+/// carries three timespecs; this leaves room for it and a little slack.
+#[cfg(target_os = "linux")]
+const CONTROL_LEN: usize = 128;
+
+/// Pull the receive timestamp out of a message's control data.
+///
+/// `SCM_TIMESTAMPING` carries three timespecs: [0] software, [1] legacy
+/// hardware (deprecated), [2] raw hardware. Software is preferred when
+/// present because it is already on the system timescale; the raw hardware
+/// stamp is on the NIC's own timescale and needs a PHC correlation before it
+/// means anything, which is why it is not simply used when available.
+///
+/// # Safety
+/// `hdr` must be a msghdr the kernel has just filled, with `msg_control`
+/// pointing at `msg_controllen` valid bytes.
+#[cfg(target_os = "linux")]
+unsafe fn kernel_timestamp(hdr: &libc::msghdr) -> Option<f64> {
+    if hdr.msg_controllen == 0 || hdr.msg_control.is_null() {
+        return None;
+    }
+    // SAFETY: caller's contract; CMSG_FIRSTHDR handles an empty buffer.
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(hdr) };
+    while !cmsg.is_null() {
+        // SAFETY: cmsg came from CMSG_FIRSTHDR/CMSG_NXTHDR and is in range.
+        let header = unsafe { &*cmsg };
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_TIMESTAMPING {
+            // SAFETY: SCM_TIMESTAMPING data is three timespecs.
+            let stamps = unsafe { libc::CMSG_DATA(cmsg).cast::<libc::timespec>() };
+            for index in [0usize, 2] {
+                // SAFETY: index is within the three-element array above.
+                let ts = unsafe { *stamps.add(index) };
+                if ts.tv_sec != 0 || ts.tv_nsec != 0 {
+                    return Some(ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9);
+                }
+            }
+        }
+        // SAFETY: as above.
+        cmsg = unsafe { libc::CMSG_NXTHDR(hdr, cmsg) };
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -246,7 +360,11 @@ pub fn recv_batch(
     };
     match socket.recv_from(buf) {
         Ok((len, peer)) => {
-            out.push(Received { len, peer });
+            out.push(Received {
+                len,
+                peer,
+                kernel_rx_s: None,
+            });
             Ok(1)
         }
         Err(e)

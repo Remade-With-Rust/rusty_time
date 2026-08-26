@@ -113,6 +113,11 @@ pub use virtual_driver::VirtualDriver;
 /// why that is not merely tidiness).
 pub mod slew;
 
+/// Reference-clock transports: gpsd shared memory, chrony's SOCK protocol,
+/// and PTP hardware clocks.
+#[cfg(any(unix, target_os = "linux"))]
+pub mod refclock;
+
 #[cfg(any(unix, windows))]
 pub mod net;
 

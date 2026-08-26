@@ -9,6 +9,7 @@ mod control;
 mod gateway;
 mod nts_session;
 mod query;
+mod refclock_cmd;
 mod server;
 mod service;
 mod service_cmd;
@@ -39,6 +40,7 @@ fn main() {
         },
         Some("state") => state_cmd::run(&args[1..]),
         Some("service") => service_cmd::run(&args[1..]),
+        Some("refclock") => refclock_cmd::run(&args[1..]),
         Some("version") | Some("--version") => {
             println!("rtimed {}", env!("CARGO_PKG_VERSION"));
             0
@@ -61,6 +63,7 @@ fn usage() {
     eprintln!("                    [--gateway ADDR] [--gateway-assets DIR]");
     eprintln!("       rtimed state <show|merge> ...");
     eprintln!("       rtimed service <show|install|path>");
+    eprintln!("       rtimed refclock <shm|sock|phc> ...");
     eprintln!("       rtimed version");
     eprintln!();
     eprintln!("  --nts   query: authenticate with NTS (RFC 8915) — key establishment on TCP 4460,");

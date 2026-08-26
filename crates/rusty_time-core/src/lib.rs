@@ -13,6 +13,7 @@ pub mod config;
 pub mod discipline;
 pub mod filter;
 pub mod ntp;
+pub mod refclock;
 pub mod select;
 pub mod server;
 pub mod vclock;

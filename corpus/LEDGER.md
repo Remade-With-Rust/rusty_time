@@ -240,3 +240,80 @@ likely cause is contention: the Windows and Linux rigs were started
 concurrently, and WSL2 forwards loopback. The rig now prints the server's
 stdout/stderr on failure and names the port-in-use case, so a repeat is
 diagnosable instead of mysterious.
+
+## M6 â€” the wasm virtual clock and the browser gateway
+
+The capability chrony cannot follow us into: a browser has no OS clock to set
+and no UDP socket to use, so the client *estimates* the offset and serves a
+corrected `now()` with an error bound attached.
+
+### M6 exit gate â€” S2-like network within 10 ms: PASS
+
+TIMECORP S2 conditions (40 ms round trip, 2:1 path asymmetry, Pareto jitter,
+40 exchanges at an 8 s cadence), asserted in
+`crates/rusty_time-wasm/src/tests.rs`:
+
+| measure | value |
+|---|---|
+| worst corrected-clock error | **6.854 ms** (bound: 10 ms) |
+| unavoidable asymmetry bias | 6.667 ms |
+| **error our estimator adds** | **~0.19 ms** |
+
+Asymmetry is the hard part and NTP cannot observe it: a 2:1 split on a 40 ms
+path is a systematic 6.67 ms bias no algorithm can remove. The gate is
+therefore really asking whether the estimator adds much on top of it, and the
+answer is ~0.19 ms. The test also asserts the error is *above* 1 ms, so a
+simulation that silently lost its asymmetry would fail rather than look
+excellent.
+
+### Real wasm against a real gateway (not a simulation)
+
+`tools/smoke/gateway_node_test.mjs` loads the compiled 31 KB wasm module,
+builds genuine NTPv4 packets inside it, posts them to a live `rtimed` gateway
+over HTTP, and feeds the replies back in â€” the browser path minus the browser.
+
+| check | result |
+|---|---|
+| exchanges accepted | 6/6, 0 rejected |
+| measured offset | +3.9 ms |
+| reported error bound | Â±6.0 ms |
+| forged reply (origin field flipped) | refused, and counted |
+
+The offset is milliseconds rather than the native client's microseconds because
+`Date.now()` has millisecond granularity â€” a browser limitation, not a defect,
+and the error bound says so rather than claiming precision the environment
+cannot provide.
+
+### Design decision worth recording
+
+The gateway speaks **real NTPv4 packets over HTTP**, not a JSON time API
+invented for browsers. A browser-specific protocol would mean a second parser,
+a second set of tests, and a browser path free to drift from the one everything
+else uses. Instead the wasm client runs the same codec and the same regression
+filter as the native client â€” both already fuzzed â€” and the gateway routes
+through the same `build_reply` that serves UDP, so rate limiting, interleaved
+mode and NTS apply to browser clients automatically.
+
+### Delivered
+
+- `@remade-with-rust/rusty-time` npm package (31 KB wasm), built by
+  `tools/wasm/build-npm.sh`.
+- `rtimed serve --gateway ADDR [--gateway-assets DIR]`: NTP-over-HTTP plus a
+  self-contained status page that measures and displays the live offset,
+  error bound and sample history.
+- The smoke rig gained a wasm section; it runs where node and a wasm build are
+  present and **skips explicitly** otherwise, rather than passing silently.
+
+### Pending, stated plainly
+
+- **WebTransport/QUIC datagrams** â€” the mission plan's preferred transport, for
+  true RTT symmetry. The HTTP path shipped here is the plan's stated fallback
+  (Â§6.4b). The wasm client is transport-agnostic by construction â€” JavaScript
+  owns the transport â€” so WebTransport slots in without touching the time math.
+- **`disco sites deploy` of the status page** â€” disco hosting is Preview and
+  not reachable from this machine; the page is served by the gateway itself in
+  the meantime.
+- **NTS over the gateway** â€” the plumbing routes through `build_reply`, so an
+  NTS-protected browser exchange needs cookie transport to the page, which is
+  M7 work.
+

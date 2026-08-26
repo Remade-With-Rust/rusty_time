@@ -45,6 +45,32 @@ rtimed service show          # print the unit for this platform
 sudo rtimed service install  # write it where the platform expects
 ```
 
+## In the browser
+
+A page has no clock it may set, so `@remade-with-rust/rusty-time` estimates the
+offset instead and serves a corrected `now()` with an honest error bound. The
+wire format is a real NTPv4 packet, so the browser runs the same codec and
+filter as the daemon:
+
+```sh
+bash tools/wasm/build-npm.sh                        # 31 KB wasm module
+rtimed serve --gateway 127.0.0.1:8199 \
+             --gateway-assets crates/rusty_time-wasm/pkg
+# then open http://127.0.0.1:8199/
+```
+
+```js
+const client = new TimeClient();
+const rnd = new Uint32Array(2); crypto.getRandomValues(rnd);
+const request = client.build_request(Date.now(), rnd[0], rnd[1]);
+const reply = new Uint8Array(await (await fetch('/time',
+  { method: 'POST', body: request })).arrayBuffer());
+client.process_response(reply, Date.now(), performance.now());
+
+client.now_ms(Date.now(), performance.now());   // corrected, never steps back
+client.confidence_ms(performance.now());        // error bound, widens if stale
+```
+
 ## Verifying a build
 
 `tools/smoke/smoke.sh` runs the built binaries end to end on the current

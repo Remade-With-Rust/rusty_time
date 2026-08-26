@@ -74,6 +74,10 @@ pub struct ServeOptions {
     pub state_path: Option<String>,
     /// Passphrase for the state file (env `RUSTY_TIME_STATE_PASSPHRASE`).
     pub state_passphrase: Option<String>,
+    /// HTTP gateway address, when the browser door should be open.
+    pub gateway_bind: Option<String>,
+    /// Directory holding the built wasm assets the status page loads.
+    pub gateway_assets: Option<String>,
     /// Per-client rate limit (chrony's `ratelimit`).
     pub rate_limit: RateLimitConfig,
     /// Where `rtimec` connects: a Unix socket path, or a named pipe on Windows.
@@ -93,6 +97,8 @@ impl ServeOptions {
             write_cert: None,
             state_path: None,
             state_passphrase: std::env::var("RUSTY_TIME_STATE_PASSPHRASE").ok(),
+            gateway_bind: None,
+            gateway_assets: None,
             rate_limit: RateLimitConfig::default(),
             control_path: crate::control::default_path(),
         };
@@ -109,6 +115,8 @@ impl ServeOptions {
                 "--write-cert" => opts.write_cert = Some(value(it.next())?),
                 "--state" => opts.state_path = Some(value(it.next())?),
                 "--control" => opts.control_path = value(it.next())?,
+                "--gateway" => opts.gateway_bind = Some(value(it.next())?),
+                "--gateway-assets" => opts.gateway_assets = Some(value(it.next())?),
                 "--ratelimit-interval" => {
                     opts.rate_limit.interval_log2 = value(it.next())?
                         .parse()
@@ -271,6 +279,27 @@ pub fn run(opts: &ServeOptions) -> i32 {
                 opts.control_path
             ),
         }
+    }
+
+    // The browser door. Started before the UDP loop so a page can reach it
+    // even while the server is busy.
+    if let Some(bind) = &opts.gateway_bind {
+        let gw_state = Arc::clone(&state);
+        let bind = bind.clone();
+        let assets = opts.gateway_assets.clone();
+        println!(
+            "rtimed: gateway (NTP over HTTP) on http://{bind}/{}",
+            if assets.is_some() {
+                " with wasm assets"
+            } else {
+                " (status page only; pass --gateway-assets for the wasm demo)"
+            }
+        );
+        std::thread::spawn(move || {
+            if let Err(e) = crate::gateway::serve(&bind, gw_state, assets) {
+                eprintln!("rtimed serve: gateway unavailable: {e}");
+            }
+        });
     }
 
     if opts.nts {

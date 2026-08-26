@@ -113,6 +113,28 @@ jobs:
               bash tools/smoke/smoke.sh
           fi
 
+  # M6 gate: build the real wasm module and run it against a real gateway.
+  # Not a simulation — this is the browser path minus the browser.
+  wasm-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+      - name: Build the npm package
+        run: bash tools/wasm/build-npm.sh
+      - name: Build rtimed
+        run: cargo build --release -p rusty_time-daemon
+      - name: wasm client against a live gateway
+        run: |
+          ./target/release/rtimed serve --stratum 1 --bind 127.0.0.1:8198 \
+            --gateway 127.0.0.1:8199 --gateway-assets crates/rusty_time-wasm/pkg \
+            --ratelimit-interval -4 --ratelimit-burst 64 --control ci-gw &
+          sleep 3
+          node tools/smoke/gateway_node_test.mjs http://127.0.0.1:8199 6
+
   # S12: deterministic server-load counts. Fast, and it has caught real
   # defects (see corpus/LEDGER.md).
   server-load:

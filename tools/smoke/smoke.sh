@@ -94,7 +94,33 @@ grep -q "127.0.0.1" "$WORK/clients.txt"
 check $? "our own address appears in the client log"
 echo
 
-echo "-- 5. service definition --"
+echo "-- 5. wasm gateway (browser path) --"
+# Only when the module has been built and node is present; the rest of the rig
+# must not depend on a JS toolchain being installed.
+PKG=crates/rusty_time-wasm/pkg
+if command -v node >/dev/null && [ -f "$PKG/rusty_time_wasm_bg.wasm" ]; then
+    GW_PORT=$((PORT + 1))
+    "$RTIMED" serve --stratum 1 --bind "127.0.0.1:$((PORT + 2))" \
+        --gateway "127.0.0.1:$GW_PORT" --gateway-assets "$PKG" \
+        --ratelimit-interval -4 --ratelimit-burst 64 \
+        --control "smoke-gw-$$" > "$WORK/gw.log" 2> "$WORK/gw.err" &
+    GW=$!
+    sleep 2
+    node tools/smoke/gateway_node_test.mjs "http://127.0.0.1:$GW_PORT" 4 \
+        > "$WORK/wasm.out" 2>&1
+    check $? "real wasm module exchanges time with the gateway"
+    grep -q "offset within 50 ms" "$WORK/wasm.out"
+    check $? "wasm client measured a sane offset"
+    grep -q "origin does not match our request is refused" "$WORK/wasm.out"
+    check $? "wasm client refuses a forged reply"
+    note "$(grep -E '^   offset' "$WORK/wasm.out" 2>/dev/null || true)"
+    kill "$GW" 2>/dev/null; wait "$GW" 2>/dev/null
+else
+    note "SKIP (needs node and a wasm-pack build: tools/wasm/build-npm.sh)"
+fi
+echo
+
+echo "-- 6. service definition --"
 "$RTIMED" service show > "$WORK/service.txt" 2> "$WORK/service.err"
 check $? "service definition emitted"
 [ -s "$WORK/service.txt" ]

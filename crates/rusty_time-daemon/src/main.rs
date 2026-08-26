@@ -6,6 +6,7 @@
 //! control socket, server mode) lands across M3–M5.
 
 mod control;
+mod gateway;
 mod nts_session;
 mod query;
 mod server;
@@ -57,6 +58,7 @@ fn usage() {
     eprintln!("                            [--port N] [--ke-port N] [--json]");
     eprintln!("       rtimed serve [--nts] [--bind ADDR] [--ke-bind ADDR] [--stratum N]");
     eprintln!("                    [--cert FILE] [--key FILE] [--nts-name NAME]");
+    eprintln!("                    [--gateway ADDR] [--gateway-assets DIR]");
     eprintln!("       rtimed state <show|merge> ...");
     eprintln!("       rtimed service <show|install|path>");
     eprintln!("       rtimed version");

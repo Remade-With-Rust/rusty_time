@@ -7,8 +7,17 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+# cdylib for the wasm module itself; rlib so the logic stays testable as plain
+# Rust on any host — which is how the S2 exit gate is asserted without a
+# browser in the loop.
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 rusty_time-core = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 
 [lints]
 workspace = true

@@ -2004,6 +2004,7 @@ name = "rusty_time-wasm"
 version = "0.1.0"
 dependencies = [
  "rusty_time-core",
+ "wasm-bindgen",
 ]
 
 [[package]]

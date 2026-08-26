@@ -4,3 +4,5 @@
 /fuzz/artifacts
 /corpus/results/*.json
 !corpus/results/.gitkeep
+# wasm-pack build output
+/crates/rusty_time-wasm/pkg

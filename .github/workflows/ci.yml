@@ -143,14 +143,28 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo run --release -p rusty_time-sim -- serverload
 
+  # G7: the parsers that face untrusted bytes. ~30 M executions locally at
+  # 60s/target with zero crashes; CI re-runs it on every change.
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly
       - run: cargo install cargo-fuzz --locked
-      - name: 60s per target
-        run: |
-          for t in ntp_parse config_parse nts_records; do
-            cargo +nightly fuzz run "$t" -- -max_total_time=60
-          done
+      - name: Fuzz the untrusted-input parsers
+        run: SECONDS_PER_TARGET=60 bash tools/corpus/run_fuzzers.sh
+
+  # M7: reference-clock transports. SHM and SOCK are driven by synthetic
+  # producers so they need no GPS; PHC runs where a /dev/ptp* exists. PPS and
+  # NIC hardware timestamping are reported as pending rather than skipped
+  # silently.
+  refclocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ethtool python3
+      - run: cargo build --release -p rusty_time-daemon
+      - name: Capability inventory
+        run: bash tools/corpus/probe_hw_capabilities.sh
+      - name: Reference clock transports
+        run: RTIMED=./target/release/rtimed bash tools/corpus/refclock_probe.sh

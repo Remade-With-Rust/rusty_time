@@ -12,19 +12,25 @@ with the run that produced it. The corpus (TIMECORP) measures rusty_time against
 
 ## Status
 
-Pre-1.0, milestone **M4** of the mission plan complete: NTPv4 codec, regression
-sample filter, source selection, discipline loop, the deterministic TIMECORP
-harness, **NTS (RFC 8915) client and server** with SpaceDB-backed persistence,
-and a hardened server — per-client and global rate limiting with Kiss-o'-Death,
-**interleaved mode** (RFC 9769), `recvmmsg` batching on Linux, and an ops
-control plane driven by `rtimec`.
+Pre-1.0. Milestones **M0–M6 complete, M7 partial** (its exit test needs a
+GPS/PPS lab box — see [corpus/LEDGER.md](corpus/LEDGER.md)).
 
-Interop is verified against chrony in both directions and both modes
-(see [corpus/LEDGER.md](corpus/LEDGER.md)): chronyd selects an `rtimed` server
-as its synchronisation source over plain NTP, over NTS, and in interleaved
-mode, where it measures a **−66 ns** offset. TLS is rustls on a pure-Rust
-crypto provider; nothing in the build needs a C toolchain, on any of the eight
-supported targets.
+What works: NTPv4 client and server, **NTS (RFC 8915)** both ends with
+SpaceDB-backed persistence, **interleaved mode** (RFC 9769), per-client and
+global rate limiting, `recvmmsg` batching, an ops control plane, platform clock
+drivers with service integration and packaging, a **wasm client** for browsers
+and edge functions, and reference clocks over gpsd SHM, chrony SOCK and PTP
+hardware clocks.
+
+Interop is verified against chrony in both directions and all three modes:
+chronyd selects an `rtimed` server as its synchronisation source over plain NTP
+(−4.8 µs), over NTS, and in interleaved mode (**−66 ns**). The parsers that
+face untrusted bytes survive ~30 million fuzz executions with zero crashes.
+TLS is rustls on a pure-Rust crypto provider; nothing in the build needs a C
+toolchain, on any of the eight supported targets.
+
+**No performance claim is made against chrony yet.** The corpus compares
+rusty_time to itself across commits; the v1.0 gates G1–G6 are open.
 
 ```sh
 # What can this machine actually do?

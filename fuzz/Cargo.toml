@@ -1,0 +1,36 @@
+[package]
+name = "rusty_time-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rusty_time-core = { path = "../crates/rusty_time-core" }
+rusty_time-nts = { path = "../crates/rusty_time-nts" }
+
+[[bin]]
+name = "ntp_parse"
+path = "fuzz_targets/ntp_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nts_records"
+path = "fuzz_targets/nts_records.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

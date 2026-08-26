@@ -1,0 +1,58 @@
+name: corpus
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1" # Mondays
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Arm 1: the deterministic sim harness — runs anywhere, ledger-comparable
+  # across commits.
+  sim-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo run --release -p rusty_time-sim -- run --seeds 31 --no-ledger --out corpus-results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: timecorp-sim-results
+          path: corpus-results/
+
+  # Arm 2 (M2 open item): validate clknetsim's libc interception against a Rust
+  # binary, then baseline chrony in the same simulated world. Marked
+  # continue-on-error until interception validation has passed once — failures
+  # here are information, not CI noise (mission plan §7.1).
+  clknetsim-baseline:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build clknetsim
+        run: |
+          git clone --depth 1 https://gitlab.com/chrony/clknetsim ../clknetsim
+          make -C ../clknetsim
+      - name: Build chrony
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y asciidoctor libgnutls28-dev nettle-dev
+          git clone --depth 1 https://gitlab.com/chrony/chrony ../chrony
+          cd ../chrony && ./configure && make -j
+      - name: Interception validation — does clknetsim see a Rust binary's clock calls?
+        run: |
+          cargo build --release -p rusty_time-daemon
+          # Minimal probe: run rtimed under the clknetsim preload and confirm the
+          # simulated clock, not the host clock, is observed. Exit nonzero if the
+          # preload was bypassed (static syscalls / vDSO): that answers M2's
+          # open question either way and is the artifact of this job.
+          LD_PRELOAD=../clknetsim/clknetsim.so CLKNETSIM_NODE=1 \
+            ./target/release/rtimed version
+      - name: chrony baseline S1-equivalent (clknetsim test framework)
+        run: |
+          cd ../chrony && make -C test/simulation quick || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clknetsim-baseline-logs
+          path: ../chrony/test/simulation

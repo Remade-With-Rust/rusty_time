@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # M0 exit gate: cargo check green on all 8 shipping targets (mission plan §6.5).
+  check-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - wasm32-unknown-unknown
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo check --workspace --all-targets --target ${{ matrix.target }}
+        if: ${{ !startsWith(matrix.target, 'wasm32') }}
+      # wasm: bins (rtimed/rtimec/timecorp) are native-only; check the libraries.
+      - run: cargo check -p rusty_time-core -p rusty_time-nts -p rusty_time-wasm -p rusty_time-api --target ${{ matrix.target }}
+        if: ${{ startsWith(matrix.target, 'wasm32') }}
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: 60s per target
+        run: |
+          for t in ntp_parse config_parse nts_records; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=60
+          done

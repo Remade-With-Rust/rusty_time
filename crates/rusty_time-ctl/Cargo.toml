@@ -1,0 +1,19 @@
+[package]
+name = "rusty_time-ctl"
+description = "rtimec — control CLI for rtimed (the chronyc analog)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rtimec"
+path = "src/main.rs"
+
+[dependencies]
+rusty_time-alloc = { workspace = true }
+rusty_time-clock = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "rusty_time-clock"
+description = "Platform clock seam: read, slew, step — linux / macos / windows / virtual"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusty_time-core = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Performance",
+    "Win32_System_Time",
+] }
+
+# The syscall boundary: the workspace-wide `unsafe_code = "deny"` is lifted for
+# this one crate, deliberately. Every unsafe block carries a SAFETY invariant.
+[lints.rust]
+unsafe_code = "allow"

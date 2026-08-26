@@ -1,0 +1,22 @@
+[package]
+name = "rusty_time-daemon"
+description = "rtimed — the rusty_time daemon (the chronyd analog)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rtimed"
+path = "src/main.rs"
+
+[dependencies]
+rusty_time-core = { workspace = true }
+rusty_time-clock = { workspace = true }
+rusty_time-api = { workspace = true }
+rusty_time-alloc = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

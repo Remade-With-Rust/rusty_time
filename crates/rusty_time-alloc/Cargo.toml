@@ -1,0 +1,14 @@
+[package]
+name = "rusty_time-alloc"
+description = "The allocator seam: one crate, one pin (mission plan §4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusty_alloc-api = "1.1.4"

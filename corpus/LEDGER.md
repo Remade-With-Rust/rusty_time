@@ -50,3 +50,49 @@ Two findings, both required:
 Consequence: the cross-implementation baseline arm (rusty_time vs chrony vs
 ntpd-rs under identical simulated worlds) is viable. chrony's own 001-defaults
 simulation test PASSes on the same rig.
+
+## M3 gate — NTS interop: PASS (both directions)
+
+Reproduce: `tools/corpus/nts_interop_chrony.sh` (needs chrony built with +NTS).
+
+| arm | result |
+|---|---|
+| rusty_time client -> **time.cloudflare.com** | 4/4 exchanges authenticated, 0 rejected, cookies replenished 8 -> 9 |
+| rusty_time client -> **chronyd** NTS server | 4/4 authenticated, 0 rejected, 9 cookies held |
+| **chronyd** client -> rusty_time NTS server | chronyc authdata: `NTS 1 15 256 ... 0 NAK, 8 Cook, CLen 100`; chronyc sources: `^* localhost` — chrony SELECTED our server as its synchronisation source |
+| rusty_time client -> rusty_time server (loopback) | 3/3 authenticated over real TLS 1.3 |
+
+Direction B is the load-bearing one: chrony is a strict independent
+implementation, so its acceptance means we are not merely agreeing with
+ourselves. TLS is rustls with `oxitls-rustcrypto-provider` (pure Rust);
+rustls's default provider compiles C and is refused by the house rule.
+
+### Persistence (SpaceDB), verified end to end
+
+Client resumed a saved session across three runs, skipping NTS-KE each time
+(9 cookies carried); server restarted and restored its master key, and
+**cookies minted by the previous server process still authenticated** — the
+property master-key persistence exists to provide.
+
+### Three defects this gate found
+
+1. **blake3 compiles C on aarch64.** spacedb-sdk pulls blake3, whose default
+   aarch64 path builds NEON assembly and needs a `cc` toolchain — a direct
+   violation of the no-C-toolchain rule. All three aarch64 legs of the check
+   matrix failed with "failed to find tool cc" while x86_64 passed. Fixed by
+   declaring blake3 with its `pure` feature so feature unification disables the
+   assembly path graph-wide.
+2. **yrs 0.25.0 divide-by-zero.** `find_pivot` (block_store.rs:51) seeds an
+   interpolation search with `clock / end` and does not guard `end == 0`;
+   reached through spacedb-sdk's `import`, it panicked on the third
+   open/flush cycle. Root-caused and avoided by not using CRDT
+   `export`/`import` as the local durability format — that is what mesh sync
+   is for — and persisting a per-entry record log instead, which is also a
+   closer fit to the per-entry house law. `import_guarded` keeps the panic
+   contained on the mesh path, where import is genuinely required.
+3. **openssl `req -x509` defaults to CA:TRUE**, and rustls correctly refuses a
+   CA certificate as an end-entity (`CaUsedAsEndEntity`). The rig now sets
+   `basicConstraints=critical,CA:FALSE`.
+
+No performance claim is made here; this block records correctness and interop
+only. chrony BD-style performance comparison remains PENDING the Linux rig.

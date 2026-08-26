@@ -1,6 +1,6 @@
 [package]
 name = "rusty_time-nts"
-description = "NTS (RFC 8915) record layer and extension-field AEAD — pure Rust"
+description = "NTS (RFC 8915) record layer, extension-field AEAD, and NTS-KE — pure Rust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,4 +11,39 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+# Always available, wasm-clean: the record codec and the extension-field AEAD.
+# aes-siv's default features pull getrandom, which refuses to build for
+# wasm32-unknown-unknown; we generate nonces ourselves.
 aes-siv = { version = "0.8.0", default-features = false, features = ["alloc"] }
+
+# The `ke` feature: NTS-KE over TLS 1.3. NOT default — it needs sockets and a
+# TLS stack, so wasm builds and the pure-codec consumers never see it.
+#
+# rustls's DEFAULT features select the aws-lc-rs backend, which compiles C.
+# House rule (mission plan §2): no C toolchain, anywhere. So rustls is taken
+# with default-features = false and the crypto provider is supplied explicitly
+# by oxitls-rustcrypto-provider — pure Rust, RustCrypto primitives, and it
+# drops the webpki dependency carrying RUSTSEC-2026-0104.
+rustls = { version = "0.23.43", default-features = false, features = [
+    "std",
+    "tls12",
+    "logging",
+], optional = true }
+oxitls-rustcrypto-provider = { version = "0.3.0", default-features = false, features = [
+    "std",
+    "tls12",
+    "zeroize",
+], optional = true }
+rustls-pki-types = { version = "1.15.1", optional = true }
+webpki-roots = { version = "1.0.9", optional = true }
+getrandom = { version = "0.4.3", optional = true }
+
+[features]
+default = []
+ke = [
+    "dep:rustls",
+    "dep:oxitls-rustcrypto-provider",
+    "dep:rustls-pki-types",
+    "dep:webpki-roots",
+    "dep:getrandom",
+]

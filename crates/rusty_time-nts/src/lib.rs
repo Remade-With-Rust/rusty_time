@@ -5,7 +5,18 @@
 //! transport-independent and fuzz-hardened.
 
 pub mod aead;
+pub mod cookie;
+pub mod ef;
 pub mod records;
+
+/// NTS-KE over TLS 1.3. Behind the `ke` feature: it needs sockets and a TLS
+/// stack, so wasm and codec-only consumers never pull one.
+#[cfg(feature = "ke")]
+pub mod ke;
+
+/// The TLS seam — the single place the crypto provider is chosen.
+#[cfg(feature = "ke")]
+pub mod tls;
 
 /// ALPN identifier for NTS-KE (RFC 8915 §4).
 pub const ALPN: &[u8] = b"ntske/1";

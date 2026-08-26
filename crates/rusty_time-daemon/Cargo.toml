@@ -16,7 +16,24 @@ rusty_time-core = { workspace = true }
 rusty_time-clock = { workspace = true }
 rusty_time-api = { workspace = true }
 rusty_time-alloc = { workspace = true }
+# The daemon is where NTS-KE's TLS stack is actually wanted, so the deliverable
+# turns the feature on; library consumers and wasm never see it.
+rusty_time-nts = { workspace = true, features = ["ke"] }
+
+# Not called from here. Declared solely to turn on blake3's `pure` feature
+# across the whole graph (Cargo features are additive), because spacedb-sdk
+# pulls blake3 and its DEFAULT aarch64 path compiles NEON **C/assembly** —
+# which needs a `cc` toolchain and breaks the house rule that nothing in the
+# build requires one (mission plan §2). Caught by the aarch64 legs of the
+# check matrix, which failed with "failed to find tool cc" while x86_64 passed.
+# Remove only if spacedb-sdk stops depending on blake3, or blake3 stops
+# needing a C compiler on aarch64.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
 serde_json = { workspace = true }
+oxitls-rcgen = "0.3.0"
+spacedb-sdk = { version = "0.5.2", default-features = false }
+argon2 = "0.5.3"
+aes-gcm = "0.11.1"
 
 [lints]
 workspace = true

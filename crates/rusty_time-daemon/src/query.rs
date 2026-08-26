@@ -1,6 +1,8 @@
 //! One-shot SNTP measurement: N exchanges, filtered, reported.
 
-use rusty_time_api::{QueryReport, SampleReport};
+use crate::nts_session::NtsSession;
+use crate::store::{DriftRecord, Store};
+use rusty_time_api::{NtsReport, QueryReport, SampleReport};
 use rusty_time_clock::{ClockRead, SystemClock};
 use rusty_time_core::ntp::{
     self, HEADER_LEN, LeapIndicator, Mode, NtpPacket, NtpTimestamp, UNIX_EPOCH_OFFSET,
@@ -17,6 +19,19 @@ pub struct Options {
     pub timeout_ms: u64,
     pub port: u16,
     pub json: bool,
+    /// Authenticate with NTS (RFC 8915): run key establishment first, then
+    /// protect every exchange.
+    pub nts: bool,
+    /// NTS-KE port; only consulted when `nts` is set.
+    pub ke_port: u16,
+    /// Extra trust anchors for NTS-KE (PEM), for a private CA or a pinned
+    /// self-signed server. Widens verification; never disables it.
+    pub nts_ca_pem: Option<String>,
+    /// SpaceDB state file. When given, unspent NTS cookies and the measured
+    /// drift are persisted, so the next run resumes without a fresh NTS-KE
+    /// round trip.
+    pub state_path: Option<String>,
+    pub state_passphrase: Option<String>,
 }
 
 impl Options {
@@ -34,14 +49,29 @@ impl Options {
             timeout_ms: 2000,
             port: 123,
             json: false,
+            nts: false,
+            ke_port: rusty_time_nts::KE_PORT,
+            nts_ca_pem: None,
+            state_path: None,
+            state_passphrase: std::env::var("RUSTY_TIME_STATE_PASSPHRASE").ok(),
         };
         while let Some(flag) = it.next() {
             match flag.as_str() {
                 "--json" => opts.json = true,
+                "--nts" => opts.nts = true,
                 "--count" => opts.count = num(flag, it.next())?,
                 "--interval-ms" => opts.interval_ms = num(flag, it.next())?,
                 "--timeout-ms" => opts.timeout_ms = num(flag, it.next())?,
                 "--port" => opts.port = num(flag, it.next())?,
+                "--ke-port" => opts.ke_port = num(flag, it.next())?,
+                "--state" => {
+                    opts.state_path = Some(it.next().ok_or("--state needs a file path")?.clone());
+                }
+                "--nts-ca" => {
+                    let path = it.next().ok_or("--nts-ca needs a file path")?;
+                    opts.nts_ca_pem =
+                        Some(std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?);
+                }
                 other => return Err(format!("unknown flag '{other}'")),
             }
         }
@@ -139,12 +169,163 @@ pub fn run(opts: &Options) -> i32 {
 
 fn measure(opts: &Options) -> Result<QueryReport, String> {
     let clock = SystemClock;
-    let addr: SocketAddr = (opts.server.as_str(), opts.port)
-        .to_socket_addrs()
-        .map_err(|e| format!("resolving {}: {e}", opts.server))?
-        .next()
-        .ok_or_else(|| format!("{} resolved to no addresses", opts.server))?;
 
+    // NTS first: key establishment decides which NTP server we actually query,
+    // because the KE server may delegate (RFC 8915 §4.1.7).
+    let mut nts = if opts.nts {
+        let extra_roots = match &opts.nts_ca_pem {
+            Some(pem) => {
+                use rusty_time_nts::tls::pki_types::{CertificateDer, pem::PemObject};
+                CertificateDer::pem_slice_iter(pem.as_bytes())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("parsing --nts-ca: {e}"))?
+            }
+            None => Vec::new(),
+        };
+        // Resume from saved state when we can: a complete stored session skips
+        // the whole TLS handshake, which is by far the most expensive part of
+        // an NTS exchange.
+        let resumed = opts.state_path.as_deref().and_then(|path| {
+            let passphrase = opts.state_passphrase.as_deref()?;
+            let mut store = Store::open(path, passphrase.as_bytes()).ok()?;
+            let saved = store.get_client_session(&opts.server).ok()??;
+            // Report what the last run measured, so a resumed session is
+            // visibly continuous rather than silently starting from nothing.
+            if let Ok(Some(drift)) = store.get_drift(&saved.ntp_server) {
+                eprintln!(
+                    "rtimed query: last measurement of {} was {:+.6} s at {:+.3} ppm",
+                    saved.ntp_server, drift.offset_s, drift.freq_ppm
+                );
+            }
+            Some(NtsSession::resume(
+                saved.keys,
+                saved.cookies,
+                saved.ntp_server,
+                saved.ntp_port,
+                opts.server.clone(),
+            ))
+        });
+
+        let session = match resumed {
+            Some(s) => {
+                eprintln!(
+                    "rtimed query: resumed NTS session for {} ({} cookies), skipping key establishment",
+                    opts.server,
+                    s.cookies_held()
+                );
+                s
+            }
+            None => NtsSession::establish(
+                &opts.server,
+                opts.ke_port,
+                Duration::from_millis(opts.timeout_ms.max(1) * 5),
+                &extra_roots,
+            )
+            .map_err(|e| format!("NTS key establishment with {}: {e}", opts.server))?,
+        };
+        Some(session)
+    } else {
+        None
+    };
+
+    let (host, port) = match &nts {
+        Some(s) => (s.ntp_server.clone(), s.ntp_port),
+        None => (opts.server.clone(), opts.port),
+    };
+
+    // Try every resolved address until one answers. A host with both A and
+    // AAAA records where one family is unreachable is common, and stopping at
+    // the first would report "no answer" for a server that is plainly up.
+    let addrs: Vec<SocketAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolving {host}: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("{host} resolved to no addresses"));
+    }
+
+    let mut last: Option<QueryReport> = None;
+    for (i, addr) in addrs.iter().enumerate() {
+        let report = measure_against(opts, &clock, *addr, nts.as_mut())?;
+        let answered = report.received > 0;
+        last = Some(report);
+        if answered || i + 1 == addrs.len() {
+            break;
+        }
+        eprintln!("rtimed query: {addr} did not answer; trying the next address");
+    }
+    let mut report = last.expect("at least one address was attempted");
+    if let (Some(session), Some(n)) = (nts.as_ref(), report.nts.as_mut()) {
+        n.cookies_after = session.cookies_held();
+    }
+
+    // Persist what this run learned, so the next one need not start cold:
+    // unspent cookies skip a whole NTS-KE round trip, and the drift reading
+    // seeds the discipline loop instead of it re-learning frequency.
+    if let Some(path) = &opts.state_path
+        && let Err(e) = persist_state(opts, path, &host, &report, nts.as_ref())
+    {
+        // Never fail a good measurement because state could not be saved.
+        eprintln!("rtimed query: could not save state: {e}");
+    }
+    Ok(report)
+}
+
+fn persist_state(
+    opts: &Options,
+    path: &str,
+    host: &str,
+    report: &QueryReport,
+    nts: Option<&NtsSession>,
+) -> Result<(), String> {
+    let passphrase = opts.state_passphrase.as_deref().ok_or(
+        "--state needs a passphrase: set RUSTY_TIME_STATE_PASSPHRASE (the state file holds \
+         NTS cookies, which carry session keys)",
+    )?;
+    let mut store = Store::open(path, passphrase.as_bytes()).map_err(|e| e.to_string())?;
+
+    if let Some(offset) = report.best_offset_s {
+        let updated_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        store
+            .put_drift(
+                host,
+                DriftRecord {
+                    freq_ppm: report.regress_freq_ppm.unwrap_or(0.0),
+                    offset_s: offset,
+                    updated_unix,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Cookies alone are useless on resume: a cookie tells the *server* what the
+    // session keys were, but the client needs its own C2S/S2C copy to protect
+    // and verify. Saving one without the other would silently produce a state
+    // file that can never be resumed from.
+    if let Some(session) = nts {
+        store
+            .put_client_session(
+                &session.ke_host,
+                session.keys(),
+                &session.unspent_cookies(),
+                &session.ntp_server,
+                session.ntp_port,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    store.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn measure_against(
+    opts: &Options,
+    clock: &SystemClock,
+    addr: SocketAddr,
+    mut nts: Option<&mut NtsSession>,
+) -> Result<QueryReport, String> {
     let bind_addr = if addr.is_ipv6() {
         "[::]:0"
     } else {
@@ -172,6 +353,14 @@ fn measure(opts: &Options) -> Result<QueryReport, String> {
         regress_sd_s: None,
         reference_id: String::new(),
         leap: String::new(),
+        nts: nts.as_ref().map(|s| NtsReport {
+            ke_host: s.ke_host.clone(),
+            ntp_server: s.ntp_server.clone(),
+            ntp_port: s.ntp_port,
+            cookies_after: s.cookies_held(),
+            authenticated: 0,
+            rejected: 0,
+        }),
     };
 
     let mut buf = [0u8; 1024];
@@ -180,7 +369,16 @@ fn measure(opts: &Options) -> Result<QueryReport, String> {
             std::thread::sleep(Duration::from_millis(opts.interval_ms));
         }
         let tx_nonce = NtpTimestamp(nonce(i as u64));
-        let request = NtpPacket::client_request(4, tx_nonce).to_bytes();
+        let header = NtpPacket::client_request(4, tx_nonce).to_bytes();
+
+        // Under NTS the datagram carries extension fields and an authenticator;
+        // plain NTP sends the bare header.
+        let request: Vec<u8> = match nts.as_mut() {
+            Some(session) => session
+                .protect(&header)
+                .map_err(|e| format!("protecting request: {e}"))?,
+            None => header.to_vec(),
+        };
 
         let t1_wall = clock.wall_ns().map_err(|e| e.to_string())? as f64 * 1e-9;
         let t1_mono = clock.mono_s().map_err(|e| e.to_string())?;
@@ -208,7 +406,9 @@ fn measure(opts: &Options) -> Result<QueryReport, String> {
                 Ok(n) if n >= HEADER_LEN => {
                     match NtpPacket::parse(&buf[..n]) {
                         Ok(p) if p.origin_ts == tx_nonce && p.mode == Mode::Server => {
-                            break Some(p);
+                            // Carry the length: NTS verification needs the whole
+                            // datagram, not just the parsed header.
+                            break Some((p, n));
                         }
                         Ok(_) => continue, // not ours / not a server answer
                         Err(_) => continue,
@@ -224,9 +424,32 @@ fn measure(opts: &Options) -> Result<QueryReport, String> {
                 Err(_) => break None,
             }
         };
-        let Some(packet) = response else { continue };
+        let Some((packet, packet_len)) = response else {
+            continue;
+        };
         let t4_wall = clock.wall_ns().map_err(|e| e.to_string())? as f64 * 1e-9;
         let t4_mono = clock.mono_s().map_err(|e| e.to_string())?;
+
+        // Authenticate BEFORE the timestamps are allowed to mean anything: an
+        // unverified NTS packet is an attacker's opinion about the time.
+        if let Some(session) = nts.as_mut() {
+            match session.verify(&buf[..packet_len]) {
+                Ok(()) => {
+                    if let Some(n) = report.nts.as_mut() {
+                        n.authenticated += 1;
+                        n.cookies_after = session.cookies_held();
+                    }
+                }
+                Err(e) => {
+                    if let Some(n) = report.nts.as_mut() {
+                        n.rejected += 1;
+                        n.cookies_after = session.cookies_held();
+                    }
+                    eprintln!("rtimed query: dropping unauthenticated response: {e}");
+                    continue;
+                }
+            }
+        }
 
         // Sanity gates before the sample is allowed to influence anything.
         if packet.stratum == 0 || packet.stratum > 15 {
@@ -279,6 +502,16 @@ fn measure(opts: &Options) -> Result<QueryReport, String> {
 
 fn print_human(r: &QueryReport) {
     println!("server    : {} ({})", r.server, r.address);
+    if let Some(n) = &r.nts {
+        println!(
+            "nts       : KE {} -> NTP {}:{}",
+            n.ke_host, n.ntp_server, n.ntp_port
+        );
+        println!(
+            "            {} authenticated, {} rejected, {} cookies held",
+            n.authenticated, n.rejected, n.cookies_after
+        );
+    }
     println!("exchanges : {}/{} answered", r.received, r.sent);
     if r.received > 0 {
         println!(

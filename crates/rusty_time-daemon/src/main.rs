@@ -5,7 +5,11 @@
 //! network. The resident daemon loop (discipline against the platform driver,
 //! control socket, server mode) lands across M3–M5.
 
+mod nts_session;
 mod query;
+mod server;
+mod state_cmd;
+mod store;
 
 #[global_allocator]
 static ALLOC: rusty_time_alloc::HouseAllocator = rusty_time_alloc::house_allocator();
@@ -21,6 +25,15 @@ fn main() {
                 2
             }
         },
+        Some("serve") => match server::ServeOptions::parse(&args[1..]) {
+            Ok(opts) => server::run(&opts),
+            Err(msg) => {
+                eprintln!("rtimed serve: {msg}");
+                usage();
+                2
+            }
+        },
+        Some("state") => state_cmd::run(&args[1..]),
         Some("version") | Some("--version") => {
             println!("rtimed {}", env!("CARGO_PKG_VERSION"));
             0
@@ -35,7 +48,15 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "usage: rtimed query <server> [--count N] [--interval-ms N] [--timeout-ms N] [--port N] [--json]"
+        "usage: rtimed query <server> [--nts] [--count N] [--interval-ms N] [--timeout-ms N]"
     );
+    eprintln!("                            [--port N] [--ke-port N] [--json]");
+    eprintln!("       rtimed serve [--nts] [--bind ADDR] [--ke-bind ADDR] [--stratum N]");
+    eprintln!("                    [--cert FILE] [--key FILE] [--nts-name NAME]");
+    eprintln!("       rtimed state <show|merge> ...");
     eprintln!("       rtimed version");
+    eprintln!();
+    eprintln!("  --nts   query: authenticate with NTS (RFC 8915) — key establishment on TCP 4460,");
+    eprintln!("          then every exchange is AEAD-protected and verified before use.");
+    eprintln!("          serve: also run an NTS-KE listener and answer protected requests.");
 }

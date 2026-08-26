@@ -12,9 +12,24 @@ with the run that produced it. The corpus (TIMECORP) measures rusty_time against
 
 ## Status
 
-Pre-1.0, milestone M2 of the mission plan: workspace scaffold, NTPv4 packet codec,
-regression sample filter, source selection, discipline loop, one-shot SNTP client
-(`rtimed query`), and the deterministic TIMECORP simulation harness.
+Pre-1.0, milestone **M3** of the mission plan complete: workspace scaffold, NTPv4
+packet codec, regression sample filter, source selection, discipline loop, the
+deterministic TIMECORP simulation harness, and **NTS (RFC 8915) client and
+server** with SpaceDB-backed persistence.
+
+NTS interop passes in both directions — `rtimed` authenticates against chronyd
+and time.cloudflare.com, and chronyd selects an `rtimed` server as its
+synchronisation source (see [corpus/LEDGER.md](corpus/LEDGER.md)). TLS is rustls
+on a pure-Rust crypto provider; nothing in the build needs a C toolchain, on any
+of the eight supported targets.
+
+```sh
+# Authenticated query
+rtimed query time.cloudflare.com --nts
+
+# Run an NTS-capable server (self-signs a dev certificate if none is given)
+rtimed serve --nts --state /var/lib/rusty_time/state.spacedb
+```
 
 ## Layout
 

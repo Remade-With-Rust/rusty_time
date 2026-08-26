@@ -24,6 +24,7 @@ unsafe_code = "deny"
 
 [workspace.dependencies]
 rusty_time-core = { path = "crates/rusty_time-core" }
+rusty_time-nts = { path = "crates/rusty_time-nts" }
 rusty_time-clock = { path = "crates/rusty_time-clock" }
 rusty_time-api = { path = "crates/rusty_time-api" }
 rusty_time-alloc = { path = "crates/rusty_time-alloc" }

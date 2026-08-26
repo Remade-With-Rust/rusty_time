@@ -15,6 +15,15 @@ pub struct NtsKeys {
     pub s2c: [u8; 32],
 }
 
+/// Redacting, deliberately: a derived `Debug` would spill session keys into
+/// every log line, panic message and error report that formats a struct
+/// holding one. If you need the bytes, name the field.
+impl fmt::Debug for NtsKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NtsKeys { c2s: <redacted>, s2c: <redacted> }")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AeadError {
     /// Authentication failed or ciphertext malformed.

@@ -50,6 +50,27 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # M3 gate: NTS interop against chrony, both directions. chrony must be built
+  # with +NTS (needs gnutls + nettle), and clknetsim is not involved here.
+  nts-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build chrony with NTS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison libgnutls28-dev nettle-dev pkg-config
+          git clone --depth 1 https://gitlab.com/chrony/chrony ~/chrony
+          cd ~/chrony && ./configure && make -j"$(nproc)"
+          ./chronyd --version | grep -q '+NTS' || { echo "chrony lacks NTS"; exit 1; }
+      - name: Build rtimed
+        run: |
+          CARGO_TARGET_DIR=~/rt-target cargo build --release -p rusty_time-daemon
+      - name: Two-way NTS interop
+        run: |
+          CHRONY_DIR=~/chrony RTIMED=~/rt-target/release/rtimed \
+            bash tools/corpus/nts_interop_chrony.sh
+
   fuzz-smoke:
     runs-on: ubuntu-latest
     steps:

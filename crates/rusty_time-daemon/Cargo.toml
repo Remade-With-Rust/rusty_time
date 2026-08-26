@@ -37,3 +37,39 @@ aes-gcm = "0.11.1"
 
 [lints]
 workspace = true
+
+# ---------------------------------------------------------------------------
+# Packaging metadata. `cargo deb` and `cargo generate-rpm` read these, so the
+# package contents are declared next to the code they package rather than in a
+# separate spec that drifts.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "rusty-time"
+maintainer = "Remade With Rust <noreply@mata.network>"
+copyright = "2026, Remade With Rust"
+extended-description = """
+A pure-Rust NTP/NTS time daemon: chrony remade with Rust.
+Speaks NTPv4 and NTS (RFC 8915) as both client and server, with interleaved
+mode, per-client and global rate limiting, and no C toolchain anywhere in the
+build."""
+section = "net"
+priority = "optional"
+assets = [
+    ["../../target/release/rtimed", "usr/sbin/", "755"],
+    ["../../target/release/rtimec", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/rusty-time/README.md", "644"],
+]
+# Type=notify readiness and CAP_SYS_TIME-only privileges live in the unit at
+# packaging/linux/rusty_time.service, which a test keeps in agreement with what
+# `rtimed service show` prints.
+systemd-units = { unit-name = "rusty_time", enable = false, start = false, unit-scripts = "../../packaging/linux" }
+
+[package.metadata.generate-rpm]
+name = "rusty_time"
+summary = "Pure-Rust NTP/NTS time daemon"
+assets = [
+    { source = "../../target/release/rtimed", dest = "/usr/sbin/rtimed", mode = "755" },
+    { source = "../../target/release/rtimec", dest = "/usr/bin/rtimec", mode = "755" },
+    { source = "../../packaging/linux/rusty_time.service", dest = "/usr/lib/systemd/system/rusty_time.service", mode = "644" },
+]

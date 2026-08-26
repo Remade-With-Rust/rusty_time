@@ -17,7 +17,98 @@ use windows_sys::Win32::System::Time::FileTimeToSystemTime;
 /// 100 ns intervals between 1601-01-01 and 1970-01-01.
 const EPOCH_DIFF_100NS: i128 = 116_444_736_000_000_000;
 
+/// Windows clamps the adjustment to roughly ±10% of the increment; we stay well
+/// inside that, and the discipline loop's own `max_freq_ppm` is tighter still.
+const MAX_SLEW_PPM: f64 = 100_000.0;
+
 pub struct SystemClock;
+
+/// Does this process hold `SeSystemtimePrivilege`?
+///
+/// Checked with `PrivilegeCheck`, which inspects the token and changes
+/// nothing. The alternative — trying an adjustment to see whether it works —
+/// would move the very clock we are asking about.
+pub fn has_system_time_privilege() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+    use windows_sys::Win32::Security::{
+        LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PRIVILEGE_SET, PrivilegeCheck,
+        SE_PRIVILEGE_ENABLED, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // "SeSystemtimePrivilege" as a NUL-terminated wide string.
+    let name: Vec<u16> = "SeSystemtimePrivilege"
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect();
+
+    let mut luid = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+    // SAFETY: `name` is a valid NUL-terminated wide string that outlives the
+    // call; `luid` is a valid out-param.
+    if unsafe { LookupPrivilegeValueW(core::ptr::null(), name.as_ptr(), &mut luid) } == 0 {
+        return false;
+    }
+
+    let mut token: HANDLE = core::ptr::null_mut();
+    // SAFETY: valid out-param; the pseudo-handle from GetCurrentProcess needs
+    // no closing.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+
+    let mut set = PRIVILEGE_SET {
+        PrivilegeCount: 1,
+        Control: 1, // PRIVILEGE_SET_ALL_NECESSARY
+        Privilege: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    let mut result: i32 = 0;
+    // SAFETY: `token` is an open token handle, `set` and `result` are valid.
+    let ok = unsafe { PrivilegeCheck(token, &mut set, &mut result) } != 0;
+    // SAFETY: `token` came from OpenProcessToken and is not used again.
+    unsafe { CloseHandle(token) };
+
+    ok && result != 0
+}
+
+pub(crate) fn platform_capabilities() -> crate::ClockCapabilities {
+    // The interrupt period sets the granularity of the frequency knob: one
+    // 100 ns unit of adjustment per increment.
+    let resolution = system_time_adjustment()
+        .ok()
+        .map(|(_, increment, _)| 1e6 / increment as f64);
+    crate::ClockCapabilities {
+        os: "windows",
+        arch: std::env::consts::ARCH,
+        can_read: true,
+        can_discipline: has_system_time_privilege(),
+        discipline_requirement: "SeSystemtimePrivilege (run elevated or as a service), \
+                                 and the Windows Time service must not be disciplining too",
+        slew_resolution_ppm: resolution,
+        max_slew_ppm: MAX_SLEW_PPM,
+        batch_receive: false,
+        mono_resolution_ns: None,
+    }
+}
+
+/// (current adjustment, increment, adjustment disabled) in 100 ns units.
+fn system_time_adjustment() -> Result<(u64, u64, bool), ClockError> {
+    let mut adjustment = 0u64;
+    let mut increment = 0u64;
+    let mut disabled = 0i32;
+    // SAFETY: three valid out-params.
+    if unsafe { GetSystemTimeAdjustmentPrecise(&mut adjustment, &mut increment, &mut disabled) }
+        == 0
+    {
+        return Err(last_error("GetSystemTimeAdjustmentPrecise"));
+    }
+    Ok((adjustment, increment, disabled != 0))
+}
 
 fn last_error(op: &'static str) -> ClockError {
     ClockError {
@@ -87,23 +178,14 @@ impl ClockDrive for SystemClock {
                 drain_offset,
                 drain_rate_ppm,
             } => {
-                // Baseline increment: what one interrupt period advances the clock
-                // by when no adjustment is active.
-                let mut adjustment = 0u64;
-                let mut increment = 0u64;
-                let mut disabled = 0i32;
-                // SAFETY: three valid out-params.
-                if unsafe {
-                    GetSystemTimeAdjustmentPrecise(&mut adjustment, &mut increment, &mut disabled)
-                } == 0
-                {
-                    return Err(last_error("GetSystemTimeAdjustmentPrecise"));
-                }
-                let drain = drain_rate_ppm.copysign(drain_offset);
-                let total_ppm = freq_ppm + drain;
-                let new_adjustment = (increment as f64 * (1.0 + total_ppm * 1e-6)).max(0.0) as u64;
-                // SAFETY: plain-value call; requires SeSystemtimePrivilege, error
-                // path reports it.
+                // The increment is what one interrupt period advances the clock
+                // by with no adjustment active; the adjustment replaces it.
+                let (_, increment, _) = system_time_adjustment()?;
+                let total_ppm =
+                    crate::slew::total_ppm(freq_ppm, drain_offset, drain_rate_ppm, MAX_SLEW_PPM);
+                let new_adjustment = crate::slew::windows_adjustment(increment, total_ppm);
+                // SAFETY: plain-value call. Requires SeSystemtimePrivilege;
+                // the error path reports its absence rather than pretending.
                 if unsafe { SetSystemTimeAdjustmentPrecise(new_adjustment, 0) } == 0 {
                     return Err(last_error("SetSystemTimeAdjustmentPrecise"));
                 }
@@ -116,6 +198,23 @@ impl ClockDrive for SystemClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privilege_probe_does_not_disturb_the_clock() {
+        // Probing must be side-effect free: the clock before and after must
+        // differ only by elapsed time, never by a jump.
+        let clock = SystemClock;
+        let before = clock.wall_ns().expect("wall");
+        let privileged = has_system_time_privilege();
+        let after = clock.wall_ns().expect("wall");
+        let elapsed_ms = (after - before) as f64 / 1e6;
+        assert!(
+            (0.0..500.0).contains(&elapsed_ms),
+            "probe moved the clock by {elapsed_ms} ms"
+        );
+        // Whatever the answer, capabilities must agree with the probe.
+        assert_eq!(platform_capabilities().can_discipline, privileged);
+    }
 
     #[test]
     fn reads_work_without_privilege() {

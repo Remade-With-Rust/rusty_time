@@ -164,3 +164,79 @@ Also fixed: `ControlResponse::Clients(Vec<..>)` could not serialize at all —
 serde's internally-tagged enums reject a newtype variant wrapping a sequence,
 so the op worked in-process and returned an empty reply over the socket. Now a
 struct variant, with serialization asserted in the test.
+
+## M5 — platform drivers, service integration, packaging
+
+### Per-OS smoke rigs (`tools/smoke/smoke.sh`)
+
+One script, run natively on each platform. It asserts the built binaries work
+end to end **without touching the system clock**, so anyone can run it.
+
+| platform | result | measured offset | notes |
+|---|---|---|---|
+| Linux (x86_64, WSL2 kernel 6.6) | **PASS** | 26 us | discipline available (root); recvmmsg batching; monotonic granularity 37 ns |
+| Windows 11 (x86_64) | **PASS** | 11 us | discipline correctly reported NOT available (unprivileged); monotonic granularity 100 ns; slew step 0.1 ppm |
+| macOS (universal2) | **CI only** | - | this project has no Mac; the rig runs in `release.yml`, and the macOS slew arithmetic is unit-tested on every host (see below) |
+
+The rig checks five things in order of how badly each would hurt: clock
+readable and requirements stated; server binds and answers; **the measured
+offset is sane** (a server that answers wrongly has failed); the control plane
+responds and its counters match the traffic sent; the service definition is
+emitted.
+
+### Clock drivers
+
+`rtimec doctor` now *probes* rather than assumes. On Windows the probe is
+`PrivilegeCheck` against `SeSystemtimePrivilege` — chosen because the
+alternative, attempting an adjustment to see whether it works, would move the
+very clock being asked about. A test asserts the probe does not disturb the
+clock.
+
+macOS is the one platform this project cannot run locally, so its slew
+arithmetic was moved out of the `#[cfg(target_os = "macos")]` module into
+`rusty_time_clock::slew`, where **every `cargo test` on every host exercises
+it** — including the bounded-horizon case that stops a tiny drain rate
+projecting a frequency term into an absurd one-shot correction.
+
+### Service integration and packaging
+
+- **Linux:** systemd `Type=notify` readiness (implemented directly — the
+  protocol is a datagram, not worth a C dependency) and socket activation, so
+  systemd can bind port 123 as root and hand the daemon an already-open socket.
+  The unit grants `CAP_SYS_TIME` and nothing else, and `Conflicts=` the other
+  time daemons. A test keeps the packaged unit and `rtimed service show` in
+  agreement, because two copies of one policy drift silently.
+- **Windows:** MSI (WiX) registering an auto-start LocalSystem service, plus a
+  standalone installer script. Neither disables `w32time` — two daemons on one
+  clock fight, so that is left an explicit operator choice, and both installers
+  say so.
+- **macOS:** launchd plist and a `pkgbuild` component package of a `lipo`-fused
+  universal2 binary.
+- `release.yml` builds all of it and **runs the smoke rig against the artifact
+  it just built**, on all three platforms.
+
+### Three defects this milestone found
+
+1. **`--control <path>` silently did nothing on Windows.** A filesystem path is
+   not a bind address, so the control plane never came up; the Windows smoke
+   rig failed on every control-plane check. Now one `control_endpoint()`
+   resolves a path to a Unix socket on Unix and to a deterministic loopback
+   port on Windows, so the same command line works on both — and the daemon
+   prints what it resolved to rather than leaving it a mystery.
+2. **The daemon and `rtimec` computed different default control names**
+   (`\\.\pipe\rusty_time` vs `rusty_time`). Once names are hashed to ports,
+   two different strings mean `rtimec` reports "is rtimed running?" about a
+   daemon that is running perfectly. Both now call one
+   `default_control_spec()`.
+3. **Socket activation was written in the wrong crate.** Adopting fd 3 needs
+   `unsafe`, which is denied workspace-wide and lifted only in the platform
+   seam. It compiled on Windows and failed on Linux — caught by the check
+   matrix, not by local builds.
+
+### One transient, recorded rather than shrugged off
+
+A single Windows smoke run failed while three subsequent runs passed. The most
+likely cause is contention: the Windows and Linux rigs were started
+concurrently, and WSL2 forwards loopback. The rig now prints the server's
+stdout/stderr on failure and names the port-in-use case, so a repeat is
+diagnosable instead of mysterious.

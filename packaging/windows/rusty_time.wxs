@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSI definition for rusty_time.
+
+  Installs both binaries and registers rtimed as an auto-start service running
+  as LocalSystem, which is the account that already holds SeSystemtimePrivilege
+  — the one privilege the daemon needs, and nothing more.
+
+  Deliberately does NOT disable the Windows Time service: two daemons
+  disciplining one clock fight each other, so that is a decision for the
+  operator to make knowingly (`rtimec doctor` reports the conflict).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="rusty_time"
+           Manufacturer="Remade With Rust"
+           Version="0.1.0"
+           UpgradeCode="6f2a1c84-5f4a-4a4a-9d3f-2f6b9c0a7e51"
+           Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of rusty_time is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="rusty_time" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
+      <Component Id="RtimedExe" Guid="9b1c2d3e-4f50-4617-8a29-0d5e7f8a1b2c">
+        <File Id="rtimed.exe" Source="!(bindpath.BinDir)\rtimed.exe" KeyPath="yes" />
+        <ServiceInstall Id="RtimedService"
+                        Name="rusty_time"
+                        DisplayName="rusty_time NTP/NTS"
+                        Description="Pure-Rust NTP/NTS time service"
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments="serve --nts"
+                        Vital="yes" />
+        <ServiceControl Id="RtimedControl"
+                        Name="rusty_time"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+      <Component Id="RtimecExe" Guid="1a2b3c4d-5e6f-4708-9a1b-2c3d4e5f6a7b">
+        <File Id="rtimec.exe" Source="!(bindpath.BinDir)\rtimec.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="rusty_time" Level="1">
+      <ComponentGroupRef Id="Binaries" />
+    </Feature>
+  </Package>
+</Wix>

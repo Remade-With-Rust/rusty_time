@@ -1,0 +1,45 @@
+[Unit]
+Description=rusty_time NTP/NTS daemon
+Documentation=https://github.com/remade-with-rust/rusty_time
+After=network-online.target
+Wants=network-online.target
+# Two time daemons disciplining one clock will fight each other.
+Conflicts=chronyd.service ntpd.service systemd-timesyncd.service
+
+[Service]
+# Type=notify means `systemctl start` waits until rtimed is actually serving,
+# not merely forked. The daemon sends READY=1 once its listeners are up.
+Type=notify
+ExecStart=/usr/sbin/rtimed serve --nts
+Restart=on-failure
+RestartSec=2
+
+# The clock is the only privilege rtimed needs. Everything else is off, so a
+# compromise of a daemon that parses untrusted UDP off the open internet buys
+# as little as possible.
+AmbientCapabilities=CAP_SYS_TIME
+CapabilityBoundingSet=CAP_SYS_TIME
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Durable state (drift, NTS keys and cookies) and the control socket.
+StateDirectory=rusty_time
+RuntimeDirectory=rusty_time
+
+[Install]
+WantedBy=multi-user.target

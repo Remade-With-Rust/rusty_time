@@ -63,6 +63,60 @@ pub struct Received {
     pub peer: std::net::SocketAddr,
 }
 
+/// Adopt a listening socket the service manager already opened, if there is one.
+///
+/// systemd's socket activation passes descriptors starting at fd 3, which lets
+/// the socket be bound by systemd (as root, on port 123) while the daemon runs
+/// unprivileged — the only thing rtimed would otherwise need root for besides
+/// the clock itself.
+///
+/// Lives in this crate rather than the daemon because adopting a raw descriptor
+/// is a platform-seam operation, and this is the one crate permitted `unsafe`.
+pub fn activated_udp_socket() -> Option<UdpSocket> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+
+        if !should_adopt_activated(
+            std::env::var("LISTEN_PID").ok().as_deref(),
+            std::env::var("LISTEN_FDS").ok().as_deref(),
+            std::process::id(),
+        ) {
+            return None;
+        }
+        // SAFETY: fd 3 is the first activated descriptor per systemd's
+        // protocol, and the check above confirmed the set was passed to this
+        // process. Ownership is taken exactly once, here.
+        Some(unsafe { UdpSocket::from_raw_fd(3) })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Should we adopt the activated descriptor set?
+///
+/// Pure, so the decision is tested with explicit inputs rather than by mutating
+/// the process environment — which is `unsafe` in edition 2024 and races with
+/// every other test in the binary.
+///
+/// `LISTEN_PID` is the load-bearing check: a descriptor inherited from a parent
+/// sits at fd 3 just as an activated one does, and adopting it would hijack
+/// whatever the parent had open there.
+pub fn should_adopt_activated(
+    listen_pid: Option<&str>,
+    listen_fds: Option<&str>,
+    our_pid: u32,
+) -> bool {
+    let for_us = listen_pid
+        .and_then(|p| p.parse::<u32>().ok())
+        .map(|pid| pid == our_pid)
+        .unwrap_or(false);
+    let count = listen_fds.and_then(|n| n.parse::<i32>().ok()).unwrap_or(0);
+    for_us && count >= 1
+}
+
 /// Datagrams a single batch may collect. Past a few dozen the syscall saving
 /// per message is already amortised, and the buffer stops fitting in cache.
 pub const BATCH_SIZE: usize = 32;
@@ -273,6 +327,22 @@ mod tests {
             total += n;
         }
         assert_eq!(total, sent, "batch receive lost datagrams");
+    }
+
+    #[test]
+    fn activation_is_refused_unless_the_descriptors_are_ours() {
+        // The happy path: systemd names us and passes one descriptor.
+        assert!(should_adopt_activated(Some("42"), Some("1"), 42));
+        // A descriptor set meant for a different process must never be
+        // adopted — fd 3 inherited from a parent looks identical otherwise.
+        assert!(!should_adopt_activated(Some("41"), Some("1"), 42));
+        // No environment at all: the ordinary case, run from a shell.
+        assert!(!should_adopt_activated(None, None, 42));
+        // Named but nothing passed.
+        assert!(!should_adopt_activated(Some("42"), Some("0"), 42));
+        // Garbage must not be read as consent.
+        assert!(!should_adopt_activated(Some("not-a-pid"), Some("1"), 42));
+        assert!(!should_adopt_activated(Some("42"), Some("many"), 42));
     }
 
     #[test]

@@ -9,6 +9,8 @@ mod control;
 mod nts_session;
 mod query;
 mod server;
+mod service;
+mod service_cmd;
 mod state_cmd;
 mod store;
 
@@ -35,6 +37,7 @@ fn main() {
             }
         },
         Some("state") => state_cmd::run(&args[1..]),
+        Some("service") => service_cmd::run(&args[1..]),
         Some("version") | Some("--version") => {
             println!("rtimed {}", env!("CARGO_PKG_VERSION"));
             0
@@ -55,6 +58,7 @@ fn usage() {
     eprintln!("       rtimed serve [--nts] [--bind ADDR] [--ke-bind ADDR] [--stratum N]");
     eprintln!("                    [--cert FILE] [--key FILE] [--nts-name NAME]");
     eprintln!("       rtimed state <show|merge> ...");
+    eprintln!("       rtimed service <show|install|path>");
     eprintln!("       rtimed version");
     eprintln!();
     eprintln!("  --nts   query: authenticate with NTS (RFC 8915) — key establishment on TCP 4460,");

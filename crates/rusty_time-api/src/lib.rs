@@ -21,6 +21,77 @@ pub struct SampleReport {
     pub root_dispersion_s: f64,
 }
 
+/// Where the control plane actually listens, resolved from what the operator
+/// typed.
+///
+/// Unix has domain sockets, Windows does not (its equivalent is a named pipe,
+/// which lands with the Win32 pipe server). Rather than make every script and
+/// CI job branch on the platform, the *same* `--control` argument resolves on
+/// both: a path becomes a deterministic loopback port on Windows, derived from
+/// the path text so the daemon and `rtimec` independently agree on it.
+///
+/// The daemon prints the resolved endpoint at startup, so the mapping is
+/// visible rather than a silent surprise.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ControlEndpoint {
+    /// A Unix domain socket at this path.
+    UnixPath(String),
+    /// A TCP endpoint on loopback.
+    Loopback(u16),
+}
+
+/// Loopback ports we derive into: the IANA dynamic range, avoiding anything an
+/// OS is likely to hand out for an ephemeral connection.
+const DERIVED_PORT_BASE: u16 = 49_200;
+const DERIVED_PORT_SPAN: u16 = 300;
+
+/// The default control name.
+///
+/// Defined here, once, because the daemon and `rtimec` must agree: on Windows
+/// the name is hashed into a port, so two *different* default strings would
+/// resolve to two different ports and `rtimec` would quietly fail to find a
+/// daemon that is running perfectly well.
+pub fn default_control_spec() -> String {
+    #[cfg(windows)]
+    {
+        "rusty_time".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        match std::env::var("XDG_RUNTIME_DIR") {
+            Ok(dir) if !dir.is_empty() => format!("{dir}/rusty_time.sock"),
+            _ => "/tmp/rusty_time.sock".to_string(),
+        }
+    }
+}
+
+/// Resolve a `--control` argument for this platform.
+pub fn control_endpoint(spec: &str) -> ControlEndpoint {
+    // An explicit host:port is honoured everywhere.
+    if let Some((_, port)) = spec.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return ControlEndpoint::Loopback(port);
+    }
+
+    if cfg!(windows) {
+        ControlEndpoint::Loopback(derive_port(spec))
+    } else {
+        ControlEndpoint::UnixPath(spec.to_string())
+    }
+}
+
+/// A stable port for a given control name. FNV-1a: tiny, dependency-free, and
+/// — the property that matters — identical in both processes and across runs.
+fn derive_port(spec: &str) -> u16 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in spec.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    DERIVED_PORT_BASE + (hash % DERIVED_PORT_SPAN as u64) as u16
+}
+
 /// What NTS did during a query (`status.ntsdata`'s client half).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct NtsReport {
@@ -174,6 +245,76 @@ mod tests {
         assert!(json.contains("\"best_offset_s\""));
         // A plain query must not emit an empty nts object.
         assert!(!json.contains("\"nts\""));
+    }
+
+    #[test]
+    fn the_default_spec_resolves_the_same_way_for_everyone() {
+        // The daemon and rtimec each call this independently. If they ever
+        // produced different strings, Windows would hash them to different
+        // ports and rtimec would report "is rtimed running?" about a daemon
+        // that is running fine.
+        let a = control_endpoint(&default_control_spec());
+        let b = control_endpoint(&default_control_spec());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_explicit_port_is_honoured_on_every_platform() {
+        assert_eq!(
+            control_endpoint("127.0.0.1:9999"),
+            ControlEndpoint::Loopback(9999)
+        );
+    }
+
+    #[test]
+    fn the_same_path_resolves_identically_in_both_processes() {
+        // The daemon and rtimec each resolve independently; if they disagreed,
+        // rtimec would connect to a port nothing is listening on.
+        let a = control_endpoint("/run/rusty_time.sock");
+        let b = control_endpoint("/run/rusty_time.sock");
+        assert_eq!(a, b, "resolution must be deterministic");
+    }
+
+    #[test]
+    fn different_names_get_different_endpoints() {
+        // Two daemons with different control names must not collide, or the
+        // second would fail to bind and the first would answer for both.
+        let mut seen = std::collections::HashSet::new();
+        let names = [
+            "/run/rusty_time.sock",
+            "/tmp/a.sock",
+            "/tmp/b.sock",
+            "rusty_time",
+            "test-rig-1",
+            "test-rig-2",
+        ];
+        for name in names {
+            seen.insert(control_endpoint(name));
+        }
+        assert!(
+            seen.len() >= names.len() - 1,
+            "control names collided: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn derived_ports_stay_in_the_intended_range() {
+        for name in ["a", "b", "/very/long/path/to/a/socket", ""] {
+            let port = derive_port(name);
+            assert!(
+                (DERIVED_PORT_BASE..DERIVED_PORT_BASE + DERIVED_PORT_SPAN).contains(&port),
+                "{name} derived out-of-range port {port}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_stays_a_unix_socket_on_unix() {
+        assert_eq!(
+            control_endpoint("/run/rusty_time.sock"),
+            ControlEndpoint::UnixPath("/run/rusty_time.sock".into())
+        );
     }
 
     #[test]

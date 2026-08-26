@@ -11,7 +11,9 @@
 //! Wire framing: one JSON request per line, one JSON response per line.
 
 use crate::server::ServerState;
-use rusty_time_api::{ClientRow, ControlRequest, ControlResponse, ServerStatsReport};
+use rusty_time_api::{
+    ClientRow, ControlEndpoint, ControlRequest, ControlResponse, ServerStatsReport,
+};
 // `Read`/`Write` are reached through the generic bounds on `serve_connection`,
 // so they need no import here; `BufRead` is needed for `read_line`.
 use std::io::{BufRead, BufReader};
@@ -21,20 +23,10 @@ use std::sync::{Arc, Mutex};
 /// and an unbounded read is a memory lever even from a local peer.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
-/// Where the control socket lives by default.
+/// Where the control socket lives by default. Defined in `rusty_time-api` so
+/// the daemon and `rtimec` cannot disagree about it.
 pub fn default_path() -> String {
-    #[cfg(windows)]
-    {
-        r"\\.\pipe\rusty_time".to_string()
-    }
-    #[cfg(unix)]
-    {
-        // Prefer the runtime directory when the platform provides one.
-        match std::env::var("XDG_RUNTIME_DIR") {
-            Ok(dir) if !dir.is_empty() => format!("{dir}/rusty_time.sock"),
-            _ => "/tmp/rusty_time.sock".to_string(),
-        }
-    }
+    rusty_time_api::default_control_spec()
 }
 
 /// Answer one request against live server state.
@@ -100,9 +92,19 @@ pub fn handle(request: &ControlRequest, state: &Arc<Mutex<ServerState>>) -> Cont
 
 use rusty_time_clock::ClockRead;
 
-/// Serve the control socket until the process ends.
+/// Serve the control plane until the process ends.
+///
+/// Which transport that is depends on the platform, resolved identically here
+/// and in `rtimec` by `rusty_time_api::control_endpoint`.
+pub fn serve(spec: &str, state: Arc<Mutex<ServerState>>) -> Result<(), String> {
+    match rusty_time_api::control_endpoint(spec) {
+        ControlEndpoint::UnixPath(path) => serve_unix(&path, state),
+        ControlEndpoint::Loopback(port) => serve_loopback(port, state),
+    }
+}
+
 #[cfg(unix)]
-pub fn serve(path: &str, state: Arc<Mutex<ServerState>>) -> Result<(), String> {
+fn serve_unix(path: &str, state: Arc<Mutex<ServerState>>) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
@@ -126,18 +128,19 @@ pub fn serve(path: &str, state: Arc<Mutex<ServerState>>) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
-pub fn serve(path: &str, state: Arc<Mutex<ServerState>>) -> Result<(), String> {
-    // Windows named pipes need the Win32 API; until that lands the control
-    // plane listens on loopback TCP, which is local-only but does not carry
-    // the pipe's SID-based authorization. Stated plainly rather than
-    // pretending the two are equivalent.
+#[cfg(not(unix))]
+fn serve_unix(_path: &str, _state: Arc<Mutex<ServerState>>) -> Result<(), String> {
+    Err("unix domain sockets are not available on this platform".to_string())
+}
+
+/// Loopback TCP: the Windows transport until a named-pipe server lands.
+///
+/// Local-only, but it does **not** carry a pipe's SID-based authorization, so
+/// any local process can connect. Stated plainly rather than treated as
+/// equivalent to a 0600 unix socket.
+fn serve_loopback(port: u16, state: Arc<Mutex<ServerState>>) -> Result<(), String> {
     use std::net::TcpListener;
-    let bind = if path.starts_with(r"\\.\pipe\") {
-        "127.0.0.1:11323".to_string()
-    } else {
-        path.to_string()
-    };
+    let bind = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&bind).map_err(|e| format!("binding {bind}: {e}"))?;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };

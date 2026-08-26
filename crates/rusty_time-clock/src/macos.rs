@@ -11,10 +11,32 @@ use rusty_time_core::ClockCommand;
 
 pub struct SystemClock;
 
+/// `adjtime` takes a whole-microsecond correction, so that is its granularity
+/// expressed as a rate over the horizon we re-arm on.
+const ADJTIME_RESOLUTION_US: f64 = 1.0;
+/// macOS slews at a fixed modest rate; asking for more just takes longer.
+const MAX_SLEW_PPM: f64 = 5_000.0;
+
 fn errno_detail(op: &'static str) -> ClockError {
     ClockError {
         op,
         detail: std::io::Error::last_os_error().to_string(),
+    }
+}
+
+pub(crate) fn platform_capabilities() -> crate::ClockCapabilities {
+    crate::ClockCapabilities {
+        os: "macos",
+        arch: std::env::consts::ARCH,
+        can_read: true,
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        can_discipline: unsafe { libc::geteuid() } == 0,
+        discipline_requirement: "root (macOS exposes no per-binary time capability); \
+                                 run from launchd as a system daemon",
+        slew_resolution_ppm: Some(ADJTIME_RESOLUTION_US),
+        max_slew_ppm: MAX_SLEW_PPM,
+        batch_receive: false,
+        mono_resolution_ns: None,
     }
 }
 
@@ -88,17 +110,11 @@ impl ClockDrive for SystemClock {
                 drain_offset,
                 drain_rate_ppm,
             } => {
-                // Convert the plan into "seconds to smear before the next plan".
-                // The daemon re-plans each poll interval; use the drain budget as
-                // the amount, and fold the frequency term in at the drain horizon.
-                let horizon_s = if drain_rate_ppm > 0.0 {
-                    (drain_offset.abs() / (drain_rate_ppm * 1e-6)).min(1024.0)
-                } else {
-                    0.0
-                };
-                let freq_term = freq_ppm * 1e-6 * horizon_s;
-                let amount = drain_offset + freq_term;
-                if amount.abs() < 1e-7 {
+                let amount =
+                    crate::slew::macos_adjtime_amount(freq_ppm, drain_offset, drain_rate_ppm);
+                // Below adjtime's own microsecond granularity there is nothing
+                // to ask for; issuing it anyway would just round to zero.
+                if amount.abs() < ADJTIME_RESOLUTION_US * 1e-6 {
                     return Ok(());
                 }
                 self.adjtime_by(amount)

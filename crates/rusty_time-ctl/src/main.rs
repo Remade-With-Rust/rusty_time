@@ -13,7 +13,7 @@ static ALLOC: rusty_time_alloc::HouseAllocator = rusty_time_alloc::house_allocat
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut rest: Vec<String> = Vec::new();
-    let mut socket = default_control_path();
+    let mut socket = rusty_time_api::default_control_spec();
     let mut json = false;
 
     let mut it = args.iter();
@@ -32,7 +32,7 @@ fn main() {
     }
 
     let code = match rest.first().map(String::as_str) {
-        Some("doctor") => doctor(),
+        Some("doctor") => doctor(json),
         Some("ping") => op(&socket, ControlRequest::Ping, json),
         Some("serverstats") => op(&socket, ControlRequest::ServerStats, json),
         Some("ntsdata") => op(&socket, ControlRequest::NtsData, json),
@@ -61,20 +61,6 @@ fn usage() {
     eprintln!("  ping            check the daemon is answering");
     eprintln!("  doctor          probe this machine's clock capabilities (no daemon needed)");
     eprintln!("  version         print version");
-}
-
-fn default_control_path() -> String {
-    #[cfg(windows)]
-    {
-        r"\\.\pipe\rusty_time".to_string()
-    }
-    #[cfg(unix)]
-    {
-        match std::env::var("XDG_RUNTIME_DIR") {
-            Ok(dir) if !dir.is_empty() => format!("{dir}/rusty_time.sock"),
-            _ => "/tmp/rusty_time.sock".to_string(),
-        }
-    }
 }
 
 fn op(socket: &str, request: ControlRequest, json: bool) -> i32 {
@@ -158,72 +144,77 @@ fn print_human(response: &ControlResponse) -> i32 {
     }
 }
 
-fn doctor() -> i32 {
+fn doctor(json: bool) -> i32 {
     let clock = SystemClock;
+    let caps = rusty_time_clock::capabilities();
+
+    if json {
+        // The smoke rigs parse this; keep the field names stable.
+        println!("{{");
+        println!("  \"os\": \"{}\",", caps.os);
+        println!("  \"arch\": \"{}\",", caps.arch);
+        println!("  \"can_read\": {},", caps.can_read);
+        println!("  \"can_discipline\": {},", caps.can_discipline);
+        println!("  \"batch_receive\": {},", caps.batch_receive);
+        println!("  \"max_slew_ppm\": {},", caps.max_slew_ppm);
+        match caps.mono_resolution_ns {
+            Some(r) => println!("  \"mono_resolution_ns\": {r:.1},"),
+            None => println!("  \"mono_resolution_ns\": null,"),
+        }
+        println!(
+            "  \"discipline_requirement\": \"{}\"",
+            caps.discipline_requirement.replace('"', "'")
+        );
+        println!("}}");
+        return if caps.can_read { 0 } else { 1 };
+    }
+
     println!("rtimec doctor — platform clock report");
-    println!("  os               : {}", std::env::consts::OS);
-    println!("  arch             : {}", std::env::consts::ARCH);
+    println!("  os               : {} ({})", caps.os, caps.arch);
 
     match clock.wall_ns() {
-        Ok(ns) => {
-            let secs = ns / 1_000_000_000;
-            println!("  wall clock       : ok ({secs} s since epoch)");
-        }
+        Ok(ns) => println!(
+            "  wall clock       : ok ({} s since epoch)",
+            ns / 1_000_000_000
+        ),
         Err(e) => {
             println!("  wall clock       : FAILED — {e}");
             return 1;
         }
     }
 
-    match clock.mono_s() {
-        Ok(_) => {
-            // Estimate read granularity: smallest nonzero delta over a burst.
-            let mut min_delta = f64::INFINITY;
-            let mut last = match clock.mono_s() {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("  monotonic clock  : FAILED — {e}");
-                    return 1;
-                }
-            };
-            for _ in 0..10_000 {
-                if let Ok(now) = clock.mono_s() {
-                    let d = now - last;
-                    if d > 0.0 && d < min_delta {
-                        min_delta = d;
-                    }
-                    last = now;
-                }
-            }
-            if min_delta.is_finite() {
-                println!(
-                    "  monotonic clock  : ok (read granularity ≈ {:.0} ns)",
-                    min_delta * 1e9
-                );
-            } else {
-                println!("  monotonic clock  : ok");
-            }
-        }
-        Err(e) => {
-            println!("  monotonic clock  : FAILED — {e}");
+    match caps.mono_resolution_ns {
+        Some(res) => println!("  monotonic clock  : ok (measured granularity ≈ {res:.0} ns)"),
+        None if caps.can_read => println!("  monotonic clock  : ok"),
+        None => {
+            println!("  monotonic clock  : FAILED");
             return 1;
         }
     }
 
-    // Honesty over optimism: we do not probe clock-SETTING capability here,
-    // because probing it would perturb the clock. Report what would be
-    // required instead.
-    #[cfg(windows)]
-    println!("  discipline       : requires SeSystemtimePrivilege (run elevated / as service)");
-    #[cfg(target_os = "linux")]
-    println!("  discipline       : requires CAP_SYS_TIME (root or file capability)");
-    #[cfg(target_os = "macos")]
-    println!("  discipline       : requires root");
-
-    #[cfg(target_os = "linux")]
-    println!("  batch receive    : recvmmsg (up to 32 datagrams per syscall)");
-    #[cfg(not(target_os = "linux"))]
-    println!("  batch receive    : one datagram per syscall (recvmmsg is Linux-only)");
+    // Probed, not assumed: this says whether disciplining would actually work
+    // *right now*, which is the question an operator is asking.
+    if caps.can_discipline {
+        println!("  discipline       : available");
+    } else {
+        println!("  discipline       : NOT available in this process");
+        println!("                     needs {}", caps.discipline_requirement);
+    }
+    match caps.slew_resolution_ppm {
+        Some(res) => println!(
+            "  slew             : {res:.4} ppm steps, up to ±{:.0} ppm",
+            caps.max_slew_ppm
+        ),
+        None => println!("  slew             : no frequency knob on this platform"),
+    }
+    println!(
+        "  batch receive    : {}",
+        if caps.batch_receive {
+            "recvmmsg (up to 32 datagrams per syscall)"
+        } else {
+            "one datagram per syscall (recvmmsg is Linux-only)"
+        }
+    );
 
     0
 }

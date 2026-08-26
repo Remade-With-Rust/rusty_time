@@ -14,12 +14,7 @@ rusty_time-core = { workspace = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60", features = [
-    "Win32_Foundation",
-    "Win32_System_SystemInformation",
-    "Win32_System_Performance",
-    "Win32_System_Time",
-] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Performance", "Win32_System_Time", "Win32_Security", "Win32_System_Threading"] }
 
 # The syscall boundary: the workspace-wide `unsafe_code = "deny"` is lifted for
 # this one crate, deliberately. Every unsafe block carries a SAFETY invariant.

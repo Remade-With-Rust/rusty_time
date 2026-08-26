@@ -27,6 +27,9 @@ crypto provider; nothing in the build needs a C toolchain, on any of the eight
 supported targets.
 
 ```sh
+# What can this machine actually do?
+rtimec doctor
+
 # Authenticated query
 rtimed query time.cloudflare.com --nts
 
@@ -36,6 +39,20 @@ rtimed serve --nts --state /var/lib/rusty_time/state.spacedb
 # Ask it what it is doing
 rtimec serverstats
 rtimec clients 20
+
+# Install as a system service (systemd / launchd / Windows SCM)
+rtimed service show          # print the unit for this platform
+sudo rtimed service install  # write it where the platform expects
+```
+
+## Verifying a build
+
+`tools/smoke/smoke.sh` runs the built binaries end to end on the current
+platform without touching the system clock, and checks that the *measured*
+offset is sane rather than merely that packets were exchanged:
+
+```sh
+RTIMED=./target/release/rtimed RTIMEC=./target/release/rtimec bash tools/smoke/smoke.sh
 ```
 
 ## Layout

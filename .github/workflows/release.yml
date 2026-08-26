@@ -1,0 +1,140 @@
+name: release
+
+# Produces the installable artifacts for every supported platform. Runs on a
+# tag, and on demand so the packaging path is exercised before a release rather
+# than discovered broken during one.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo install cargo-deb cargo-generate-rpm --locked
+      - name: Cross linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+          mkdir -p .cargo
+          printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p rusty_time-daemon -p rusty_time-ctl
+      # A static musl build is the artifact that runs anywhere, including a
+      # container with no libc of its own.
+      - name: Tarball
+        run: |
+          mkdir -p dist
+          tar -czf "dist/rusty_time-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" rtimed rtimec
+      - name: Smoke the artifact we just built
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          RTIMED=target/${{ matrix.target }}/release/rtimed \
+          RTIMEC=target/${{ matrix.target }}/release/rtimec \
+            bash tools/smoke/smoke.sh
+      - name: Packages
+        run: |
+          cargo deb -p rusty_time-daemon --target ${{ matrix.target }} --no-build -o dist/ || true
+          cargo generate-rpm -p crates/rusty_time-daemon --target ${{ matrix.target }} -o dist/ || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/
+
+  macos:
+    name: macos universal2
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - name: Build both architectures
+        run: |
+          cargo build --release --target x86_64-apple-darwin -p rusty_time-daemon -p rusty_time-ctl
+          cargo build --release --target aarch64-apple-darwin -p rusty_time-daemon -p rusty_time-ctl
+      # One binary that runs on Intel and Apple Silicon, which is what a .pkg
+      # is expected to contain.
+      - name: Fuse universal2
+        run: |
+          mkdir -p dist/bin
+          for bin in rtimed rtimec; do
+            lipo -create \
+              "target/x86_64-apple-darwin/release/$bin" \
+              "target/aarch64-apple-darwin/release/$bin" \
+              -output "dist/bin/$bin"
+            lipo -info "dist/bin/$bin"
+          done
+      # macOS is the one platform this project cannot run locally, so CI is
+      # where its smoke rig actually executes.
+      - name: Smoke rig
+        run: RTIMED=dist/bin/rtimed RTIMEC=dist/bin/rtimec bash tools/smoke/smoke.sh
+      - name: Component package
+        run: |
+          mkdir -p dist/root/usr/local/bin
+          cp dist/bin/rtimed dist/bin/rtimec dist/root/usr/local/bin/
+          pkgbuild --root dist/root --identifier network.mata.rusty_time \
+            --version "${GITHUB_REF_NAME#v}" --install-location / \
+            dist/rusty_time-universal2.pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal2
+          path: dist/*.pkg
+
+  windows:
+    name: windows ${{ matrix.target }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p rusty_time-daemon -p rusty_time-ctl
+      - name: Smoke the artifact we just built
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          RTIMED=target/${{ matrix.target }}/release/rtimed.exe \
+          RTIMEC=target/${{ matrix.target }}/release/rtimec.exe \
+            bash tools/smoke/smoke.sh
+      - name: Zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path `
+            "target/${{ matrix.target }}/release/rtimed.exe", `
+            "target/${{ matrix.target }}/release/rtimec.exe", `
+            "packaging/windows/install-service.cmd" `
+            -DestinationPath "dist/rusty_time-${{ matrix.target }}.zip"
+      - name: MSI
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix build packaging/windows/rusty_time.wxs `
+            -d BinDir="target/${{ matrix.target }}/release" `
+            -o "dist/rusty_time-${{ matrix.target }}.msi"
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.target }}
+          path: dist/

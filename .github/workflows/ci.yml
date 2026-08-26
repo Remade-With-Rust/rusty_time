@@ -91,6 +91,28 @@ jobs:
             RTIMEC=~/rt-target/release/rtimec \
             bash tools/corpus/m4_interop_chrony.sh
 
+  # M5 gate: the smoke rig on every platform we ship, including macOS — the one
+  # this project cannot run locally.
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release -p rusty_time-daemon -p rusty_time-ctl
+      - name: Smoke rig
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            RTIMED=./target/release/rtimed.exe RTIMEC=./target/release/rtimec.exe \
+              bash tools/smoke/smoke.sh
+          else
+            RTIMED=./target/release/rtimed RTIMEC=./target/release/rtimec \
+              bash tools/smoke/smoke.sh
+          fi
+
   # S12: deterministic server-load counts. Fast, and it has caught real
   # defects (see corpus/LEDGER.md).
   server-load:

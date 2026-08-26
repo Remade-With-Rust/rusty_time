@@ -32,6 +32,9 @@ use std::time::Duration;
 /// table is a memory-exhaustion lever for anyone spoofing source addresses.
 const CLIENT_TABLE_CAPACITY: usize = 16_384;
 
+/// How often the service-manager status line is refreshed.
+const STATUS_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The rate-limiter's notion of "a client": the source **address only**, never
 /// the port.
 ///
@@ -256,7 +259,18 @@ pub fn run(opts: &ServeOptions) -> i32 {
                 eprintln!("rtimed serve: control plane unavailable: {e}");
             }
         });
-        println!("rtimed: control socket at {}", opts.control_path);
+        // Print what it *resolved to*, not what was typed: on Windows a path
+        // becomes a loopback port, and an operator who cannot see that has no
+        // way to tell why `rtimec` is not connecting.
+        match rusty_time_api::control_endpoint(&opts.control_path) {
+            rusty_time_api::ControlEndpoint::UnixPath(p) => {
+                println!("rtimed: control socket at {p}")
+            }
+            rusty_time_api::ControlEndpoint::Loopback(port) => println!(
+                "rtimed: control on 127.0.0.1:{port} (from '{}')",
+                opts.control_path
+            ),
+        }
     }
 
     if opts.nts {
@@ -287,12 +301,21 @@ pub fn run(opts: &ServeOptions) -> i32 {
         std::thread::spawn(move || ke_accept_loop(listener, tls_config, ke_state, ntp_port));
     }
 
-    let socket = match UdpSocket::bind(&opts.ntp_bind) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("rtimed serve: binding NTP {}: {e}", opts.ntp_bind);
-            return 1;
+    // Prefer a socket the service manager already opened. Under systemd socket
+    // activation that socket was bound as root on port 123, which lets the
+    // daemon itself run without the privilege to bind it.
+    let socket = match crate::service::activated_udp_socket() {
+        Some(s) => {
+            println!("rtimed: using the socket passed by the service manager");
+            s
         }
+        None => match UdpSocket::bind(&opts.ntp_bind) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("rtimed serve: binding NTP {}: {e}", opts.ntp_bind);
+                return 1;
+            }
+        },
     };
     println!(
         "rtimed: NTP listening on {} (stratum {}, rate limit 1 per {} s burst {})",
@@ -301,6 +324,21 @@ pub fn run(opts: &ServeOptions) -> i32 {
         2f64.powi(opts.rate_limit.interval_log2 as i32),
         opts.rate_limit.burst
     );
+
+    // Announce readiness only now: everything a client can reach is up, so a
+    // supervisor that waits for this is waiting for something true.
+    let caps = rusty_time_clock::capabilities();
+    crate::service::notify_ready(&format!(
+        "serving NTP on {} (stratum {}{})",
+        opts.ntp_bind,
+        opts.stratum,
+        if caps.can_discipline {
+            ""
+        } else {
+            ", clock read-only"
+        }
+    ));
+
     ntp_serve_loop(&socket, &state);
     0
 }
@@ -515,8 +553,26 @@ fn ntp_serve_loop(socket: &UdpSocket, state: &Arc<Mutex<ServerState>>) {
     // kernel boundary is not spending it answering NTP.
     let mut bufs = vec![[0u8; 1024]; net::BATCH_SIZE];
     let mut received = Vec::with_capacity(net::BATCH_SIZE);
+    // Refresh the supervisor's one-line status occasionally, so `systemctl
+    // status` shows what the server is actually doing rather than only what it
+    // said at startup. Cheap: once a minute, off the hot path.
+    let mut next_status = std::time::Instant::now() + STATUS_INTERVAL;
 
     loop {
+        if std::time::Instant::now() >= next_status {
+            next_status = std::time::Instant::now() + STATUS_INTERVAL;
+            if let Ok(guard) = state.lock() {
+                let stats = guard.clients.stats;
+                crate::service::notify_status(&format!(
+                    "{} requests, {} answered, {} rate-limited, {} clients",
+                    stats.requests,
+                    stats.responses,
+                    stats.dropped_rate_limit,
+                    guard.clients.len()
+                ));
+            }
+        }
+
         match net::wait_readable(socket, Duration::from_millis(500)) {
             Ok(true) => {}
             Ok(false) => continue,

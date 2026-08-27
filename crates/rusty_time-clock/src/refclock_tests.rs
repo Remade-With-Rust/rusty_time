@@ -129,7 +129,14 @@ fn kernel_receive_timestamps_are_produced_when_the_platform_supplies_them() {
     for _ in 0..50 {
         if crate::net::wait_readable(&server, std::time::Duration::from_millis(100))
             .unwrap_or(false)
-            && crate::net::recv_batch(&server, &mut bufs, &mut out).unwrap_or(0) > 0
+            && crate::net::recv_batch(
+                &server,
+                &mut bufs,
+                &mut crate::net::BatchScratch::new(),
+                &mut out,
+            )
+            .unwrap_or(0)
+                > 0
         {
             received = out.first().copied();
             break;

@@ -10,7 +10,7 @@
 
 use crate::ntp::NtpTimestamp;
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 
 /// Rate-limit policy, mirroring chrony's `ratelimit interval/burst/leak`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -134,8 +134,6 @@ pub struct ClientRecord {
     /// answered once is capable, but only a client that asks is using it, and
     /// an operator reading a client log needs the second fact.
     pub interleaved_now: bool,
-    /// This record's position in the eviction order.
-    order_seq: u64,
 }
 
 impl ClientRecord {
@@ -151,7 +149,6 @@ impl ClientRecord {
             last_transmit: None,
             last_receive_sent: None,
             interleaved_now: false,
-            order_seq: 0,
         }
     }
 }
@@ -170,6 +167,168 @@ pub struct ServerStats {
     pub evicted: u64,
 }
 
+/// End-of-list sentinel for the intrusive recency links.
+const NIL: u32 = u32::MAX;
+
+/// Odd 64-bit multiplier for the key mixer. Any odd constant with a good bit
+/// spread works; this one is xxHash's prime 1.
+const MIX: u64 = 0x9e37_79b1_85eb_ca87;
+
+/// A fast, **seeded** hasher for short keys.
+///
+/// The default `HashMap` hasher is SipHash-1-3, chosen for resistance to
+/// collision floods. That resistance is not optional here — the key is a
+/// client's source address, which an attacker picks — but SipHash's cost is
+/// out of proportion to a 4-to-17-byte key: with everything else in the client
+/// table fixed, callgrind still attributed ~32% of the server's per-request
+/// instructions to hashing one address once.
+///
+/// So this keeps the property and drops the price. The seed is drawn from the
+/// OS once per process via `RandomState`, exactly as SipHash's keys are, so an
+/// attacker cannot compute which addresses collide without first learning a
+/// secret they never see. What is given up is SipHash's *proof* against an
+/// adversary who somehow does learn the seed; what is kept is the practical
+/// defence, on a table that is additionally bounded to a fixed capacity with
+/// LRU eviction, so even a successful collision attack cannot grow a chain
+/// without bound.
+#[derive(Clone, Copy)]
+pub struct ClientHashBuilder {
+    seed: u64,
+}
+
+impl Default for ClientHashBuilder {
+    fn default() -> Self {
+        // `RUSTY_TIME_HASH_SEED` pins the seed. It exists for measurement: a
+        // random seed changes which keys collide, which moves the probe count,
+        // which makes an instruction-count harness reproducible only to about
+        // 0.002% instead of exactly. That is far below any effect worth acting
+        // on, but an instrument that is exact is worth more than one that is
+        // nearly exact, and the pin costs one environment read per table.
+        //
+        // It is emphatically NOT for production: a known seed is a known
+        // collision set, which is the property this hasher is seeded to deny.
+        if let Ok(pinned) = std::env::var("RUSTY_TIME_HASH_SEED")
+            && let Ok(seed) = pinned.parse::<u64>()
+        {
+            return ClientHashBuilder { seed };
+        }
+        // One OS-random draw per table, reusing std's entropy source rather
+        // than adding a dependency for it.
+        use std::hash::BuildHasher as _;
+        let seed = std::collections::hash_map::RandomState::new().hash_one(0xA5A5_5A5Au64);
+        ClientHashBuilder { seed }
+    }
+}
+
+impl std::hash::BuildHasher for ClientHashBuilder {
+    type Hasher = ClientHasher;
+    fn build_hasher(&self) -> ClientHasher {
+        ClientHasher { state: self.seed }
+    }
+}
+
+pub struct ClientHasher {
+    state: u64,
+}
+
+impl ClientHasher {
+    #[inline]
+    fn mix(&mut self, value: u64) {
+        self.state = (self.state ^ value).wrapping_mul(MIX);
+    }
+}
+
+impl Hasher for ClientHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.mix(u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rest.len()].copy_from_slice(rest);
+            // Fold the length in so trailing zero bytes cannot alias a shorter
+            // key against a longer one.
+            self.mix(u64::from_le_bytes(buf) ^ (rest.len() as u64) << 56);
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.mix(value as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.mix(value as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        // splitmix64's finalizer: full avalanche in a handful of instructions,
+        // which is what stops near-adjacent addresses landing in near-adjacent
+        // buckets.
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+/// One client's storage: its key, its record, and its place in the recency
+/// list. Slots are stable — an index handed out stays valid until the client
+/// is evicted — which is what makes the list links safe as plain integers.
+struct Slot<K> {
+    key: K,
+    record: ClientRecord,
+    /// Toward the most-recently-used end.
+    prev: u32,
+    /// Toward the least-recently-used end.
+    next: u32,
+    /// Bumped every time this slot is handed to a new client, so a handle kept
+    /// across an eviction is detected rather than silently addressing whoever
+    /// took the slot over.
+    generation: u32,
+}
+
+/// A resolved position in the table.
+///
+/// One request touches the same client four times — admit, choose a response
+/// mode, record what was sent, then record the true transmit time after the
+/// packet leaves. Looking the key up each time cost four hashes of the same
+/// address, which callgrind put at ~51% of what the server does per request
+/// once the recency index was fixed. A handle turns the three follow-ups into
+/// array indexing.
+///
+/// It is deliberately not a raw index: the generation makes a handle that
+/// outlived its client detectably stale instead of quietly wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientHandle {
+    slot: u32,
+    generation: u32,
+}
+
+impl ClientHandle {
+    /// A handle that resolves to nothing — what a request rejected by the
+    /// global limiter gets, having never reached a per-client record.
+    pub const INVALID: ClientHandle = ClientHandle {
+        slot: NIL,
+        generation: 0,
+    };
+}
+
 /// Bounded most-recently-used client table.
 ///
 /// The bound is the point: an unbounded map is a memory-exhaustion lever for
@@ -185,12 +344,17 @@ pub struct ServerStats {
 /// `order` index makes it O(log n) *and* deterministic, where a `HashMap` scan
 /// depends on iteration order that differs between instances.
 pub struct ClientTable<K: Eq + Hash + Ord + Clone> {
-    clients: HashMap<K, ClientRecord>,
-    /// (touch sequence, key), ordered oldest first.
-    order: std::collections::BTreeSet<(u64, K)>,
-    /// Monotonic counter giving every touch a distinct, ordered stamp. Time
-    /// cannot serve here: two requests can share a `last_seen` reading.
-    next_seq: u64,
+    /// Key to slot. The only hashed structure, and the reason a request costs
+    /// one hash instead of several.
+    index: HashMap<K, u32, ClientHashBuilder>,
+    /// Records in stable storage. Slots are handed out from `free` and never
+    /// move, which is what lets the ordering below be pointers rather than
+    /// comparisons.
+    slots: Vec<Slot<K>>,
+    free: Vec<u32>,
+    /// Ends of the intrusive most-recently-used list threaded through `slots`.
+    mru: u32,
+    lru: u32,
     /// Global token bucket: level and the time it was last refilled.
     global_tokens: f64,
     global_last: Option<f64>,
@@ -198,69 +362,199 @@ pub struct ClientTable<K: Eq + Hash + Ord + Clone> {
     global_drops_since_kod: u32,
     capacity: usize,
     config: RateLimitConfig,
+    /// Tokens a client earns per second — `2^-interval_log2`, precomputed.
+    ///
+    /// It derives only from `config`, which is fixed at construction, so
+    /// recomputing it per request was a `powi` call on the hot path for a
+    /// constant. Callgrind put the server's per-request cost at 3053 Ir; this
+    /// is one of the cheaper pieces of that, and it is free to remove.
+    refill_per_s: f64,
     pub stats: ServerStats,
 }
 
 impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     pub fn new(capacity: usize, config: RateLimitConfig) -> Self {
         ClientTable {
-            clients: HashMap::new(),
-            order: std::collections::BTreeSet::new(),
-            next_seq: 0,
+            index: HashMap::with_capacity_and_hasher(capacity.max(1), ClientHashBuilder::default()),
+            slots: Vec::with_capacity(capacity.max(1)),
+            free: Vec::new(),
+            mru: NIL,
+            lru: NIL,
             global_tokens: config.global_burst,
             global_last: None,
             global_drops_since_kod: 0,
             capacity: capacity.max(1),
             config,
+            refill_per_s: 2f64.powi(-(config.interval_log2 as i32)),
             stats: ServerStats::default(),
         }
     }
 
-    /// Move a client to the most-recent end of the eviction order.
-    fn touch(&mut self, key: &K) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        if let Some(record) = self.clients.get_mut(key) {
-            let old = record.order_seq;
-            record.order_seq = seq;
-            self.order.remove(&(old, key.clone()));
-            self.order.insert((seq, key.clone()));
+    /// Detach a slot from the recency list.
+    fn unlink(&mut self, i: u32) {
+        let (prev, next) = {
+            let slot = &self.slots[i as usize];
+            (slot.prev, slot.next)
+        };
+        if prev == NIL {
+            self.mru = next;
+        } else {
+            self.slots[prev as usize].next = next;
+        }
+        if next == NIL {
+            self.lru = prev;
+        } else {
+            self.slots[next as usize].prev = prev;
         }
     }
 
+    /// Put a detached slot at the most-recent end.
+    fn link_front(&mut self, i: u32) {
+        let old = self.mru;
+        {
+            let slot = &mut self.slots[i as usize];
+            slot.prev = NIL;
+            slot.next = old;
+        }
+        if old == NIL {
+            self.lru = i;
+        } else {
+            self.slots[old as usize].prev = i;
+        }
+        self.mru = i;
+    }
+
+    /// Move a client to the most-recent end of the eviction order.
+    ///
+    /// Six pointer writes, no hashing, no comparisons, no allocation. The
+    /// previous form kept a `BTreeSet<(seq, K)>` and did a remove plus an
+    /// insert — two O(log n) tree walks and two key clones — on *every*
+    /// request. Callgrind attributed 23% of the whole server hot path to that
+    /// tree's `search_tree`, for an index that is only ever read when the
+    /// table is full and something has to be evicted.
+    fn touch(&mut self, i: u32) {
+        if self.mru == i {
+            return; // already most-recent; the common case for a chatty client
+        }
+        self.unlink(i);
+        self.link_front(i);
+    }
+
+    /// The real per-client footprint: the record, the slot links that order
+    /// it, and the index entry that finds it.
+    ///
+    /// Reported by the type rather than estimated by the caller, because the
+    /// corpus quotes this number and an estimate drifts silently when the
+    /// structure changes. It did: the figure used to be `size_of::<ClientRecord>()`
+    /// alone, which stopped being the whole story the moment records moved
+    /// into slots.
+    pub fn bytes_per_client() -> usize {
+        core::mem::size_of::<Slot<K>>()
+            + core::mem::size_of::<K>()          // the index's own copy of the key
+            + core::mem::size_of::<u32>()        // the slot number it maps to
+            + 1 // hashbrown's control byte
+    }
+
     pub fn len(&self) -> usize {
-        self.clients.len()
+        self.index.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
+        self.index.is_empty()
     }
 
     pub fn get(&self, key: &K) -> Option<&ClientRecord> {
-        self.clients.get(key)
+        let i = *self.index.get(key)?;
+        Some(&self.slots[i as usize].record)
     }
 
     /// The MRU report: most recently seen first, at most `limit` entries.
+    ///
+    /// Walks the recency list, which is **already** in this order — `admit`
+    /// moves a client to the front and sets `last_seen` in the same breath, so
+    /// list order and descending `last_seen` are the same thing.
+    ///
+    /// The previous form cloned every record in the table into a `Vec`, sorted
+    /// all of them, and threw away all but `limit`. At the daemon's capacity
+    /// of 16384 that is ~1.5 MiB copied and an O(n log n) sort to answer a
+    /// ten-row status query. This is O(limit) and allocates once, for exactly
+    /// the rows returned.
     pub fn most_recent(&self, limit: usize) -> Vec<(K, ClientRecord)> {
-        let mut all: Vec<(K, ClientRecord)> =
-            self.clients.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        all.sort_by(|a, b| b.1.last_seen.total_cmp(&a.1.last_seen));
-        all.truncate(limit);
-        all
+        let mut out = Vec::with_capacity(limit.min(self.index.len()));
+        let mut at = self.mru;
+        while at != NIL && out.len() < limit {
+            let slot = &self.slots[at as usize];
+            out.push((slot.key.clone(), slot.record));
+            at = slot.next;
+        }
+        out
     }
 
-    /// Drop the least recently seen client. O(log n) via the order index.
+    /// Drop the least recently seen client. O(1): it is the list's tail.
     fn evict_one(&mut self) {
-        if let Some(entry) = self.order.iter().next().cloned() {
-            self.order.remove(&entry);
-            self.clients.remove(&entry.1);
-            self.stats.evicted += 1;
+        let victim = self.lru;
+        if victim == NIL {
+            return;
+        }
+        self.unlink(victim);
+        let key = self.slots[victim as usize].key.clone();
+        self.index.remove(&key);
+        self.free.push(victim);
+        self.stats.evicted += 1;
+    }
+
+    /// Take a slot for a new client, reusing an evicted one where possible.
+    fn alloc_slot(&mut self, key: K, record: ClientRecord) -> u32 {
+        let i = match self.free.pop() {
+            Some(i) => {
+                let slot = &mut self.slots[i as usize];
+                slot.key = key;
+                slot.record = record;
+                slot.prev = NIL;
+                slot.next = NIL;
+                // New occupant, new generation: any handle still naming this
+                // slot from its previous client now fails to resolve.
+                slot.generation = slot.generation.wrapping_add(1);
+                i
+            }
+            None => {
+                self.slots.push(Slot {
+                    key,
+                    record,
+                    prev: NIL,
+                    next: NIL,
+                    generation: 0,
+                });
+                (self.slots.len() - 1) as u32
+            }
+        };
+        self.link_front(i);
+        i
+    }
+
+    /// Turn a handle back into a slot, or `None` if it has gone stale.
+    fn resolve(&self, handle: ClientHandle) -> Option<usize> {
+        let i = handle.slot as usize;
+        let slot = self.slots.get(i)?;
+        (slot.generation == handle.generation).then_some(i)
+    }
+
+    fn handle_for(&self, slot: u32) -> ClientHandle {
+        ClientHandle {
+            slot,
+            generation: self.slots[slot as usize].generation,
         }
     }
 
     /// Admit one request: refill the client's bucket, decide its fate, and
     /// record it. `now` is monotonic seconds.
     pub fn admit(&mut self, key: &K, now: f64) -> Disposition {
+        self.admit_handle(key, now).0
+    }
+
+    /// `admit`, also returning the handle that addresses this client, so the
+    /// rest of the request never has to hash the key again.
+    pub fn admit_handle(&mut self, key: &K, now: f64) -> (Disposition, ClientHandle) {
         self.stats.requests += 1;
 
         // Global ceiling first. It is checked before the per-client bucket so
@@ -281,35 +575,38 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
                 if self.global_drops_since_kod >= period {
                     self.global_drops_since_kod = 0;
                     self.stats.kiss_of_death += 1;
-                    return Disposition::KissOfDeath;
+                    return (Disposition::KissOfDeath, ClientHandle::INVALID);
                 }
-                return Disposition::Drop;
+                return (Disposition::Drop, ClientHandle::INVALID);
             }
         }
 
-        if !self.clients.contains_key(key) {
-            if self.clients.len() >= self.capacity {
-                self.evict_one();
+        // One hash for the common case (a client we already know), two for a
+        // client we have never seen. The previous form hashed three times per
+        // request: `contains_key`, then `touch`'s `get_mut`, then a final
+        // `get_mut` to reach the record.
+        let slot = match self.index.get(key) {
+            Some(&i) => {
+                self.touch(i);
+                i
             }
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            let mut record = ClientRecord::new(now, self.config.burst);
-            record.order_seq = seq;
-            self.clients.insert(key.clone(), record);
-            self.order.insert((seq, key.clone()));
-        } else {
-            self.touch(key);
-        }
+            None => {
+                if self.index.len() >= self.capacity {
+                    self.evict_one();
+                }
+                let i = self.alloc_slot(key.clone(), ClientRecord::new(now, self.config.burst));
+                self.index.insert(key.clone(), i);
+                i
+            }
+        };
 
         let config = self.config;
-        let record = self
-            .clients
-            .get_mut(key)
-            .expect("record was just inserted if missing");
+        let rate = self.refill_per_s;
+        let handle = self.handle_for(slot);
+        let record = &mut self.slots[slot as usize].record;
 
         // Refill: one token per 2^interval seconds since we last saw them.
         let elapsed = (now - record.last_seen).max(0.0);
-        let rate = 2f64.powi(-(config.interval_log2 as i32));
         record.tokens = (record.tokens + elapsed * rate).min(config.burst as f64);
         record.last_seen = now;
         record.requests += 1;
@@ -320,7 +617,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
             self.stats.responses += 1;
             // Spend a global token only when a response is actually produced.
             self.global_tokens -= 1.0;
-            return Disposition::Respond;
+            return (Disposition::Respond, handle);
         }
 
         record.dropped += 1;
@@ -334,9 +631,9 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
         if record.drops_since_kod >= period {
             record.drops_since_kod = 0;
             self.stats.kiss_of_death += 1;
-            Disposition::KissOfDeath
+            (Disposition::KissOfDeath, handle)
         } else {
-            Disposition::Drop
+            (Disposition::Drop, handle)
         }
     }
 
@@ -347,9 +644,29 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     /// timestamp. That is unforgeable in the useful sense: only a client that
     /// actually saw our last response knows it.
     pub fn response_mode(&mut self, key: &K, request_origin: NtpTimestamp) -> ResponseMode {
-        let Some(record) = self.clients.get(key) else {
+        match self.index.get(key) {
+            Some(&i) => {
+                let handle = self.handle_for(i);
+                self.response_mode_at(handle, request_origin)
+            }
+            None => ResponseMode::Basic,
+        }
+    }
+
+    /// `response_mode` addressed by handle — no hashing.
+    pub fn response_mode_at(
+        &mut self,
+        handle: ClientHandle,
+        request_origin: NtpTimestamp,
+    ) -> ResponseMode {
+        // One lookup, not two. The original read the record with `get` and then
+        // re-found the same entry with `get_mut` to store `interleaved_now` —
+        // a second hash of the same key on the per-request path, where hashing
+        // was measured at ~38% of all instructions.
+        let Some(i) = self.resolve(handle) else {
             return ResponseMode::Basic;
         };
+        let record = &mut self.slots[i].record;
         let (Some(sent_receive), Some(prev_transmit)) =
             (record.last_receive_sent, record.last_transmit)
         else {
@@ -360,9 +677,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
         // recent qualifies; anything older falls back to basic rather than
         // answering with a transmit timestamp from the wrong exchange.
         let interleaved = request_origin == sent_receive && !request_origin.is_zero();
-        if let Some(record) = self.clients.get_mut(key) {
-            record.interleaved_now = interleaved;
-        }
+        record.interleaved_now = interleaved;
         if interleaved {
             self.stats.interleaved_responses += 1;
             ResponseMode::Interleaved { prev_transmit }
@@ -373,7 +688,21 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
 
     /// Record what we received and what we told the client, after answering.
     pub fn note_response(&mut self, key: &K, receive: NtpTimestamp, receive_sent: NtpTimestamp) {
-        if let Some(record) = self.clients.get_mut(key) {
+        if let Some(&i) = self.index.get(key) {
+            let handle = self.handle_for(i);
+            self.note_response_at(handle, receive, receive_sent);
+        }
+    }
+
+    /// `note_response` addressed by handle — no hashing.
+    pub fn note_response_at(
+        &mut self,
+        handle: ClientHandle,
+        receive: NtpTimestamp,
+        receive_sent: NtpTimestamp,
+    ) {
+        if let Some(i) = self.resolve(handle) {
+            let record = &mut self.slots[i].record;
             record.last_receive = Some(receive);
             record.last_receive_sent = Some(receive_sent);
         }
@@ -384,8 +713,20 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     /// timestamp the basic exchange cannot report because the packet has not
     /// left yet when its own transmit field is written.
     pub fn note_transmit(&mut self, key: &K, transmit: NtpTimestamp) {
-        if let Some(record) = self.clients.get_mut(key) {
-            record.last_transmit = Some(transmit);
+        if let Some(&i) = self.index.get(key) {
+            self.slots[i as usize].record.last_transmit = Some(transmit);
+        }
+    }
+
+    /// `note_transmit` addressed by handle — no hashing.
+    ///
+    /// This is the one called after `send`, so a handle taken before the write
+    /// is used after it. The generation check is what makes that safe: if the
+    /// client was evicted in between, the update is dropped rather than landing
+    /// on whoever inherited the slot.
+    pub fn note_transmit_at(&mut self, handle: ClientHandle, transmit: NtpTimestamp) {
+        if let Some(i) = self.resolve(handle) {
+            self.slots[i].record.last_transmit = Some(transmit);
         }
     }
 

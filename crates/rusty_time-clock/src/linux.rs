@@ -10,9 +10,30 @@ pub struct SystemClock;
 
 /// `adjtimex` accepts frequency in 2^-16 ppm, so this is its granularity.
 const SLEW_RESOLUTION_PPM: f64 = 1.0 / 65_536.0;
-/// The kernel clamps `ADJ_FREQUENCY` at ±32768 ppm (its scaled field is an i32
-/// of 2^-16 ppm units); the discipline loop's own limit is far tighter.
-const MAX_SLEW_PPM: f64 = 32_767.0;
+/// The kernel's nominal tick, in microseconds — `1e6 / USER_HZ`.
+///
+/// Read from the C library rather than assumed: USER_HZ is 100 on almost every
+/// build, but it is 1000 on some, and the tick arithmetic is wrong by 10x if
+/// this is guessed.
+fn nominal_tick_us() -> i64 {
+    // SAFETY: sysconf takes an int and returns a long; no pointers involved.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        10_000
+    } else {
+        1_000_000 / hz as i64
+    }
+}
+
+/// The fastest this kernel can actually be slewed.
+///
+/// `ADJ_FREQUENCY` alone stops at 500 ppm; combined with the tick the reachable
+/// range is about ±100000 ppm. This is what `capabilities()` advertises, and
+/// the client loop configures its discipline from it — so it must be a rate the
+/// driver can genuinely deliver, not the width of a struct field.
+fn max_slew_ppm() -> f64 {
+    crate::slew::linux_max_slew_ppm(nominal_tick_us())
+}
 
 fn errno_detail(op: &'static str) -> ClockError {
     ClockError {
@@ -55,7 +76,7 @@ pub(crate) fn platform_capabilities() -> crate::ClockCapabilities {
         discipline_requirement: "CAP_SYS_TIME (run as root, or grant the binary the file \
                                  capability: setcap cap_sys_time+ep /usr/sbin/rtimed)",
         slew_resolution_ppm: Some(SLEW_RESOLUTION_PPM),
-        max_slew_ppm: MAX_SLEW_PPM,
+        max_slew_ppm: max_slew_ppm(),
         batch_receive: true,
         mono_resolution_ns: None,
     }
@@ -74,6 +95,21 @@ impl ClockRead for SystemClock {
             return Err(errno_detail("clock_gettime(REALTIME)"));
         }
         Ok(ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128)
+    }
+
+    fn wall_parts(&self) -> Result<(i64, u32), ClockError> {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: as above. This is what the kernel hands back anyway, so
+        // returning it unchanged avoids composing a 128-bit nanosecond count
+        // only for the caller to divide it apart again.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+        if rc != 0 {
+            return Err(errno_detail("clock_gettime(REALTIME)"));
+        }
+        Ok((ts.tv_sec as i64, ts.tv_nsec as u32))
     }
 
     fn mono_s(&self) -> Result<f64, ClockError> {
@@ -127,17 +163,23 @@ impl ClockDrive for SystemClock {
                 // The daemon re-plans every poll, so the drain is folded into the
                 // commanded frequency until the next plan (mission plan §6.1; the
                 // TIMECORP simulator models exactly this driver behavior).
-                let drain = drain_rate_ppm.copysign(drain_offset);
-                let total_ppm = (freq_ppm + drain).clamp(-MAX_SLEW_PPM, MAX_SLEW_PPM);
+                let total_ppm =
+                    crate::slew::total_ppm(freq_ppm, drain_offset, drain_rate_ppm, max_slew_ppm());
+                // Split across the tick and the frequency knob: the kernel
+                // clamps ADJ_FREQUENCY at 500 ppm, so anything faster has to
+                // come from the tick or it is silently not applied at all.
+                let (tick_us, residual_ppm) =
+                    crate::slew::linux_tick_and_freq(total_ppm, nominal_tick_us());
                 let mut tx: libc::timex =
                     // SAFETY: plain-old-data, zeroed is valid.
                     unsafe { core::mem::zeroed() };
-                tx.modes = libc::ADJ_FREQUENCY;
-                tx.freq = (total_ppm * FREQ_SCALE) as libc::c_long;
+                tx.modes = libc::ADJ_FREQUENCY | libc::ADJ_TICK;
+                tx.freq = (residual_ppm * FREQ_SCALE) as libc::c_long;
+                tx.tick = tick_us as libc::c_long;
                 // SAFETY: tx is valid and exclusively owned for the call.
                 let rc = unsafe { libc::clock_adjtime(libc::CLOCK_REALTIME, &mut tx) };
                 if rc < 0 {
-                    return Err(errno_detail("clock_adjtime(ADJ_FREQUENCY)"));
+                    return Err(errno_detail("clock_adjtime(ADJ_FREQUENCY|ADJ_TICK)"));
                 }
                 Ok(())
             }

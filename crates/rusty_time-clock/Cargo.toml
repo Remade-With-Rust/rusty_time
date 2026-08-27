@@ -1,11 +1,16 @@
 [package]
 name = "rusty_time-clock"
-description = "Platform clock seam: read, slew, step — linux / macos / windows / virtual"
+description = "Platform clock seam for rusty_time: read, slew and step the system clock on Linux (clock_adjtime + ADJ_TICK), macOS (adjtime) and Windows (SetSystemTimeAdjustmentPrecise), plus batched UDP receive and kernel receive timestamps."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-clock"
+readme = "README.md"
+keywords = ["ntp", "clock", "adjtimex", "time", "syscall"]
+categories = ["date-and-time", "os", "hardware-support"]
 
 [dependencies]
 rusty_time-core = { workspace = true }
@@ -15,6 +20,15 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Performance", "Win32_System_Time", "Win32_Security", "Win32_System_Threading"] }
+
+# recv_batch's per-call setup, as a deterministic instruction count. Run under
+# callgrind; see the file header for the two arms. `harness = false` because
+# this is a plain binary, not a libtest benchmark — without it cargo links
+# libtest's main instead and the binary runs zero tests while looking like it
+# ran fine.
+[[bench]]
+name = "recv_setup"
+harness = false
 
 # The syscall boundary: the workspace-wide `unsafe_code = "deny"` is lifted for
 # this one crate, deliberately. Every unsafe block carries a SAFETY invariant.

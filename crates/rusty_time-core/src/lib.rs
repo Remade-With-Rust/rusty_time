@@ -9,6 +9,7 @@
 //! the local clock** to match the source (RFC 5905 θ). Positive offset = local is
 //! behind.
 
+pub mod client;
 pub mod config;
 pub mod discipline;
 pub mod filter;
@@ -23,6 +24,7 @@ pub use filter::{RegressEstimate, Sample, SampleRegister};
 pub use ntp::{LeapIndicator, Mode, NtpPacket, NtpShort, NtpTimestamp, ParseError};
 pub use select::{Selection, SourceEstimate};
 pub use server::{
-    ClientRecord, ClientTable, Disposition, RateLimitConfig, ResponseMode, ServerStats,
+    ClientHandle, ClientRecord, ClientTable, Disposition, RateLimitConfig, ResponseMode,
+    ServerStats,
 };
 pub use vclock::VirtualClock;

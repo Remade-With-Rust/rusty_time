@@ -308,15 +308,21 @@ in `corpus/LEDGER.md` with the run that produced it (the rusty_zstd refusal disc
 
 ### 7.4 Release gates (v1.0 ships when TIMECORP says)
 
-| Gate | Bar |
-|---|---|
-| G1 accuracy | steady-state p95 offset ≤ chrony's on ≥ 12 of 14 sim scenarios, **beat** on ≥ 7; no scenario > 1.25× chrony |
-| G2 convergence | S6 time-to-1 ms ≤ chrony; S7 respects the same makestep policy chrony is configured with |
-| G3 holdover | S10 24 h drift ≤ chrony ± noise floor |
-| G4 server | S12 responses/sec ≥ chrony on the same rig (recvmmsg is our lever); p99 ≤ chrony |
-| G5 footprint | RSS and CPU/day ≤ 1.5× chrony (report honestly; chrony is very lean — parity is a fine v1 story, per the rusty_alloc precedent) |
-| G6 vs ntpd-rs | ≥ chrony-level margin over ntpd-rs on S1–S10 — the "why not ntpd-rs" receipt |
-| G7 correctness | all §7.1 interop + conformance + fuzz gates green — a speed win that fails interop is a bug with good timing |
+| Gate | Bar | Status |
+|---|---|---|
+| G1 accuracy | steady-state p95 offset ≤ chrony's on ≥ 12 of 14 sim scenarios, **beat** on ≥ 7; no scenario > 1.25× chrony | ⚠️ **PARTIAL** — 5 of 14 scenarios measured against chrony. Within the cap on S1 (0.89×), S8 (1.05×), S2 (1.07×), S4 (1.05×); **S6 breaches at 2.13×** |
+| G2 convergence | S6 time-to-1 ms ≤ chrony; S7 respects the same makestep policy chrony is configured with | ❌ **FAIL** — S6 190 s vs chrony 12 s. Cause identified (drain policy removes ~⅓ of the offset per poll); retune pending its own validation pass |
+| G3 holdover | S10 24 h drift ≤ chrony ± noise floor | not measured |
+| G4 server | S12 responses/sec ≥ chrony on the same rig (recvmmsg is our lever); p99 ≤ chrony | not measured |
+| G5 footprint | RSS and CPU/day ≤ 1.5× chrony (report honestly; chrony is very lean — parity is a fine v1 story, per the rusty_alloc precedent) | not measured |
+| G6 vs ntpd-rs | ≥ chrony-level margin over ntpd-rs on S1–S10 — the "why not ntpd-rs" receipt | not measured (interop PASS at M4) |
+| G7 correctness | all §7.1 interop + conformance + fuzz gates green — a speed win that fails interop is a bug with good timing | ✅ **PASS** except HW1 (needs GPS/PPS hardware) |
+
+The cross-implementation arm is `tools/corpus/bench_vs_chrony.sh`, run under
+**clknetsim** — chrony's own simulator, so the baseline uses the tooling its
+authors trust. Both arms share one config per scenario and talk to the same
+chronyd stratum-1 server; error is read from clknetsim's ground-truth offset
+log rather than from either implementation's self-report.
 
 `corpus/LEDGER.md` records every run: date, commit, scenario set, seeds, numbers, verdict.
 Wins may be cited; anything not in the ledger does not exist.

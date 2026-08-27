@@ -1,11 +1,16 @@
 [package]
 name = "rusty_time-alloc"
-description = "The allocator seam: one crate, one pin (mission plan §4)"
+description = "The allocator seam for rusty_time: one crate, one pin, so a deliberate global allocator choice is made once in the deliverables rather than forced on every library consumer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-alloc"
+readme = "README.md"
+keywords = ["allocator", "memory", "rusty-alloc", "seam"]
+categories = ["memory-management", "no-std"]
 
 [lints]
 workspace = true

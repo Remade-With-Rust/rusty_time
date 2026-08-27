@@ -1,11 +1,16 @@
 [package]
 name = "rusty_time-daemon"
-description = "rtimed — the rusty_time daemon (the chronyd analog)"
+description = "rtimed, the rusty_time daemon: a pure-Rust NTPv4 and NTS (RFC 8915) client and server with interleaved mode (RFC 9769), rate limiting, Kiss-o'-Death, batched send/receive and an NTP-over-HTTP gateway. The chronyd analog."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-daemon"
+readme = "README.md"
+keywords = ["ntp", "nts", "chrony", "daemon", "timesync"]
+categories = ["command-line-utilities", "date-and-time", "network-programming"]
 
 [[bin]]
 name = "rtimed"

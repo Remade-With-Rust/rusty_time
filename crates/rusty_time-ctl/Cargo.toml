@@ -1,11 +1,16 @@
 [package]
 name = "rusty_time-ctl"
-description = "rtimec — control CLI for rtimed (the chronyc analog)"
+description = "rtimec, the control client for the rusty_time daemon: sources, tracking, client table and NTS key state over a local control socket. The chronyc analog."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-ctl"
+readme = "README.md"
+keywords = ["ntp", "chrony", "cli", "timesync", "chronyc"]
+categories = ["command-line-utilities", "date-and-time"]
 
 [lib]
 name = "rusty_time_ctl"

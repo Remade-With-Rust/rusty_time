@@ -8,8 +8,9 @@
 
 use crate::rng::Pcg32;
 use crate::scenarios::Scenario;
+use rusty_time_core::client::SyncController;
 use rusty_time_core::ntp::offset_delay;
-use rusty_time_core::{ClockCommand, Discipline, DisciplineConfig, Sample, SampleRegister};
+use rusty_time_core::{ClockCommand, DisciplineConfig, Sample};
 
 /// Integration substep for the plant, seconds.
 const SUBSTEP_S: f64 = 1.0;
@@ -42,17 +43,10 @@ pub fn run(scenario: &Scenario, seed: u64) -> RunMetrics {
     let mut freq_true_ppm = scenario.base_freq_ppm;
     let mut applied_ppm = 0.0_f64; // driver-commanded total (freq + drain fold)
 
-    let mut register = SampleRegister::new(64);
-    let mut discipline = Discipline::new(DisciplineConfig::default());
-    // Discipline bookkeeping mirrored by the daemon loop at M3: the pure
-    // frequency command and the temporary drain rate are tracked separately,
-    // because their register transforms differ (permanent dfreq vs consumed
-    // offset). Folding the drain into dfreq lets the slope measurement absorb
-    // it and the loop settles into a constant-offset limit cycle — S1 sat
-    // pinned at 2 ms until this split existed.
-    let mut freq_cmd_ppm = 0.0_f64;
-    let mut drain_ppm = 0.0_f64;
-    let mut last_plan_mono: Option<f64> = None;
+    // The controller is `rusty_time_core::client::SyncController` — the same
+    // type the daemon runs. Benchmarking a simulator-only copy of the
+    // discipline logic would measure something that does not ship.
+    let mut controller = SyncController::new(DisciplineConfig::default());
 
     let mut trajectory: Vec<(f64, f64)> = Vec::with_capacity(scenario.duration_s as usize + 8);
     let mut packets: u32 = 0;
@@ -68,16 +62,6 @@ pub fn run(scenario: &Scenario, seed: u64) -> RunMetrics {
                 packets += 1;
                 let mono_now = t + err;
 
-                // The drain that ran since the last plan is a *consumed offset
-                // correction*: remove it from stored history as an offset, so
-                // the regression slope keeps measuring frequency only.
-                if let Some(last) = last_plan_mono {
-                    let drained = drain_ppm * 1e-6 * (mono_now - last);
-                    if drained != 0.0 {
-                        register.slew_samples(mono_now, 0.0, drained);
-                    }
-                }
-
                 // One exchange. Server clocks are truth; local timestamps carry err.
                 let out_delay = scenario.rtt_s / 2.0
                     + scenario.asym_extra_s
@@ -89,58 +73,51 @@ pub fn run(scenario: &Scenario, seed: u64) -> RunMetrics {
                 let t4_true = t3 + back_delay;
                 let t4 = t4_true + err;
                 let (offset, delay) = offset_delay(t1, t2, t3, t4);
-                register.push(Sample {
-                    t: (t1 + t4) / 2.0,
-                    offset,
-                    delay,
-                    dispersion: 0.0,
-                });
                 packets_at.push((t, packets));
 
-                // Estimate: regression once warm, best single sample before that.
-                let (est_offset, est_freq, est_sd) = match register.regress(mono_now) {
-                    Some(e) => (e.offset, e.freq_ppm, e.offset_sd.max(1e-7)),
-                    None => match register.best() {
-                        Some(b) => (b.offset, None, (b.delay / 2.0).max(1e-7)),
-                        None => (0.0, None, 1e-3),
+                let step = controller.on_sample(
+                    mono_now,
+                    Sample {
+                        t: (t1 + t4) / 2.0,
+                        offset,
+                        delay,
+                        dispersion: 0.0,
                     },
-                };
-                let plan = discipline.on_estimate(est_offset, est_freq, est_sd);
-                let freq_cmd_new = discipline.freq_ppm();
-                match plan.command {
-                    ClockCommand::Step { add_seconds } => {
-                        err += add_seconds;
-                        register.slew_samples(mono_now, freq_cmd_new - freq_cmd_ppm, add_seconds);
-                        drain_ppm = 0.0;
-                    }
-                    ClockCommand::Slew {
-                        drain_offset,
-                        drain_rate_ppm,
-                        ..
-                    } => {
-                        // Permanent frequency change transforms history as dfreq;
-                        // the new drain is accounted when it has actually run
-                        // (top of the next plan).
-                        register.slew_samples(mono_now, freq_cmd_new - freq_cmd_ppm, 0.0);
-                        drain_ppm = drain_rate_ppm.copysign(drain_offset);
-                    }
+                );
+                if let ClockCommand::Step { add_seconds } = step.plan.command {
+                    err += add_seconds;
                 }
-                freq_cmd_ppm = freq_cmd_new;
-                applied_ppm = freq_cmd_ppm + drain_ppm;
-                last_plan_mono = Some(mono_now);
-                next_poll_at = t + plan.next_poll_s;
+                applied_ppm = step.applied_ppm;
+                next_poll_at = t + step.plan.next_poll_s;
             } else {
-                next_poll_at = t + 2f64.powi(discipline.poll_log2() as i32);
+                next_poll_at = t + controller.retry_interval_s();
             }
         }
 
         // ---- plant integration to min(next event, next substep) ----
-        let dt = SUBSTEP_S.min(next_poll_at - t).max(1e-3);
+        //
+        // A drain is a budget, so it can finish between polls. Integrating
+        // straight through its end would keep slewing past the offset it was
+        // given to remove — so the drain's completion is an event the plant
+        // must stop at, exactly as the daemon wakes for it.
+        let mut next_event = next_poll_at;
+        if let Some(ends) = controller.drain_completes_at()
+            && ends > t
+            && ends < next_event
+        {
+            next_event = ends;
+        }
+        let dt = SUBSTEP_S.min(next_event - t).max(1e-3);
         freq_true_ppm += rng.normal() * scenario.wander_ppm_sqrt_s * dt.sqrt();
         // Positive applied_ppm speeds the local clock up, so the disciplined
         // clock's error integrates at (true drift + our correction).
         err += (freq_true_ppm + applied_ppm) * 1e-6 * dt;
         t += dt;
+        // Retire the drain if its budget ran out during that step, and pick up
+        // the frequency-only command it leaves behind.
+        if controller.poll_drain(t).is_some() {
+            applied_ppm = controller.applied_ppm();
+        }
         trajectory.push((t, err));
     }
 

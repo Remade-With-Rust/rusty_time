@@ -37,6 +37,74 @@ pub fn total_ppm(freq_ppm: f64, drain_offset: f64, drain_rate_ppm: f64, max_ppm:
     (freq_ppm + drain).clamp(-max_ppm, max_ppm)
 }
 
+/// The kernel's hard ceiling on `ADJ_FREQUENCY`, in ppm.
+///
+/// Linux clamps `time_freq` to `MAXFREQ` (`kernel/time/ntp.c`), which is
+/// 500000 ns/s — that is **500 ppm**, not the ±32768 ppm the width of the
+/// scaled field suggests. The field is 2^-16 ppm units and does have room for
+/// far more; the kernel simply refuses to use it.
+pub const LINUX_MAX_ADJ_FREQ_PPM: f64 = 500.0;
+
+/// How far from nominal the kernel will accept a tick, as a fraction.
+///
+/// `process_adjtimex_modes` rejects anything outside 900000/USER_HZ ..
+/// 1100000/USER_HZ, so ±10%.
+pub const LINUX_TICK_RANGE_FRACTION: f64 = 0.1;
+
+/// Split a wanted frequency into a tick value and the residual for
+/// `ADJ_FREQUENCY`.
+///
+/// **Why this exists at all.** 500 ppm cannot drain a 10 ms offset in less
+/// than 20 seconds, and cannot drain a 500 ms one in less than 17 minutes, so
+/// a driver limited to `ADJ_FREQUENCY` converges far slower than chrony and —
+/// worse — silently delivers less correction than the discipline loop was told
+/// it would. The controller then subtracts a drain that never happened from
+/// its sample history, the regression reads the shortfall as a frequency
+/// error, and the loop winds itself up to the frequency clamp and overshoots.
+/// That is not a hypothetical: it is what the first cross-implementation run
+/// against chrony produced — a 10 ms start overshooting to −8.8 ms.
+///
+/// The tick — how much the kernel adds per timer interrupt — carries the
+/// coarse part, and `ADJ_FREQUENCY` trims what is left. chrony's Linux driver
+/// does exactly this, and it is the only way to get a usable slew range.
+///
+/// Returns `(tick_us, residual_ppm)`, with the residual always inside the
+/// kernel's `ADJ_FREQUENCY` limit.
+pub fn linux_tick_and_freq(total_ppm: f64, nominal_tick_us: i64) -> (i64, f64) {
+    if nominal_tick_us <= 0 {
+        return (
+            nominal_tick_us,
+            total_ppm.clamp(-LINUX_MAX_ADJ_FREQ_PPM, LINUX_MAX_ADJ_FREQ_PPM),
+        );
+    }
+    let ppm_per_us = 1e6 / nominal_tick_us as f64;
+    let max_offset_us = (nominal_tick_us as f64 * LINUX_TICK_RANGE_FRACTION).floor() as i64;
+    let reachable = max_offset_us as f64 * ppm_per_us + LINUX_MAX_ADJ_FREQ_PPM;
+    let wanted = total_ppm.clamp(-reachable, reachable);
+
+    // Leave the tick alone unless the frequency knob genuinely cannot cover
+    // the request: changing the tick perturbs jiffies-based timekeeping, so it
+    // is a tool for range, not for everyday trimming.
+    let mut offset_us = 0i64;
+    if wanted.abs() > LINUX_MAX_ADJ_FREQ_PPM {
+        offset_us = (wanted / ppm_per_us).round() as i64;
+        offset_us = offset_us.clamp(-max_offset_us, max_offset_us);
+    }
+    let residual = (wanted - offset_us as f64 * ppm_per_us)
+        .clamp(-LINUX_MAX_ADJ_FREQ_PPM, LINUX_MAX_ADJ_FREQ_PPM);
+    (nominal_tick_us + offset_us, residual)
+}
+
+/// The widest frequency this kernel can actually be driven at, given its tick.
+pub fn linux_max_slew_ppm(nominal_tick_us: i64) -> f64 {
+    if nominal_tick_us <= 0 {
+        return LINUX_MAX_ADJ_FREQ_PPM;
+    }
+    let ppm_per_us = 1e6 / nominal_tick_us as f64;
+    (nominal_tick_us as f64 * LINUX_TICK_RANGE_FRACTION).floor() * ppm_per_us
+        + LINUX_MAX_ADJ_FREQ_PPM
+}
+
 /// Windows: convert a frequency correction into the adjustment value the API
 /// wants — the per-interrupt increment scaled by (1 + ppm).
 ///
@@ -65,6 +133,81 @@ mod tests {
     fn total_ppm_respects_the_platform_ceiling() {
         assert_eq!(total_ppm(1e9, 1.0, 1e9, 500.0), 500.0);
         assert_eq!(total_ppm(-1e9, -1.0, 1e9, 500.0), -500.0);
+    }
+
+    /// The nominal tick for the usual USER_HZ of 100.
+    const TICK_100HZ: i64 = 10_000;
+
+    #[test]
+    fn small_corrections_leave_the_tick_alone() {
+        // Under the kernel's frequency ceiling there is no reason to disturb
+        // the tick, and doing so would perturb jiffies-based timekeeping.
+        for ppm in [0.0, 1.0, -50.0, 499.0, -499.0] {
+            let (tick, residual) = linux_tick_and_freq(ppm, TICK_100HZ);
+            assert_eq!(tick, TICK_100HZ, "tick moved for {ppm} ppm");
+            assert!((residual - ppm).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn large_corrections_are_delivered_in_full() {
+        // The whole point: what the driver commands must equal what was asked
+        // for. This is the assertion whose absence let the daemon believe it
+        // was slewing at 1716 ppm while the kernel delivered 500.
+        for ppm in [1_716.0, -1_716.0, 5_000.0, -20_000.0, 83_333.0] {
+            let (tick, residual) = linux_tick_and_freq(ppm, TICK_100HZ);
+            let delivered = (tick - TICK_100HZ) as f64 * (1e6 / TICK_100HZ as f64) + residual;
+            assert!(
+                (delivered - ppm).abs() < 1e-6,
+                "asked {ppm} ppm, driver would deliver {delivered} ppm"
+            );
+        }
+    }
+
+    #[test]
+    fn the_residual_always_fits_the_kernels_frequency_limit() {
+        // A residual over MAXFREQ is silently clamped by the kernel, which is
+        // exactly the lie this module exists to stop telling.
+        for tick in [1_000i64, 10_000, 4_000] {
+            for ppm in [0.0, 600.0, -600.0, 1e5, -1e5, 1e9, -1e9] {
+                let (_, residual) = linux_tick_and_freq(ppm, tick);
+                assert!(
+                    residual.abs() <= LINUX_MAX_ADJ_FREQ_PPM + 1e-9,
+                    "tick {tick}, {ppm} ppm left residual {residual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_tick_stays_inside_what_the_kernel_will_accept() {
+        // Outside ±10% adjtimex returns EINVAL and the correction is lost.
+        for tick in [1_000i64, 10_000, 4_000] {
+            for ppm in [1e9, -1e9, 250_000.0] {
+                let (out, _) = linux_tick_and_freq(ppm, tick);
+                assert!(
+                    out >= 900_000 / (1_000_000 / tick) && out <= 1_100_000 / (1_000_000 / tick),
+                    "tick {out} outside the kernel's window for nominal {tick}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_advertised_ceiling_is_one_the_driver_can_reach() {
+        // capabilities().max_slew_ppm feeds the discipline's own limit, so an
+        // over-claim here is what makes the controller command the impossible.
+        for tick in [1_000i64, 10_000, 4_000] {
+            let ceiling = linux_max_slew_ppm(tick);
+            let (out, residual) = linux_tick_and_freq(ceiling, tick);
+            let delivered = (out - tick) as f64 * (1e6 / tick as f64) + residual;
+            assert!(
+                (delivered - ceiling).abs() < 1e-6,
+                "advertised {ceiling} ppm but could only deliver {delivered}"
+            );
+        }
+        // And it is a real improvement over the frequency knob alone.
+        assert!(linux_max_slew_ppm(TICK_100HZ) > 99_000.0);
     }
 
     #[test]

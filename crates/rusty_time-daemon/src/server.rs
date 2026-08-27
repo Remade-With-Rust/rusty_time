@@ -14,7 +14,9 @@
 
 use rusty_time_clock::{ClockRead, SystemClock, net};
 use rusty_time_core::ntp::{self, HEADER_LEN, LeapIndicator, Mode, NtpPacket, NtpTimestamp};
-use rusty_time_core::server::{ClientTable, Disposition, RateLimitConfig, ResponseMode};
+use rusty_time_core::server::{
+    ClientHandle, ClientTable, Disposition, RateLimitConfig, ResponseMode,
+};
 use rusty_time_nts::aead::NtsKeys;
 use rusty_time_nts::cookie::{COOKIE_NONCE_LEN, KeyRing, MasterKey};
 use rusty_time_nts::ef::{self, NONCE_LEN, UNIQUE_ID_LEN};
@@ -53,6 +55,10 @@ const KE_COOKIE_COUNT: usize = 8;
 /// Cap on how many cookies one NTP reply may carry, so a request stuffed with
 /// placeholders cannot be used as an amplification lever.
 const MAX_REPLY_COOKIES: usize = 8;
+/// Roughly the wire size of one cookie extension field, for pre-sizing reply
+/// buffers. An over-estimate costs a few bytes; an under-estimate costs a
+/// reallocate-and-copy, which is what this exists to avoid.
+const COOKIE_FIELD_HINT: usize = 112;
 
 pub struct ServeOptions {
     pub ntp_bind: String,
@@ -582,6 +588,30 @@ fn ntp_serve_loop(socket: &UdpSocket, state: &Arc<Mutex<ServerState>>) {
     // kernel boundary is not spending it answering NTP.
     let mut bufs = vec![[0u8; 1024]; net::BATCH_SIZE];
     let mut received = Vec::with_capacity(net::BATCH_SIZE);
+    // Allocated once and reused for every receive, like the buffers above.
+    // No control data: this loop timestamps the batch itself and never reads
+    // the per-datagram kernel stamp, so asking for one is work the kernel does
+    // for nobody. (Reading it instead would be an accuracy improvement worth
+    // its cost -- a separate change, not this one.)
+    let mut scratch = net::BatchScratch::without_timestamps();
+    let mut send_scratch = net::BatchScratch::without_timestamps();
+    // Measurement arm, resolved ONCE here rather than per reply: an A/B switch
+    // inside the loop being timed is overhead added in order to take the
+    // measurement. Set RUSTY_TIME_NO_BATCH_SEND=1 to answer with one `sendto`
+    // per reply, which is what this server did before batching, so the two can
+    // be compared inside a single run instead of across runs whose absolute
+    // throughput drifts by tens of percent.
+    let batch_send = std::env::var_os("RUSTY_TIME_NO_BATCH_SEND").is_none();
+    // How many datagrams a receive actually collects. A send-batching change
+    // cannot pay if the batches are one packet deep, and "the toggle changed
+    // nothing" reads the same whether the idea is wrong or the arm is never
+    // exercised -- so the depth is counted rather than assumed.
+    let report_batches = std::env::var_os("RUSTY_TIME_BATCH_STATS").is_some();
+    let mut batch_calls: u64 = 0;
+    let mut batch_datagrams: u64 = 0;
+    let mut batch_max: usize = 0;
+    let mut next_batch_report = std::time::Instant::now() + Duration::from_secs(1);
+    let mut replies: Vec<(Reply, SocketAddr)> = Vec::with_capacity(net::BATCH_SIZE);
     // Refresh the supervisor's one-line status occasionally, so `systemctl
     // status` shows what the server is actually doing rather than only what it
     // said at startup. Cheap: once a minute, off the hot path.
@@ -602,42 +632,103 @@ fn ntp_serve_loop(socket: &UdpSocket, state: &Arc<Mutex<ServerState>>) {
             }
         }
 
+        // Always poll before receiving. Skipping it after a full batch, on the
+        // theory that a backlog makes the answer obvious, was tried and
+        // measured 0.4% WORSE: `poll` is cheaper than the extra `recvmmsg`
+        // that comes back empty when the guess is wrong.
         match net::wait_readable(socket, Duration::from_millis(500)) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(_) => continue,
         }
-        let count = match net::recv_batch(socket, &mut bufs, &mut received) {
+        let count = match net::recv_batch(socket, &mut bufs, &mut scratch, &mut received) {
             Ok(n) => n,
             Err(_) => continue,
         };
+        if count == 0 {
+            continue;
+        }
+        if report_batches {
+            batch_calls += 1;
+            batch_datagrams += count as u64;
+            batch_max = batch_max.max(count);
+            if std::time::Instant::now() >= next_batch_report && batch_calls > 0 {
+                next_batch_report = std::time::Instant::now() + Duration::from_secs(1);
+                eprintln!(
+                    "batch: {} receives, {} datagrams, mean {:.2}, max {}",
+                    batch_calls,
+                    batch_datagrams,
+                    batch_datagrams as f64 / batch_calls as f64,
+                    batch_max
+                );
+            }
+        }
         // Receive timestamp as early as possible: everything after this is
         // processing delay the client should not be charged for. One reading
         // covers the batch, which is honest to within the batch's own span.
-        let recv_ts = match clock.wall_ns() {
-            Ok(ns) => unix_ns_to_ntp(ns),
+        let recv_ts = match clock.wall_parts() {
+            Ok((s, n)) => unix_parts_to_ntp(s, n),
             Err(_) => continue,
         };
 
-        for i in 0..count {
-            let Some(item) = received.get(i).copied() else {
-                break;
-            };
-            let request = &bufs[i][..item.len.min(bufs[i].len())];
-            let Some(reply) = build_reply(request, item.peer, recv_ts, state, &clock) else {
-                continue;
-            };
-            if socket.send_to(&reply, item.peer).is_ok() {
-                // Read the clock *after* the send returns: that is the closest
-                // we get to a real transmit timestamp without hardware
-                // timestamping (M7), and it is what interleaved mode reports
-                // to this client on its next exchange.
-                if let Ok(ns) = clock.wall_ns()
-                    && let Ok(mut guard) = state.lock()
+        // Build every reply first, then send the whole batch in one syscall.
+        //
+        // The receive side has been one `recvmmsg` since M5 while the reply
+        // side was one `sendto` per packet, so a batch of 32 requests cost 1
+        // receive syscall and 32 send syscalls. It also took the state lock
+        // and read the clock once per reply, after each individual send.
+        replies.clear();
+        if let Ok(mut guard) = state.lock() {
+            for i in 0..count {
+                let Some(item) = received.get(i).copied() else {
+                    break;
+                };
+                let request = &bufs[i][..item.len.min(bufs[i].len())];
+                if let Some(reply) = build_reply_in(request, item.peer, recv_ts, &mut guard, &clock)
                 {
-                    guard
-                        .clients
-                        .note_transmit(&client_key(item.peer), unix_ns_to_ntp(ns));
+                    replies.push((reply, item.peer));
+                }
+            }
+        }
+        if replies.is_empty() {
+            continue;
+        }
+        let sent = if batch_send {
+            // Read straight out of `replies`: no temporary vector describing
+            // data the loop already holds.
+            net::send_batch_by(
+                socket,
+                &replies,
+                |(reply, _)| reply.bytes.as_slice(),
+                |(_, peer)| *peer,
+                &mut send_scratch,
+            )
+            .unwrap_or(0)
+        } else {
+            let mut n = 0;
+            for (reply, peer) in &replies {
+                if socket.send_to(reply.bytes.as_slice(), peer).is_err() {
+                    break;
+                }
+                n += 1;
+            }
+            n
+        };
+
+        // One clock reading for the batch, taken straight after the syscall
+        // that put every one of these packets on the wire. This is not a loss
+        // of precision against the old per-send stamp — it is a gain: the
+        // packets really did all leave in one syscall, whereas the old loop
+        // charged each client the accumulated cost of every send before it.
+        if sent > 0
+            && let Ok((s, n)) = clock.wall_parts()
+        {
+            let transmit = unix_parts_to_ntp(s, n);
+            // One lock for the batch, not one per reply. Addressed by handle,
+            // so none of these costs a hash either.
+            if let Ok(mut guard) = state.lock() {
+                for (reply, _) in replies.iter().take(sent) {
+                    guard.clients.note_transmit_at(reply.handle, transmit);
                 }
             }
         }
@@ -646,7 +737,7 @@ fn ntp_serve_loop(socket: &UdpSocket, state: &Arc<Mutex<ServerState>>) {
 
 /// A Kiss-o'-Death RATE response: stratum 0 carrying a four-character kiss
 /// code, which tells a conforming client to back off rather than retry harder.
-fn kiss_of_death(request: &NtpPacket, recv_ts: NtpTimestamp) -> Vec<u8> {
+fn kiss_of_death(request: &NtpPacket, recv_ts: NtpTimestamp) -> [u8; HEADER_LEN] {
     NtpPacket {
         leap: LeapIndicator::NoWarning,
         version: request.version,
@@ -663,13 +754,63 @@ fn kiss_of_death(request: &NtpPacket, recv_ts: NtpTimestamp) -> Vec<u8> {
         transmit_ts: recv_ts,
     }
     .to_bytes()
-    .to_vec()
 }
 
-fn unix_ns_to_ntp(ns: i128) -> NtpTimestamp {
-    let secs = (ns / 1_000_000_000) as i64;
-    let nanos = (ns % 1_000_000_000) as u32;
+/// Whether interleaved-mode debug output is on. Read from the environment
+/// once; it cannot change while the process runs.
+fn debug_xleave() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RUSTY_TIME_DEBUG_XLEAVE").is_ok())
+}
+
+/// Unix (seconds, nanoseconds) to an NTP timestamp.
+///
+/// Takes the parts the OS already had rather than a nanosecond count, so
+/// nothing has to divide a 128-bit integer back apart to recover them — that
+/// division is a software routine, and it measured 5% of everything the server
+/// did per reply.
+fn unix_parts_to_ntp(secs: i64, nanos: u32) -> NtpTimestamp {
     NtpTimestamp::from_unix(secs, nanos)
+}
+
+/// The bytes of one reply.
+///
+/// A plain NTP response is always exactly 48 bytes, so it travels in the
+/// enum rather than on the heap: the server used to `to_vec()` a fixed-size
+/// array once per request, which is an allocation and a free per packet for a
+/// value whose size is known at compile time. Only NTS replies, which carry
+/// cookies and an authenticator of variable length, actually need a `Vec`.
+pub enum ReplyBytes {
+    Plain([u8; HEADER_LEN]),
+    Extended(Vec<u8>),
+}
+
+impl ReplyBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ReplyBytes::Plain(buf) => buf,
+            ReplyBytes::Extended(v) => v,
+        }
+    }
+}
+
+/// One built reply, plus the handle addressing the client it is for.
+///
+/// The handle is carried out so the caller can record the true transmit time
+/// after `send` without hashing the address a second time.
+pub struct Reply {
+    pub bytes: ReplyBytes,
+    pub handle: ClientHandle,
+}
+
+/// So a `Reply` can be used anywhere the bytes were used before — the tests
+/// that check what goes on the wire are unchanged by the switch away from
+/// `Vec`, which is what makes them evidence that nothing else changed either.
+impl std::ops::Deref for Reply {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
 }
 
 /// Build the response for one request, or `None` if it must be ignored.
@@ -681,91 +822,147 @@ pub fn build_reply(
     recv_ts: NtpTimestamp,
     state: &Arc<Mutex<ServerState>>,
     clock: &SystemClock,
-) -> Option<Vec<u8>> {
+) -> Option<Reply> {
+    let mut guard = state.lock().ok()?;
+    build_reply_in(request, peer, recv_ts, &mut guard, clock)
+}
+
+/// `build_reply` against state the caller has already locked.
+///
+/// The UDP loop answers a whole batch at a time, so it takes the lock once for
+/// the batch rather than once per request — up to 32 acquisitions collapsed
+/// into one. The locking wrapper above stays for the gateway, whose requests
+/// arrive one per connection on their own threads.
+///
+/// The trade is that a batch of NTS replies now holds the lock across their
+/// cryptography. That is acceptable here because the UDP responder is the only
+/// writer and the gateway is a browser-facing path where a few hundred
+/// microseconds is invisible; it would need revisiting if the responder ever
+/// became multi-threaded.
+pub fn build_reply_in(
+    request: &[u8],
+    peer: SocketAddr,
+    recv_ts: NtpTimestamp,
+    guard: &mut ServerState,
+    clock: &SystemClock,
+) -> Option<Reply> {
     if request.len() < HEADER_LEN {
-        if let Ok(mut guard) = state.lock() {
-            guard.clients.note_refused();
-        }
+        guard.clients.note_refused();
         return None;
     }
     let parsed = match NtpPacket::parse(request) {
         Ok(p) => p,
         Err(_) => {
-            if let Ok(mut guard) = state.lock() {
-                guard.clients.note_refused();
-            }
+            guard.clients.note_refused();
             return None;
         }
     };
     // Only client-mode requests are answered: never reflect a server-mode
     // packet, which is how NTP reflection amplification starts.
     if parsed.mode != Mode::Client {
-        if let Ok(mut guard) = state.lock() {
-            guard.clients.note_refused();
-        }
+        guard.clients.note_refused();
         return None;
     }
 
     // Rate limit before any crypto: an unauthenticated flood must not be able
     // to make us do AES work per packet.
     let now_mono = clock.mono_s().ok()?;
-    let (disposition, mode) = {
-        let mut guard = state.lock().ok()?;
-        let key = client_key(peer);
-        let disposition = guard.clients.admit(&key, now_mono);
-        let mode = if disposition == Disposition::Respond {
-            guard.clients.response_mode(&key, parsed.origin_ts)
+
+    // ONE lock for the whole per-client path. This used to take the mutex four
+    // separate times per request -- admit, stratum, note_response, and
+    // note_transmit in the caller -- three of which were re-acquiring it
+    // immediately after releasing it. Everything inside is either a table
+    // operation or pure arithmetic on values the table just produced, so
+    // there is nothing to be gained by letting go in between.
+    let key = client_key(peer);
+    let locked = {
+        let (disposition, handle) = guard.clients.admit_handle(&key, now_mono);
+        if disposition != Disposition::Respond {
+            (
+                disposition,
+                handle,
+                ResponseMode::Basic,
+                0u8,
+                recv_ts,
+                recv_ts,
+            )
         } else {
-            ResponseMode::Basic
-        };
-        (disposition, mode)
+            let mode = guard.clients.response_mode_at(handle, parsed.origin_ts);
+            let stratum = guard.stratum;
+            // Interleaved mode reports the PREVIOUS exchange's transmit, whose
+            // value was read after that packet actually went out. Receive is
+            // always THIS exchange's -- that is what lets the client
+            // interleave again next time. Only transmit looks backwards.
+            let (mut receive_field, mut transmit_field) = match mode {
+                ResponseMode::Basic => (recv_ts, recv_ts),
+                ResponseMode::Interleaved { prev_transmit } => (recv_ts, prev_transmit),
+            };
+            // Bit 0: receive set, transmit clear. Makes the two distinguishable
+            // and lets a peer detect interleaved requests statelessly.
+            rusty_time_core::server::mark_server_timestamps(
+                &mut receive_field,
+                &mut transmit_field,
+            );
+            // Remember what we received and what we told them, so the next
+            // request can be recognised as interleaved.
+            guard
+                .clients
+                .note_response_at(handle, recv_ts, receive_field);
+            (
+                disposition,
+                handle,
+                mode,
+                stratum,
+                receive_field,
+                transmit_field,
+            )
+        }
     };
+    let (disposition, handle, mode, stratum, receive_field, transmit_field) = locked;
     match disposition {
         Disposition::Respond => {}
-        Disposition::KissOfDeath => return Some(kiss_of_death(&parsed, recv_ts)),
+        Disposition::KissOfDeath => {
+            return Some(Reply {
+                bytes: ReplyBytes::Plain(kiss_of_death(&parsed, recv_ts)),
+                handle,
+            });
+        }
         Disposition::Drop => return None,
     }
-    let stratum = state.lock().ok()?.stratum;
 
-    // Is this NTS? Find the cookie and authenticator.
+    // Is this NTS? Find the cookie and authenticator. No length guard here on
+    // purpose: `ef::fields` already clamps its start to the packet length and
+    // yields nothing for a bare 48-byte header, so a guard would only add a
+    // branch to buy a check that already happens.
     let mut cookie: Option<&[u8]> = None;
     let mut unique_id: Option<&[u8]> = None;
     let mut placeholders = 0usize;
-    let mut has_auth = false;
+    // The authenticator field itself, not just whether there was one: the
+    // verifier needs its body and offset, and finding them again means walking
+    // every extension field a second time on a path that has just walked them.
+    let mut auth_field: Option<ef::Field> = None;
     for field in ef::fields(request) {
         match field.field_type {
             ef::field_type::NTS_COOKIE => cookie = Some(field.body),
             ef::field_type::UNIQUE_IDENTIFIER => unique_id = Some(field.body),
             ef::field_type::NTS_COOKIE_PLACEHOLDER => placeholders += 1,
             ef::field_type::NTS_AUTHENTICATOR => {
-                has_auth = true;
+                auth_field = Some(field);
                 break;
             }
             _ => {}
         }
     }
 
-    // Interleaved mode reports the PREVIOUS exchange's timestamps, whose
-    // transmit value was read after that packet was actually sent. The client
-    // pairs them with the T1/T4 it kept, and so gets an exchange whose
-    // server-side transmit is not a guess made before transmission.
-    // Receive is always THIS exchange's — that is what lets the client
-    // interleave again next time. Only the transmit field looks backwards.
-    let (mut receive_field, mut transmit_field) = match mode {
-        ResponseMode::Basic => (recv_ts, recv_ts),
-        ResponseMode::Interleaved { prev_transmit } => (recv_ts, prev_transmit),
-    };
-    // Bit 0: receive set, transmit clear. Makes the two distinguishable and
-    // lets a peer detect interleaved requests statelessly.
-    rusty_time_core::server::mark_server_timestamps(&mut receive_field, &mut transmit_field);
-
     // RUSTY_TIME_DEBUG_XLEAVE=1 prints the pairing an interleaved reply
     // carries. The two numbers that matter: the server-side turnaround
     // (transmit - receive), which should be microseconds, and the age of the
     // pair, which should be about one poll interval.
-    if matches!(mode, ResponseMode::Interleaved { .. })
-        && std::env::var("RUSTY_TIME_DEBUG_XLEAVE").is_ok()
-    {
+    //
+    // The variable is read once per process, not once per request: `env::var`
+    // walks the environment and allocates a String, which is real work to do
+    // on a hot path for a flag that cannot change while the process runs.
+    if matches!(mode, ResponseMode::Interleaved { .. }) && debug_xleave() {
         eprintln!(
             "xleave: reported_tx_age={:+.6}s (should be ~1 poll interval)",
             recv_ts.seconds_since(transmit_field),
@@ -798,57 +995,70 @@ pub fn build_reply(
         transmit_ts: transmit_field,
     };
 
-    // Remember what we received and what we told them, so the next request can
-    // be recognised as interleaved.
-    if let Ok(mut guard) = state.lock() {
-        guard
-            .clients
-            .note_response(&client_key(peer), recv_ts, receive_field);
-    }
-
-    if !has_auth {
+    let Some(auth_field) = auth_field else {
         // Plain NTP. In basic mode stamp transmit as late as possible; in
         // interleaved mode the transmit field is the previous exchange's and
         // must not be overwritten.
         if mode == ResponseMode::Basic {
-            let mut tx = clock.wall_ns().ok().map(unix_ns_to_ntp)?;
+            let mut tx = clock
+                .wall_parts()
+                .ok()
+                .map(|(s, n)| unix_parts_to_ntp(s, n))?;
             let mut rx = header.receive_ts;
             rusty_time_core::server::mark_server_timestamps(&mut rx, &mut tx);
             header.transmit_ts = tx;
         }
-        return Some(header.to_bytes().to_vec());
-    }
+        return Some(Reply {
+            bytes: ReplyBytes::Plain(header.to_bytes()),
+            handle,
+        });
+    };
 
     // NTS path: the cookie must redeem and the authenticator must verify
     // before we say anything at all about the time.
     let (cookie, unique_id) = (cookie?, unique_id?);
-    let keys = {
-        let guard = state.lock().ok()?;
-        rusty_time_nts::cookie::redeem(&guard.ring, cookie).ok()?
-    };
-    verify_client_authenticator(request, &keys.c2s)?;
+    let keys = rusty_time_nts::cookie::redeem(&guard.ring, cookie).ok()?;
+    verify_client_authenticator(request, auth_field, &keys.c2s)?;
 
     // Fresh cookies: one to replace the cookie just spent, plus the
     // placeholders asked for, capped.
     let want = (1 + placeholders).min(MAX_REPLY_COOKIES);
-    let mut plaintext = Vec::new();
+    // Sized up front: a cookie extension field is ~104 bytes, so growing from
+    // empty walks through several reallocate-and-copy rounds per reply.
+    let mut plaintext = Vec::with_capacity(want * COOKIE_FIELD_HINT);
+    // One draw from the OS for every cookie nonce, not one per cookie: this
+    // used to be up to eight separate `getrandom` calls per reply for 128
+    // bytes of entropy. The nonces are still independent — they are distinct
+    // slices of one random buffer.
+    let mut nonce_bytes = [0u8; COOKIE_NONCE_LEN * MAX_REPLY_COOKIES];
+    rusty_time_nts::ke::fill_random(&mut nonce_bytes[..want * COOKIE_NONCE_LEN]).ok()?;
+    let mut nonces = [[0u8; COOKIE_NONCE_LEN]; MAX_REPLY_COOKIES];
+    for (i, slot) in nonces.iter_mut().enumerate().take(want) {
+        slot.copy_from_slice(&nonce_bytes[i * COOKIE_NONCE_LEN..(i + 1) * COOKIE_NONCE_LEN]);
+    }
     {
-        let guard = state.lock().ok()?;
-        for _ in 0..want {
-            let mut nonce = [0u8; COOKIE_NONCE_LEN];
-            rusty_time_nts::ke::fill_random(&mut nonce).ok()?;
-            let fresh = rusty_time_nts::cookie::mint(&guard.ring, &keys, &nonce).ok()?;
-            ef::write_field(&mut plaintext, ef::field_type::NTS_COOKIE, &fresh);
-        }
+        // One key schedule and no per-cookie allocation, writing the fields
+        // straight into the plaintext buffer.
+        rusty_time_nts::cookie::mint_fields_into(
+            &guard.ring,
+            &keys,
+            &nonces[..want],
+            &mut plaintext,
+        )
+        .ok()?;
     }
 
     if mode == ResponseMode::Basic {
-        let mut tx = clock.wall_ns().ok().map(unix_ns_to_ntp)?;
+        let mut tx = clock
+            .wall_parts()
+            .ok()
+            .map(|(s, n)| unix_parts_to_ntp(s, n))?;
         let mut rx = header.receive_ts;
         rusty_time_core::server::mark_server_timestamps(&mut rx, &mut tx);
         header.transmit_ts = tx;
     }
-    let mut reply = header.to_bytes().to_vec();
+    let mut reply = Vec::with_capacity(HEADER_LEN + 64 + want * COOKIE_FIELD_HINT + 64);
+    reply.extend_from_slice(&header.to_bytes());
     // Echo the unique identifier so the client can bind reply to request.
     let mut uid = [0u8; UNIQUE_ID_LEN];
     let n = unique_id.len().min(UNIQUE_ID_LEN);
@@ -858,8 +1068,11 @@ pub fn build_reply(
     let mut nonce = [0u8; NONCE_LEN];
     rusty_time_nts::ke::fill_random(&mut nonce).ok()?;
     let ciphertext = rusty_time_nts::aead::seal(&keys.s2c, &[&reply, &nonce], &plaintext).ok()?;
-    reply.extend_from_slice(&ef::authenticator_field(&nonce, &ciphertext));
-    Some(reply)
+    ef::write_authenticator(&mut reply, &nonce, &ciphertext);
+    Some(Reply {
+        bytes: ReplyBytes::Extended(reply),
+        handle,
+    })
 }
 
 #[cfg(test)]
@@ -867,8 +1080,7 @@ pub fn build_reply(
 mod tests;
 
 /// Verify the client's authenticator over the packet preceding it.
-fn verify_client_authenticator(request: &[u8], c2s: &[u8; 32]) -> Option<()> {
-    let auth = ef::fields(request).find(|f| f.field_type == ef::field_type::NTS_AUTHENTICATOR)?;
+fn verify_client_authenticator(request: &[u8], auth: ef::Field<'_>, c2s: &[u8; 32]) -> Option<()> {
     if auth.body.len() < 4 {
         return None;
     }

@@ -73,9 +73,14 @@ fn handle(
     let path = parts.next().unwrap_or("/").to_string();
 
     // Headers: we need Content-Length and nothing else.
+    //
+    // One buffer, cleared and refilled, rather than a fresh `String` per
+    // header line. A browser sends a dozen or more headers per request, so the
+    // old form allocated and freed a dozen strings to read a single number.
     let mut content_length = 0usize;
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
+        line.clear();
         if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
             break;
         }
@@ -136,7 +141,12 @@ fn time_exchange<R: BufRead>(
     // The same reply builder that answers UDP: rate limiting, interleaved
     // mode, NTS and all. A gateway client is a client.
     match build_reply(&body, peer, recv_ts, state, &clock) {
-        Some(reply) => respond(writer, 200, "application/octet-stream", &reply),
+        Some(reply) => respond(
+            writer,
+            200,
+            "application/octet-stream",
+            reply.bytes.as_slice(),
+        ),
         // Rate-limited or refused: say so in HTTP terms rather than hanging.
         None => respond(writer, 429, "text/plain", b"no reply\n"),
     }

@@ -124,6 +124,53 @@ pub fn mint(
     Ok(cookie)
 }
 
+/// Mint several cookies at once, writing each straight into `out` as an
+/// `NTS_COOKIE` extension field.
+///
+/// Byte-for-byte the same fields as calling [`mint`] per nonce and handing
+/// each result to `ef::write_field`, with the per-cookie overhead removed:
+///
+/// * **One key schedule instead of one per cookie.** All the cookies in a
+///   reply are sealed under the same master key, so the cipher is built once.
+/// * **No per-cookie allocations.** The payload and header are fixed-size and
+///   live on the stack; the cookie is written into the caller's buffer rather
+///   than assembled in a `Vec` and copied in.
+///
+/// A server answering one NTS request mints up to eight of these, so the old
+/// shape cost eight key expansions and about thirty allocations per reply.
+pub fn mint_fields_into(
+    ring: &KeyRing,
+    keys: &NtsKeys,
+    nonces: &[[u8; COOKIE_NONCE_LEN]],
+    out: &mut Vec<u8>,
+) -> Result<(), CookieError> {
+    let master = ring.current().ok_or(CookieError::Malformed)?;
+    let mut sealer = aead::Sealer::new(&master.key);
+
+    let mut payload = [0u8; 64];
+    payload[..32].copy_from_slice(&keys.c2s);
+    payload[32..].copy_from_slice(&keys.s2c);
+
+    let mut header = [0u8; KEY_ID_LEN + COOKIE_NONCE_LEN];
+    header[..KEY_ID_LEN].copy_from_slice(&master.id.to_be_bytes());
+
+    // One scratch buffer for every cookie, rather than a fresh allocation per
+    // cookie that is copied out and dropped immediately.
+    let mut sealed = Vec::with_capacity(payload.len() + 16);
+    for nonce in nonces {
+        header[KEY_ID_LEN..].copy_from_slice(nonce);
+        sealed.clear();
+        sealed.extend_from_slice(&payload);
+        sealer
+            .seal_in_place(&[&header], &mut sealed)
+            .map_err(|_| CookieError::Authentication)?;
+        // The cookie is `header || sealed`; written as two parts so it never
+        // has to exist as one buffer.
+        crate::ef::write_field_parts(out, crate::ef::field_type::NTS_COOKIE, &[&header, &sealed]);
+    }
+    Ok(())
+}
+
 /// Recover the session keys from a cookie, or reject it.
 pub fn redeem(ring: &KeyRing, cookie: &[u8]) -> Result<NtsKeys, CookieError> {
     if cookie.len() < KEY_ID_LEN + COOKIE_NONCE_LEN + 16 {

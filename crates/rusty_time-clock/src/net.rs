@@ -179,6 +179,85 @@ pub fn should_adopt_activated(
 /// per message is already amortised, and the buffer stops fitting in cache.
 pub const BATCH_SIZE: usize = 32;
 
+/// Reusable working memory for `recv_batch`.
+///
+/// The kernel needs an array of headers, one address slot and one control
+/// block per datagram. None of it carries information between calls -- it is
+/// all overwritten by the next `recvmmsg` -- so it is allocated once by the
+/// caller and reused, exactly as the packet buffers already are, instead of
+/// being built and thrown away on every receive.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub struct BatchScratch {
+    /// Whether to ask the kernel for control data (receive timestamps).
+    ///
+    /// Only worth paying for if the caller reads `Received::kernel_rx_s`. The
+    /// server does not — it stamps the batch itself — so it asks for none, and
+    /// the kernel skips the control-message machinery for every datagram.
+    want_control: bool,
+    iovecs: Vec<libc::iovec>,
+    addrs: Vec<libc::sockaddr_storage>,
+    msgs: Vec<libc::mmsghdr>,
+    controls: Vec<[u8; CONTROL_LEN]>,
+}
+
+#[cfg(target_os = "linux")]
+impl BatchScratch {
+    /// Scratch that collects kernel receive timestamps.
+    pub fn new() -> Self {
+        let mut scratch = BatchScratch {
+            want_control: true,
+            ..BatchScratch::default()
+        };
+        scratch.ensure(BATCH_SIZE);
+        scratch
+    }
+
+    /// Scratch for a caller that does not read `Received::kernel_rx_s`.
+    pub fn without_timestamps() -> Self {
+        let mut scratch = BatchScratch::default();
+        scratch.ensure(BATCH_SIZE);
+        scratch
+    }
+
+    /// Grow to hold `count` datagrams. After the first call this does nothing.
+    fn ensure(&mut self, count: usize) {
+        if self.msgs.len() >= count {
+            return;
+        }
+        // SAFETY: every one of these is a plain-old-data C struct for which an
+        // all-zero bit pattern is a valid, inert value; each is fully
+        // initialised before the kernel sees it.
+        self.iovecs
+            .resize(count, unsafe { core::mem::zeroed::<libc::iovec>() });
+        self.addrs.resize(count, unsafe {
+            core::mem::zeroed::<libc::sockaddr_storage>()
+        });
+        self.msgs
+            .resize(count, unsafe { core::mem::zeroed::<libc::mmsghdr>() });
+        self.controls.resize(count, [0u8; CONTROL_LEN]);
+    }
+}
+
+/// Non-Linux placeholder, so callers have one shape on every platform.
+#[cfg(not(target_os = "linux"))]
+#[derive(Default)]
+pub struct BatchScratch;
+
+#[cfg(not(target_os = "linux"))]
+impl BatchScratch {
+    pub fn new() -> Self {
+        BatchScratch
+    }
+
+    /// Same shape as the Linux constructor. There is no control-message
+    /// machinery to decline here, so the two are identical — the method exists
+    /// so callers compile unchanged on every platform.
+    pub fn without_timestamps() -> Self {
+        BatchScratch
+    }
+}
+
 /// Receive up to `bufs.len()` datagrams in **one** syscall on Linux
 /// (`recvmmsg`), falling back to a single `recv_from` elsewhere.
 ///
@@ -190,6 +269,7 @@ pub const BATCH_SIZE: usize = 32;
 pub fn recv_batch(
     socket: &UdpSocket,
     bufs: &mut [[u8; 1024]],
+    scratch: &mut BatchScratch,
     out: &mut Vec<Received>,
 ) -> Result<usize, ClockError> {
     use std::os::fd::AsRawFd;
@@ -199,31 +279,44 @@ pub fn recv_batch(
     if count == 0 {
         return Ok(0);
     }
+    scratch.ensure(count);
 
-    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(count);
-    let mut addrs: Vec<libc::sockaddr_storage> = vec![unsafe { core::mem::zeroed() }; count];
-    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(count);
-    // Room for the kernel's SCM_TIMESTAMPING control message per datagram.
-    // Requested unconditionally: if timestamping was never enabled the kernel
-    // simply writes no control data and the field stays None.
-    let mut controls: Vec<[u8; CONTROL_LEN]> = vec![[0u8; CONTROL_LEN]; count];
-
-    for (i, buf) in bufs.iter_mut().take(count).enumerate() {
-        iovecs.push(libc::iovec {
-            iov_base: buf.as_mut_ptr().cast::<libc::c_void>(),
-            iov_len: buf.len(),
-        });
-        let _ = i;
+    // Point each header at this call's buffers and reset the two lengths the
+    // kernel writes back. Nothing is allocated and nothing is zeroed: the
+    // kernel reports how many bytes it put in the address and the control
+    // block, so stale bytes beyond those lengths are never read.
+    //
+    // The previous form built all four arrays per call -- two of them with
+    // `vec![zeroed; 32]`, which is ~4 KiB of sockaddr and 4 KiB of control
+    // buffer memset on every `recvmmsg`, plus four allocations -- to hand the
+    // kernel scratch space it immediately overwrites.
+    let BatchScratch {
+        want_control,
+        iovecs,
+        addrs,
+        msgs,
+        controls,
+    } = scratch;
+    for i in 0..count {
+        iovecs[i] = libc::iovec {
+            iov_base: bufs[i].as_mut_ptr().cast::<libc::c_void>(),
+            iov_len: bufs[i].len(),
+        };
     }
-    for (i, addr) in addrs.iter_mut().enumerate().take(count) {
-        let mut hdr: libc::mmsghdr = unsafe { core::mem::zeroed() };
-        hdr.msg_hdr.msg_name = (addr as *mut libc::sockaddr_storage).cast::<libc::c_void>();
-        hdr.msg_hdr.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        hdr.msg_hdr.msg_iov = iovecs[i..].as_ptr() as *mut libc::iovec;
-        hdr.msg_hdr.msg_iovlen = 1;
-        hdr.msg_hdr.msg_control = controls[i].as_mut_ptr().cast::<libc::c_void>();
-        hdr.msg_hdr.msg_controllen = CONTROL_LEN as _;
-        msgs.push(hdr);
+    for i in 0..count {
+        let hdr = &mut msgs[i].msg_hdr;
+        hdr.msg_name = (&mut addrs[i] as *mut libc::sockaddr_storage).cast::<libc::c_void>();
+        hdr.msg_namelen = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        hdr.msg_iov = (&mut iovecs[i]) as *mut libc::iovec;
+        hdr.msg_iovlen = 1;
+        if *want_control {
+            hdr.msg_control = controls[i].as_mut_ptr().cast::<libc::c_void>();
+            hdr.msg_controllen = CONTROL_LEN as _;
+        } else {
+            hdr.msg_control = core::ptr::null_mut();
+            hdr.msg_controllen = 0;
+        }
+        msgs[i].msg_len = 0;
     }
 
     // SAFETY: msgs is a valid array of `count` mmsghdr, each pointing at a
@@ -319,6 +412,173 @@ unsafe fn kernel_timestamp(hdr: &libc::msghdr) -> Option<f64> {
 }
 
 #[cfg(target_os = "linux")]
+/// Fill a `sockaddr_storage` from a Rust address, returning its length.
+#[cfg(target_os = "linux")]
+fn rust_to_sockaddr(
+    addr: &std::net::SocketAddr,
+    out: &mut libc::sockaddr_storage,
+) -> libc::socklen_t {
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            // SAFETY: sockaddr_storage is sized and aligned for sockaddr_in,
+            // which is the whole reason it exists; every field is written.
+            let sin = unsafe { &mut *(out as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+            core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
+        }
+        std::net::SocketAddr::V6(v6) => {
+            // SAFETY: as above, for sockaddr_in6.
+            let sin6 = unsafe { &mut *(out as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr.s6_addr = v6.ip().octets();
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_scope_id = v6.scope_id();
+            core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
+        }
+    }
+}
+
+/// Send many datagrams in **one** syscall on Linux (`sendmmsg`).
+///
+/// The receive side has been batched since M5; the send side was not, so a
+/// server that collected up to 32 requests with one `recvmmsg` then answered
+/// them with 32 separate `sendto` calls. Under load the reply path was the
+/// syscall-heavy half of the loop.
+///
+/// It also makes the transmit timestamp *more* honest for interleaved mode
+/// rather than less: the packets genuinely do leave in one syscall, so one
+/// clock reading taken immediately afterwards describes all of them, where the
+/// old loop stamped each reply after its own `sendto` and attributed the
+/// accumulated delay of the whole loop to the last client in the batch.
+///
+/// Returns how many datagrams the kernel accepted.
+#[cfg(target_os = "linux")]
+pub fn send_batch(
+    socket: &UdpSocket,
+    messages: &[(&[u8], std::net::SocketAddr)],
+    scratch: &mut BatchScratch,
+) -> Result<usize, ClockError> {
+    send_batch_by(socket, messages, |m| m.0, |m| m.1, scratch)
+}
+
+/// `send_batch` reading each datagram out of the caller's own items.
+///
+/// The slice form needs a `&[(&[u8], SocketAddr)]`, which a caller holding
+/// replies in some other shape can only produce by building a temporary vector
+/// every batch — an allocation, a copy of every element, and a free, to
+/// describe data it already had. Accessors remove it.
+#[cfg(target_os = "linux")]
+pub fn send_batch_by<T>(
+    socket: &UdpSocket,
+    items: &[T],
+    payload: impl Fn(&T) -> &[u8],
+    peer: impl Fn(&T) -> std::net::SocketAddr,
+    scratch: &mut BatchScratch,
+) -> Result<usize, ClockError> {
+    use std::os::fd::AsRawFd;
+
+    let count = items.len().min(BATCH_SIZE);
+    if count == 0 {
+        return Ok(0);
+    }
+    scratch.ensure(count);
+    let BatchScratch {
+        iovecs,
+        addrs,
+        msgs,
+        ..
+    } = scratch;
+
+    for (i, item) in items.iter().enumerate().take(count) {
+        let bytes = payload(item);
+        iovecs[i] = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        let namelen = rust_to_sockaddr(&peer(item), &mut addrs[i]);
+        let hdr = &mut msgs[i].msg_hdr;
+        hdr.msg_name = (&mut addrs[i] as *mut libc::sockaddr_storage).cast::<libc::c_void>();
+        hdr.msg_namelen = namelen;
+        hdr.msg_iov = (&mut iovecs[i]) as *mut libc::iovec;
+        hdr.msg_iovlen = 1;
+        hdr.msg_control = core::ptr::null_mut();
+        hdr.msg_controllen = 0;
+        msgs[i].msg_len = 0;
+    }
+
+    // SAFETY: msgs is a valid array of `count` mmsghdr, each naming a live
+    // iovec and sockaddr owned by `scratch`, which outlives the call. The
+    // payloads are borrowed for the duration of `messages`.
+    let sent = unsafe {
+        libc::sendmmsg(
+            socket.as_raw_fd(),
+            msgs.as_mut_ptr(),
+            count as libc::c_uint,
+            libc::MSG_DONTWAIT as _,
+        )
+    };
+    if sent < 0 {
+        let err = std::io::Error::last_os_error();
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            return Ok(0);
+        }
+        return Err(ClockError {
+            op: "sendmmsg",
+            detail: err.to_string(),
+        });
+    }
+    Ok(sent as usize)
+}
+
+/// Non-Linux fallback: one datagram per call, same shape as the batch path.
+#[cfg(not(target_os = "linux"))]
+pub fn send_batch(
+    socket: &UdpSocket,
+    messages: &[(&[u8], std::net::SocketAddr)],
+    scratch: &mut BatchScratch,
+) -> Result<usize, ClockError> {
+    send_batch_by(socket, messages, |m| m.0, |m| m.1, scratch)
+}
+
+/// Non-Linux fallback: one datagram per call, same shape as the batch path.
+#[cfg(not(target_os = "linux"))]
+pub fn send_batch_by<T>(
+    socket: &UdpSocket,
+    items: &[T],
+    payload: impl Fn(&T) -> &[u8],
+    peer: impl Fn(&T) -> std::net::SocketAddr,
+    _scratch: &mut BatchScratch,
+) -> Result<usize, ClockError> {
+    let mut sent = 0;
+    for item in items {
+        match socket.send_to(payload(item), peer(item)) {
+            Ok(_) => sent += 1,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(e) => {
+                return Err(ClockError {
+                    op: "send_to",
+                    detail: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(sent)
+}
+
+#[cfg(target_os = "linux")]
 fn sockaddr_to_rust(storage: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
     match storage.ss_family as libc::c_int {
@@ -352,6 +612,7 @@ fn sockaddr_to_rust(storage: &libc::sockaddr_storage) -> Option<std::net::Socket
 pub fn recv_batch(
     socket: &UdpSocket,
     bufs: &mut [[u8; 1024]],
+    _scratch: &mut BatchScratch,
     out: &mut Vec<Received>,
 ) -> Result<usize, ClockError> {
     out.clear();
@@ -430,7 +691,8 @@ mod tests {
                 idle += 1;
                 continue;
             }
-            let n = recv_batch(&server, &mut bufs, &mut out).expect("batch");
+            let n =
+                recv_batch(&server, &mut bufs, &mut BatchScratch::new(), &mut out).expect("batch");
             if n == 0 {
                 idle += 1;
                 continue;
@@ -470,7 +732,10 @@ mod tests {
             .expect("timeout");
         let mut bufs = [[0u8; 1024]; 4];
         let mut out = Vec::new();
-        assert_eq!(recv_batch(&s, &mut bufs, &mut out).expect("batch"), 0);
+        assert_eq!(
+            recv_batch(&s, &mut bufs, &mut BatchScratch::new(), &mut out).expect("batch"),
+            0
+        );
         assert!(out.is_empty());
     }
 }

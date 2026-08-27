@@ -1,4 +1,4 @@
-﻿//! timecorp — the TIMECORP corpus runner.
+//! timecorp — the TIMECORP corpus runner.
 //!
 //! `timecorp run [--scenario S1,S6] [--seeds N] [--out DIR] [--ledger PATH]`
 //! runs each scenario across N seeds through the deterministic simulator, writes
@@ -8,6 +8,7 @@
 //! (mission plan §7). This runner also prints a seed-split noise floor so a
 //! future delta has something honest to clear.
 
+mod load;
 mod rng;
 mod scenarios;
 mod serverload;
@@ -45,6 +46,14 @@ fn main() {
             0
         }
         Some("serverload") => run_server_load(),
+        Some("load") => match load::LoadOptions::parse(&args[1..]) {
+            Ok(opts) => load::run(&opts),
+            Err(e) => {
+                eprintln!("timecorp load: {e}");
+                usage();
+                2
+            }
+        },
         _ => {
             usage();
             2
@@ -96,7 +105,9 @@ fn run_server_load() -> i32 {
             m.reply_ratio * 100.0
         ));
     }
-    let per_client = core::mem::size_of::<rusty_time_core::server::ClientRecord>();
+    // Ask the table, do not estimate: the record alone stopped being the whole
+    // per-client cost once records moved into slots with recency links.
+    let per_client = rusty_time_core::server::ClientTable::<std::net::IpAddr>::bytes_per_client();
     println!(
         "\nclient-table state: {per_client} bytes/client, capacity 16384 => {:.1} MiB worst case",
         (per_client * 16_384) as f64 / (1024.0 * 1024.0)

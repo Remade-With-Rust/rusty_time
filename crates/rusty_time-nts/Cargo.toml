@@ -1,11 +1,23 @@
 [package]
 name = "rusty_time-nts"
-description = "NTS (RFC 8915) record layer, extension-field AEAD, and NTS-KE — pure Rust"
+description = "Network Time Security (RFC 8915) for NTP: the NTS-KE record layer, AES-SIV extension field AEAD, and server cookies. Pure Rust, wasm-clean, no C toolchain."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-nts"
+readme = "README.md"
+keywords = ["nts", "ntp", "aes-siv", "cryptography", "rfc8915"]
+categories = ["cryptography", "network-programming", "date-and-time"]
+
+# The NTS server reply path, as a deterministic instruction count. `harness =
+# false`: a plain binary, not a libtest bench — without it cargo links
+# libtest's main and the binary silently runs zero tests.
+[[bench]]
+name = "nts_reply"
+harness = false
 
 [lints]
 workspace = true

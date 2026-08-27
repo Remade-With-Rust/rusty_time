@@ -36,6 +36,25 @@ pub trait ClockRead {
     fn wall_ns(&self) -> Result<i128, ClockError>;
     /// Monotonic seconds from an arbitrary origin, unaffected by steps.
     fn mono_s(&self) -> Result<f64, ClockError>;
+
+    /// Wall clock as **(seconds, nanoseconds)** since the Unix epoch.
+    ///
+    /// This is the shape an NTP timestamp actually wants, and the shape the
+    /// OS already has: every platform's clock call returns a seconds/nanos
+    /// pair. Going through `wall_ns` multiplies those together into an `i128`
+    /// and the caller then divides them straight back apart — and a 128-bit
+    /// division is a *software* routine, not an instruction. On the server's
+    /// per-reply path callgrind attributed 5% of everything the server did to
+    /// `__divti3`, for a round trip that produces the numbers it started with.
+    ///
+    /// The default implementation keeps that round trip, so implementations
+    /// that only have nanoseconds still work; the platform clocks override it.
+    fn wall_parts(&self) -> Result<(i64, u32), ClockError> {
+        let ns = self.wall_ns()?;
+        let secs = ns.div_euclid(1_000_000_000) as i64;
+        let nanos = ns.rem_euclid(1_000_000_000) as u32;
+        Ok((secs, nanos))
+    }
 }
 
 /// Drive the platform clock.

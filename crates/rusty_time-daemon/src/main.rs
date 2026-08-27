@@ -15,6 +15,7 @@ mod service;
 mod service_cmd;
 mod state_cmd;
 mod store;
+mod sync;
 
 #[global_allocator]
 static ALLOC: rusty_time_alloc::HouseAllocator = rusty_time_alloc::house_allocator();
@@ -34,6 +35,14 @@ fn main() {
             Ok(opts) => server::run(&opts),
             Err(msg) => {
                 eprintln!("rtimed serve: {msg}");
+                usage();
+                2
+            }
+        },
+        Some("sync") => match sync::SyncOptions::parse(&args[1..]) {
+            Ok(opts) => sync::run(&opts),
+            Err(msg) => {
+                eprintln!("rtimed sync: {msg}");
                 usage();
                 2
             }
@@ -61,6 +70,8 @@ fn usage() {
     eprintln!("       rtimed serve [--nts] [--bind ADDR] [--ke-bind ADDR] [--stratum N]");
     eprintln!("                    [--cert FILE] [--key FILE] [--nts-name NAME]");
     eprintln!("                    [--gateway ADDR] [--gateway-assets DIR]");
+    eprintln!("       rtimed sync <server>... [--dry-run] [--seconds N] [--minpoll N]");
+    eprintln!("                   [--maxpoll N] [--makestep T N] [--verbose]");
     eprintln!("       rtimed state <show|merge> ...");
     eprintln!("       rtimed service <show|install|path>");
     eprintln!("       rtimed refclock <shm|sock|phc> ...");

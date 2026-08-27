@@ -1,11 +1,16 @@
 [package]
 name = "rusty_time-api"
-description = "Typed op/report types — the JSON public wire for rtimed/rtimec"
+description = "Typed op and report types for rusty_time: the JSON wire between the rtimed daemon and the rtimec control client. Every capability is an op before it is a command."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-api"
+readme = "README.md"
+keywords = ["ntp", "time", "api", "json", "chrony"]
+categories = ["api-bindings", "date-and-time", "network-programming"]
 
 [dependencies]
 serde = { workspace = true }

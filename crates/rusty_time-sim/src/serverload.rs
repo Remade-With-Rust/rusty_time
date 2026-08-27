@@ -128,8 +128,7 @@ pub fn run(scenario: &LoadScenario, seed: u64) -> LoadMetrics {
         } else {
             0.0
         },
-        bytes_per_client: core::mem::size_of::<rusty_time_core::server::ClientRecord>()
-            + core::mem::size_of::<u32>(),
+        bytes_per_client: ClientTable::<u32>::bytes_per_client(),
     }
 }
 

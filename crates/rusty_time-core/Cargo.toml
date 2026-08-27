@@ -1,13 +1,31 @@
 [package]
 name = "rusty_time-core"
-description = "Portable NTP protocol + clock-discipline algorithms (no I/O, no OS clock)"
+description = "Portable NTPv4 protocol and clock-discipline algorithms: packet codec, regression sample filter, falseticker selection, rate limiting and interleaved mode. No I/O, no OS clock, deny(unsafe). The engine inside the rusty_time NTP/NTS daemon."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-core"
+readme = "README.md"
+keywords = ["ntp", "nts", "time", "clock", "sntp"]
+categories = ["date-and-time", "network-programming", "no-std"]
 
 [dependencies]
+
+# The server hot path as a deterministic instruction-count workload. `harness =
+# false` because this is not a libtest benchmark: it is a plain binary meant to
+# be run under callgrind, whose Ir count is exact and reproducible where a wall
+# clock cannot resolve the sub-1% effects being chased.
+[[bench]]
+name = "hot_path"
+harness = false
+
+# The MRU status report. `harness = false`: a plain binary, not libtest.
+[[bench]]
+name = "mru_report"
+harness = false
 
 [lints]
 workspace = true

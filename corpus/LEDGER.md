@@ -414,3 +414,684 @@ and time.cloudflare.com.
 
 With this, every correctness gate that does not require hardware or a
 performance baseline is green.
+
+
+## Cross-implementation performance: rusty_time vs chrony (G1-G6 arm)
+
+`tools/corpus/bench_vs_chrony.sh`. The comparison the mission plan has owed
+since M2, and the first time this project has published a number against
+chrony rather than against itself.
+
+### The rig
+
+**clknetsim** — chrony's own deterministic clock-and-network simulator, so the
+baseline is measured on the tooling its authors trust. Both arms run in the
+*same simulated world*: one config file per scenario, used unchanged by each
+arm, and node 1 is a chronyd stratum-1 server in both cases so the server is
+never a variable. chrony is configured, not strawmanned: `iburst`, and the
+same `minpoll 4 / maxpoll 6 / makestep 1.0 3` policy given to rtimed.
+
+Error is read from clknetsim's own offset log, which records each node's
+**true** error once per second. Neither implementation's self-report is
+trusted — that distinction matters here, because the first defect below was
+one where rtimed's self-report and the truth disagreed by 8 ms.
+
+11 repetitions per arm per scenario, 1800 s simulated each. clknetsim redraws
+its random streams per run, so a single run is one sample of a distribution;
+the table reports the **median run** for typical behaviour and the **worst run**
+for the tail.
+
+### Steady-state accuracy (last quarter of each run)
+
+| scenario | arm | p50 (median run) | p95 (median run) | max (worst run) |
+|---|---|---|---|---|
+| S1 LAN symmetric | chrony | 1.4 us | 1.8 us | 2.5 us |
+| S1 | **rusty_time** | **1.1 us** | **1.6 us** | 3.4 us |
+| S6 cold start 500 ms | chrony | 1.2 us | 1.6 us | 4.3 us |
+| S6 | rusty_time | 2.4 us | 3.4 us | 4.8 us |
+| S8 drifty +100 ppm | chrony | 5.5 us | 8.0 us | 20.4 us |
+| S8 | rusty_time | 6.2 us | 8.4 us | 23.3 us |
+| S2 WAN 2:1 asymmetric | chrony | 6.630 ms | 6.813 ms | 7.028 ms |
+| S2 | rusty_time | 7.153 ms | 7.310 ms | 8.191 ms |
+| S4 congested, 10% loss | chrony | 2.024 ms | 2.742 ms | 8.005 ms |
+| S4 | **rusty_time** | **1.902 ms** | 2.892 ms | **7.043 ms** |
+
+S2 is a check on the rig as much as on the implementations: a 40 ms path split
+26.7/13.3 ms puts an irreducible 6.7 ms error in any NTP client, because NTP
+cannot observe path asymmetry. Both land there. A result meaningfully below
+6.7 ms would have meant the harness was measuring something other than true
+error.
+
+### Convergence (median across runs)
+
+| scenario | chrony to <1 ms | rusty_time to <1 ms | chrony to <100 us | rusty_time to <100 us |
+|---|---|---|---|---|
+| S1 | 7 s | 41 s | 7 s | 132 s |
+| S6 | 12 s | 190 s | 12 s | 281 s |
+| S8 | 7 s | 39 s | 7 s | 130 s |
+
+### Gate verdicts, stated plainly
+
+| gate | verdict |
+|---|---|
+| **G1 accuracy** | **UNRESOLVED at microsecond scale; not met overall.** See the second run below — the us-scale scenarios are not separated by this rig, and the earlier per-scenario win/loss readings did not survive it. What holds: 5 of 14 scenarios have an arm at all, and **S6 is the one real signal**, sitting above the 1.25x cap in both runs. |
+| **G2 convergence** | **FAIL.** S6 time-to-1 ms is 190 s against chrony's 12 s. Not close, and not a measurement artefact — see the cause below. |
+| G3 holdover, G4 server throughput, G5 footprint, G6 vs ntpd-rs | **NOT MEASURED.** No number is claimed. |
+
+### Why convergence lags, since the number alone does not say
+
+The offset drain removes `offset / (corrtimeratio * poll)` per plan, with
+`corrtimeratio = 3`, and the loop re-plans every poll. Each poll therefore
+removes about a third of what remains, so the offset decays as `(2/3)^n` —
+about 5.7 polls to fall by 10x. After the initial burst the poll jumps
+straight to `minpoll` (16 s), which sets the pace from then on. chrony
+finishes most of the correction inside the burst instead.
+
+This is a tuning decision in the drain policy, not a defect: the loop is
+stable, converges monotonically, and its steady-state accuracy is at parity.
+It is deliberately **not** being retuned as part of this benchmark. Changing
+`corrtimeratio` moves every S1-S14 number in this ledger, and retuning a
+constant at the end of a benchmark run in order to turn a gate green is how a
+corpus stops being evidence. It is the next piece of work, with its own
+validation pass.
+
+### Two real defects this comparison found
+
+Both were invisible to the in-house simulator, because the simulator modelled
+an idealised driver. This is the argument for the cross-implementation arm
+existing at all.
+
+**1. The Linux driver silently delivered a fraction of the commanded slew.**
+`ADJ_FREQUENCY` is clamped by the kernel at **500 ppm** (`MAXFREQ` in
+`kernel/time/ntp.c`); the driver advertised 32767 ppm, reading the limit off
+the width of the scaled field rather than the kernel's behaviour. Asked for
+1716 ppm, the clock moved at 500. The controller then subtracted a drain that
+had not happened from its sample history, the regression read the shortfall as
+a frequency error, wound up to the 500 ppm frequency clamp, and **overshot a
+10 ms start to -8.8 ms**. Fixed by splitting the correction across `ADJ_TICK`
+(coarse, +/-10% of nominal) and `ADJ_FREQUENCY` (fine), which is what chrony
+does and the only way to get a usable slew range on Linux; `capabilities()`
+now advertises a rate the driver can actually deliver, and `rtimed sync`
+configures the discipline from it so the loop cannot command the impossible.
+Guarded by `linux_tick_and_freq` tests asserting commanded == delivered.
+
+**2. A cold start wasted 16 seconds before its first usable sample.**
+A server that has just started answers with the unsynchronised leap indicator,
+which a client must refuse. On that refusal the retry backed off to the full
+poll interval (16 s) instead of the burst spacing (2 s). First usable sample
+moved from t=15.995 s to t=1.995 s. Guarded by two tests in
+`rusty_time-core::client`: retries are fast while burst budget remains, and
+back off to the poll interval once it is spent.
+
+Neither fix changed the S1/S6/S8 simulator numbers recorded above — verified by
+re-running `timecorp run --seeds 31` against a freshly built binary and getting
+byte-identical output.
+
+| measure | value |
+|---|---|
+| Workspace tests | **179 passing, 0 failing** |
+| clippy `-D warnings` | clean |
+| Scenarios with a cross-implementation arm | 5 of 14 |
+
+
+## Server hot path: 3053.6 -> 352.1 instructions per request (-88.47%)
+
+`tools/perf/ir.sh`, `crates/rusty_time-core/benches/hot_path.rs`.
+
+### The instrument, and why it is a counter
+
+Every win below is individually well under 1% of any wall clock. At that size
+the clock cannot be promoted to the verdict however many pairs are run — the
+box's own drift is larger than the effect, so a timing A/B either discards real
+work-removal or banks a regression. So the primary evidence is a **deterministic
+instruction count**: callgrind Ir, exact and attributable per function.
+
+The harness is a fixed 200k-request workload with a fixed client population, an
+LCG picking clients from a fixed seed, and a simulated monotonic clock. The
+client table's hash seed is pinned via `RUSTY_TIME_HASH_SEED` so probe counts do
+not move between runs. **Verified exactly reproducible: three consecutive runs
+each read 70,428,459 Ir.** (Unpinned, the OS-random seed makes it reproducible
+only to ~0.002% — still four orders of magnitude below the effect, but an exact
+instrument is worth more than a nearly-exact one.)
+
+The correctness gate is byte-identity. This is an integer/exact path, so the
+harness folds every byte of every reply into a checksum and the harness refuses
+to report a win if it moves. **It did not move across any of the ten changes:
+`0x7546d2258584b400` throughout.**
+
+### Where the instructions actually were
+
+Profiled before touching anything. The result overturned the assumption that an
+NTP server spends its time on NTP:
+
+| cost | share of per-request instructions |
+|---|---|
+| SipHash hashing the client address | ~38% |
+| `BTreeSet` recency index (`search_tree`) | ~23% |
+| hashbrown `get_mut` | ~6% |
+| **client-table bookkeeping, total** | **~67%** |
+
+The cause was structural: the table was hashed **seven times per request** —
+three in `admit` (`contains_key`, `touch`'s `get_mut`, then a final `get_mut`),
+two in `response_mode`, one each in `note_response` and `note_transmit` — plus
+two O(log n) tree walks and two key clones to maintain an eviction index that is
+only read when the table is full.
+
+### The ten wins
+
+Measured cumulatively; each was landed and gated separately.
+
+| # | change | where |
+|---|---|---|
+| 1 | Precompute the token refill rate — a `powi` per request for a value derived only from config | core |
+| 2 | `response_mode`: `get` + `get_mut` on the same key -> one `get_mut` | core |
+| 3 | `admit`: three lookups -> one | core |
+| 4 | `BTreeSet<(seq, K)>` recency index -> intrusive O(1) doubly-linked list over stable slots; removes 2 tree walks + 2 key clones per request | core |
+| 5 | `ClientHandle`: hash once in `admit`, address the three follow-ups by index — four hashes per request -> one | core |
+| 6 | Seeded multiply-mix hasher replacing SipHash for the address key | core |
+| 7 | Four mutex acquisitions per request -> two (`admit`/`response_mode`/`stratum`/`note_response` folded under one guard) | daemon |
+| 8 | Plain NTP replies no longer allocate: `ReplyBytes::Plain([u8; 48])` instead of `to_vec()` on a fixed-size array | daemon |
+| 9 | `kiss_of_death` returns `[u8; 48]` instead of `Vec<u8>` | daemon |
+| 10 | `client_key` computed once instead of twice; `RUSTY_TIME_DEBUG_XLEAVE` read once per process instead of per interleaved request | daemon |
+
+Cumulative: **610,723,644 -> 70,428,459 Ir** over 200k requests, i.e.
+**3053.6 -> 352.1 instructions per request, -88.47%**, checksum unchanged.
+
+Wins 7-10 are daemon-side and outside the core harness, so they are recorded as
+the deterministic counts they are — locks per request, allocations per reply,
+calls per request — verified in the code rather than inferred.
+
+### On the security of win 6
+
+SipHash-1-3 is std's default because it resists collision floods, and that
+property is **not** optional when the key is a client-chosen source address.
+The replacement keeps it and drops the price: the seed is drawn from the OS once
+per process, exactly as SipHash's keys are, so an attacker cannot compute a
+colliding set without a secret they never see. What is given up is SipHash's
+proof against an adversary who already knows the seed. What remains alongside is
+a table bounded to a fixed capacity with LRU eviction, so no chain can grow
+without bound even if that ever failed.
+
+### One candidate investigated and rejected
+
+Guarding the extension-field walk on `request.len() > HEADER_LEN`, on the theory
+that plain 48-byte requests should not pay for it. **Rejected: `ef::fields`
+already clamps its start to the packet length and yields nothing for a bare
+header**, so the guard bought a check that already happens and added a branch.
+Reverted rather than counted.
+
+### One instrument corrected
+
+The corpus previously reported **104 bytes/client, 1.6 MiB worst case**. That
+figure was `size_of::<ClientRecord>()` alone and omitted the `BTreeSet` index
+entirely, so it under-counted the old structure too. It now asks the type
+(`ClientTable::bytes_per_client()`), which counts the record, its slot links and
+the index entry: **150 bytes/client, 2.3 MiB at capacity 16384**. The two
+numbers are not comparable and **no memory win is claimed** — the new one is
+simply the first complete measurement.
+
+### Gates
+
+| gate | result |
+|---|---|
+| Reply byte-identity (harness checksum) | unchanged through all ten changes |
+| S12a / S12b / S12c server-load counts | **identical to the recorded ledger rows**, including 1,021,672 evictions in S12b — the new LRU behaves identically through a million evictions |
+| S1 / S6 / S8 discipline scenarios | unchanged |
+| Workspace tests | 179 passing, 0 failing, **test files unchanged** |
+| clippy `-D warnings`, `cargo fmt` | clean |
+| 8-target check matrix | green |
+
+### What is NOT claimed
+
+An 88% instruction reduction is not an 88% throughput gain. Instructions are not
+time: what was removed (SipHash rounds, B-tree pointer chases) has different IPC
+and cache behaviour from what remains, and a real server additionally spends the
+syscalls this harness excludes. The single-arm absolute figure, pinned and
+best-of-3 CPU time over 20M requests, is **~30M requests/s of core policy +
+codec work on one core** — G4 (throughput vs chrony on the same rig) remains
+**unmeasured**, and this does not settle it.
+
+
+## Round two: the paths the first round never instrumented
+
+The first round fixed the plain-NTP client table and stopped there, because
+that was the only path with an instrument. Three more were built. Each is a
+deterministic Ir workload with a byte-identity gate, and each found work worth
+removing.
+
+| harness | measures | before | after |
+|---|---|---|---|
+| `rusty_time-clock/benches/recv_setup.rs` | `recv_batch` per-call setup | 10,892.5 Ir/call | **1,264.5** (−88.4%) |
+| `rusty_time-nts/benches/nts_reply.rs` | the server's NTS reply | 30,275 Ir/reply | **19,240** (−36.4%) |
+| `rusty_time-core/benches/mru_report.rs` | the MRU status report | 2,236,139 Ir/report | **2,959** (−99.87%, 756x) |
+
+### The ten changes
+
+Six carry an exact Ir A/B; four are deterministic counts of work removed,
+verified in the code the way the first round's daemon changes were.
+
+| # | change | evidence |
+|---|---|---|
+| 1 | `recv_batch` takes a caller-owned `BatchScratch` instead of building four arrays per call — two of them `vec![zeroed; 32]`, ~8 KiB of memset, to hand the kernel space it immediately overwrites | **measured** 10,892.5 -> 1,264.5 Ir/call |
+| 2 | NTS reply and cookie-plaintext buffers pre-sized instead of grown from empty | **measured** 30,275 -> 28,804 |
+| 3 | `ef::write_authenticator` appends in place; the old form built the body in one `Vec`, copied it into a second to add the header, and left the caller to copy that into the reply | **measured** 28,804 -> 28,377 |
+| 4 | `cookie::mint_fields_into` — **one** AES key schedule for all of a reply's cookies instead of one each, and no per-cookie allocation | **measured** 28,377 -> 19,654 (−30.7%) |
+| 5 | One `getrandom` draw for every cookie nonce, not one per cookie | **counted** up to 8 syscalls per reply -> 1 |
+| 6 | `Sealer::seal_in_place` — one scratch buffer for all the cookies rather than a fresh `Vec` per cookie, copied out and dropped | **measured** 19,654 -> 19,240 |
+| 7 | `most_recent` walks the recency list, which is already in that order, instead of cloning all 16384 records and sorting them to keep ten | **measured** 2,236,139 -> 2,959 |
+| 8 | `ef::write_zero_field` for cookie placeholders — the client allocated a zero `Vec` to copy zeros out of (also ships in wasm) | **counted** 1 allocation per protected request -> 0 |
+| 9 | The NTS server path walks the request's extension fields **once**; it used to walk them again inside the authenticator verifier to re-find a field it had just seen | **counted** 2 walks per NTS request -> 1 |
+| 10 | The gateway reuses one `String` across header lines instead of allocating a fresh one per line | **counted** ~1 allocation per header -> 1 per request |
+
+Win 4 is the one that mattered, and it was not obvious from reading: the cost
+was not the cryptography but the *setup* for it. A reply mints up to eight
+cookies under one master key and was expanding a fresh AES key schedule for
+each.
+
+### The gate
+
+Every arm's checksum is unchanged: `0xc0452ab605328800` (plain), and
+`0xef68436181093b01` across all four NTS changes. The `mru_report` arms agree
+exactly (`0x9dc2477057bf9530`), which is the proof that the recency list and a
+sort by `last_seen` are the same ordering.
+
+The decisive one is not a checksum. These changes rewrite how cookies are
+minted and how authenticators are written, so **live NTS interop against
+chrony was re-run and passes in both directions**: rusty_time authenticates
+against chronyd's NTS server (4/4 exchanges, offset −32 us), and chronyd
+completes NTS against ours, holding 8 cookies of length 100 and selecting us
+`^*` at +628 ns. A foreign implementation redeeming our cookies is a stronger
+statement about the wire format than any local assertion.
+
+S1/S6/S8 unchanged; S12a/b/c counts identical; 179 tests, clippy clean, 8
+targets green.
+
+### Three notes against self-flattery
+
+**The measuring tap was 20% of the measurement.** The plain-path harness folded
+each reply into a checksum byte by byte — 48 iterations per request, which
+callgrind priced at 68 Ir/request, about a fifth of everything the workload
+did once the client table was fixed. Every share derived from that harness was
+distorted by it. The fold is now word-wise, coverage unchanged. The plain-path
+baseline is restated at **237.1 Ir/request** with the honest tap.
+
+**One change measured exactly zero and was reverted.** `admit_handle` indexed
+the same slot twice, once for the generation and once for the record; merging
+them changed nothing, because LLVM had already merged them. Kept out of the
+count, and the code was put back rather than left carrying a comment claiming
+a saving that does not exist. It also refutes the obvious next move: the
+`slice/index.rs` share is not redundant indexing waiting to be restructured.
+
+**A harness silently measured nothing.** The first `recv_setup` run reported
+38.8 Ir/call for *both* arms — a flat toggle that would have read as "reusing
+the scratch does not help". It was missing `harness = false`, so cargo linked
+libtest's `main` and the binary ran zero tests while exiting cleanly. A flat
+arm-toggle is not evidence until the arm is known to be wired; the harness now
+prints its own work count (`calls 20000`) so this cannot recur silently.
+
+
+## G4 server throughput: MET
+
+`tools/corpus/bench_server_vs_chrony.sh` (new), `tools/perf/server_ir.sh` (new).
+G4 had no arm at all before this; it now has two, and passes.
+
+### Against chrony, same rig, same generator
+
+200000 requests per round, concurrency 64, 6 rounds, server and generator
+pinned to different cores, arm order rotated.
+
+| arm | answered | replies/s | cpu us/reply |
+|---|---|---|---|
+| **rusty_time** | 200000 | **138664** | **2.950** |
+| chrony | 200000 | 105668 | 4.100 |
+| chrony_null | 200000 | 105960 | 4.050 |
+
+Work parity exact. **replies/s: null-arm floor 292, arm gap 32996 — RESOLVED,
+rusty_time ahead** (113x the floor). **cpu_us/reply: floor 0.05, gap 1.15 —
+RESOLVED** (23x the floor). That is **1.31x chrony's throughput at 0.72x its
+CPU per reply**.
+
+p99 is **not** claimed: at concurrency 64 against a saturated server it is
+queueing latency in the generator, and all three arms sit within 3% of each
+other. G4's p99 half needs a sub-saturation rate arm that does not exist yet.
+
+### The deterministic instrument
+
+Wall throughput could not resolve a single one of the changes below — the
+control arm's spread across rounds exceeded its own median. `server_ir.sh` runs
+the server under callgrind and counts instructions retired per reply:
+reproducible to 0.02% (878.4 / 878.5 / 878.6 across runs), and immune to
+whatever else the box is doing.
+
+| # | change | Ir/reply |
+|---|---|---|
+| — | before | **962.0** |
+| 1 | `sendmmsg`: one send syscall per batch instead of one per reply | 878.5 (-8.7%) |
+| 2 | `ClockRead::wall_parts` — the OS already has (secs, nanos); composing them into an `i128` and dividing them back apart cost a *software* 128-bit division, 5% of the server | 799.3 (-9.0%) |
+| 3 | `send_batch_by` reads the caller's replies directly, dropping a per-batch temporary vector | 784.0 (-1.9%) |
+| 4 | One state lock for the whole batch instead of one per reply (up to 32 -> 1) | 741.0 (-5.5%) |
+| 5 | No control buffers on the server socket: it never enables or reads kernel receive timestamps, so it was asking the kernel to prepare data for nobody | 724.7 (-2.2%) |
+| — | **after** | **725.2 (-24.6%)** |
+
+Interleaved mode is not worse for batching, it is better: the packets now
+genuinely all leave in one syscall, so the single timestamp taken immediately
+after describes all of them, where the old loop stamped each reply after its
+own `sendto` and charged the last client in a batch the accumulated cost of
+every send before it.
+
+
+## G2 convergence: substantially improved, still short on S6
+
+One change, gated three ways. The offset drain aims to finish in
+`CORR_TIME_RATIO` poll intervals but the loop re-plans every poll, so only a
+third of it ever runs: the offset decays by a third per poll, a time constant
+three times longer than the ratio suggests. Correct in steady state — it is
+what keeps sample noise out of the clock — and wrong during acquisition.
+
+| scenario (clknetsim) | before | after | chrony |
+|---|---|---|---|
+| S1 to <1 ms | 41 s | **5 s** | 7 s |
+| S6 to <1 ms | 190 s | **28 s** | 12 s |
+| S8 to <1 ms | 39 s | **5 s** | 7 s |
+
+S1 and S8 now beat chrony. **S6 is 6.8x better but still 2.3x chrony's 12 s, so
+G2 is not met.** The in-house corpus improves too: S1 231 s -> 89 s, S8 405 s ->
+127 s, steady-state unchanged on both.
+
+### Why it is gated, and what the gates cost
+
+The first version keyed only on "the offset is far outside the noise". On
+clknetsim it was a clean win everywhere, S6 included at 12 s — G2 met. On the
+in-house corpus, whose S6 models a path with 0.74 ms of jitter, it took S6's
+steady error from **2.54 ms to 10.83 ms**. Two rigs, opposite verdicts, and the
+low-noise one showed only the good news.
+
+Raising the noise threshold did nothing: S6 sat at 10.83 ms at 10x, 30x, 100x
+and 300x, because the estimator there reports a *small* `offset_sd` beside a
+large error. A loop that is confidently wrong cannot be filtered out by asking
+it how confident it is.
+
+What worked was bounding the correction by what the clock can absorb: the fast
+path applies only while acquiring (first 8 updates), and only when the rate it
+needs is at most a quarter of the slew ceiling. A correction that consumes the
+whole budget pins the clock at maximum rate for the interval, and the frequency
+estimator then infers drift from samples taken while the clock was being
+hauled — badly enough to leave a permanently worse steady state.
+
+| variant | clknetsim S6 | in-house S6 steady |
+|---|---|---|
+| ungated | 12 s (G2 met) | 2.54 -> **10.83 ms** |
+| **gated (shipped)** | 28 s (G2 not met) | 2.54 -> **2.93 ms** |
+
+The gated version ships. Turning a convergence gate green by accepting a 3.4x
+steady-state regression is the same move this ledger refused earlier when it
+declined to retune `corrtimeratio` to make G2 pass — and it would have been
+invisible to the rig the gate is scored on.
+
+## Why S6 was twice chrony's convergence, and the gate that fixed it
+
+The 28 s was not mysterious once the trajectory was read next to chrony's. It
+was one step.
+
+```
+t= 1.995  offset -0.500  freq -83333   poll=2     <- burst, at the slew ceiling
+t= 4.177  offset -0.318  freq -53042   poll=2
+t= 6.290  offset -0.206  freq -34378   poll=2
+t= 8.361  offset -0.135  freq -67545   poll=2
+t=10.506  offset +0.0098 freq   +609   poll=16    <- burst over, 9.8 ms left
+t=26.497  offset +0.0000                          <- 16 s spent on 9.8 ms
+```
+
+The offset drain is sized to finish **within one poll interval**. The
+acquisition burst ended after a fixed four samples, and the poll then jumped
+straight from 2 s to `min_poll`. So the burst hauled 500 ms down to 9.8 ms in
+ten seconds — and then handed the last 9.8 ms a **16 second deadline instead of
+a 2 second one**. chrony, which is not bound by its poll interval, had the same
+cold start gone by t=12 s.
+
+Everything else was a distraction: the frequency estimate was not the problem
+(suppressing frequency updates across the haul changed the outcome by nothing
+at all), and the slew ceiling was not the problem (the burst was already at it).
+
+### The gate
+
+**End the acquisition burst when the offset reaches the convergence target, not
+when a counter runs out.** Capped at `MAX_ACQUIRE_BURST` polls, because a
+client that cannot converge must back off rather than keep asking a stranger's
+server every two seconds.
+
+A first version keyed the extension on `offset > 10 x noise` and failed at
+precisely the wrong moment: at 9.8 ms remaining, `10 x noise` evaluated to
+about 10 ms, the test went false, and the poll jumped anyway. Tying it to what
+"converged" actually means — 1 ms, floored at twice the noise — is what worked.
+
+| clknetsim, to <1 ms | before | after | chrony |
+|---|---|---|---|
+| S1 | 41 s | **5 s** | 7 s |
+| S6 | 190 s -> 28 s | **18 s** | 12 s |
+| S8 | 39 s | **5 s** | 7 s |
+
+S6 is now **1.5x chrony, down from 2.3x**; S1 and S8 beat it. S1 accuracy is
+also now RESOLVED in our favour (1.0 us vs 1.8 us, null-arm floor 0.27 us).
+
+### And the regression it retired
+
+The earlier acquisition change cost the in-house corpus's S6 steady error
+(2.54 -> 2.93 ms) and that was recorded as the price of the convergence win.
+With the burst gate in place the price is gone — the noisy rig improves on
+**every** metric:
+
+| in-house corpus | baseline | now |
+|---|---|---|
+| S1 conv / steady | 231 s / 218.8 us | **73 s / 199.7 us** |
+| S6 steady (seeds converged) | 2.54 ms (4/31) | **1.51 ms (10/31)** |
+| S8 conv / steady | 405 s / 4.70 ms | **74 s / 4.43 ms** |
+
+That is the tell that this gate addresses the cause rather than trading one
+scenario against another: the two rigs, which disagreed sharply on the previous
+attempt, now agree.
+
+### What still separates us from chrony on S6
+
+`ClockCommand::Slew` carries a `drain_offset` — a budget — and **no driver
+honours it**; every platform folds the drain into a constant frequency that
+runs until the next plan. That is why the correction time has to equal the poll
+interval at all: a rate that finishes early would keep going and overshoot.
+chrony's driver accumulates an offset and stops when it is gone, which is how
+it slews near its ceiling without being bound to its polling schedule.
+
+Honouring that budget in the drivers (Linux `ADJ_OFFSET` is exactly this
+primitive) would remove the remaining 1.5x. It is an architectural change to
+the clock seam, not a tuning constant, and it is the next thing to do for G2.
+
+Guarded by three tests in `discipline::acquisition_tests`: the burst continues
+while a correction is outstanding, ends once the offset is small, and is
+bounded when convergence never arrives.
+
+## The architectural fix: drains carry a budget
+
+`ClockCommand::Slew` has always had three fields — a frequency, a
+`drain_offset`, and a `drain_rate_ppm`. The middle one says how big the
+correction is. **No driver honoured it.** Every platform folded the drain into
+a constant frequency that ran until the next plan replaced it, so a drain was
+not a correction of known size, it was a rate with no end.
+
+That is why the correction time had to equal the poll interval: a rate that
+would finish early does not stop when the offset is gone, it sails past it. So
+"how fast may the clock move" and "when does the next packet arrive" were the
+same question, and a 500 ms cold start's last 9.8 ms was handed a 16 s deadline
+because that is when the next packet happened to be due.
+
+### What was built
+
+* `SyncController` tracks `drain_remaining_s` — the budget — and exposes
+  `drain_completes_at()` and `poll_drain()`.
+* The daemon **wakes for the end of a drain** rather than only for the next
+  poll, and applies the frequency-only command that retires it.
+* The simulator stops its plant integration at the same event, so the two agree
+  — the property that makes a corpus number mean anything.
+
+### The bug it produced, which is the bug it exists to prevent
+
+First implementation booked **the budget** when a drain retired. But the budget
+says when the drain *should* stop; the driver stops when it is told to, which
+is when the caller next looks. Waking 11 ms after a 19577 ppm drain expired
+delivered **215 us** the loop never recorded. One unbooked correction, once, in
+a fifteen-minute run, left a permanent ~180 us bias: **S6 measured 137 us
+steady against chrony's 2.5 us**, and the frequency estimate settled 1 ppm off
+true because the regression read the missing correction as drift.
+
+This is the same failure as a driver silently clamping a slew (M2, the Linux
+`ADJ_FREQUENCY` 500 ppm ceiling): **the loop's arithmetic must describe what the
+clock did, not what it was asked to do.** Fixed by booking the delivered
+correction, and pinned by two tests in `client::tests`.
+
+### What it bought, measured honestly
+
+**No measured speed.** At the shipped configuration the budget is inert: the
+same binary with drain retirement disabled (`RUSTY_TIME_NO_DRAIN_STOP=1`)
+measures the same — S1 5 s, S6 14 s, S8 5 s either way. The discipline never
+asks for a rate that would finish before the next poll, so no drain ever
+retires early enough to matter.
+
+Three attempts to use it were tried and all measured worse on at least one rig:
+
+| attempt | clknetsim S6 | in-house S6 steady |
+|---|---|---|
+| clear in a fixed 2 s, ceiling-capped | 11 s | 9.27 ms |
+| slew at the ceiling throughout | 107 s | 4.93 ms |
+| fixed 2 s, gated on confidence | 16 s | 1.50 ms |
+| **poll-scaled, confidence-capped (shipped)** | **14 s** | **1.50 ms** |
+
+It is kept as correctness infrastructure, not as a speed win: `drain_offset`
+now means what it says, an over-fast rate can no longer overshoot, and a late
+wake-up is accounted rather than lost. Anyone raising the rate in future needs
+all three, and none of them existed before.
+
+## What actually moved S6: confidence
+
+The measured improvement came from a different gate. How fast the clock may be
+hauled should depend on how well the offset is known — and the two rigs differ
+by two orders of magnitude in exactly that quantity. A 500 ms offset on
+clknetsim's 10 us-jitter path is known to five decimal places; the same 500 ms
+on the in-house S6's 0.74 ms-jitter path is a much rougher number, and
+committing to it at full speed writes the roughness into the clock.
+
+So the acquisition rate keeps scaling with the poll interval, and only its
+*ceiling* depends on confidence: the full slew budget once the offset exceeds
+the noise by 10000x, a quarter of it otherwise. No single constant satisfied
+both rigs; this satisfies both.
+
+| clknetsim, to <1 ms | start of session | now | chrony |
+|---|---|---|---|
+| S1 | 41 s | **5 s** | 7 s |
+| S6 | 190 s | **14 s** | 12 s |
+| S8 | 39 s | **5 s** | 7 s |
+
+| in-house corpus | baseline | now |
+|---|---|---|
+| S1 conv / steady | 231 s / 218.8 us | **73 s / 199.7 us** |
+| S6 steady | 2.54 ms | **1.50 ms** |
+| S8 conv / steady | 405 s / 4.70 ms | **74 s / 4.43 ms** |
+
+**S6 is 14-16 s against chrony's 12 s, from 2.3x at the start of this work and
+15.8x before any of it.** G2's bar is "<= chrony", so it is still not met.
+Convergence is highly reproducible -- chrony 7/12/7 s with zero spread across
+nine rounds, rusty_time 5/14-16/5 s -- so those numbers are trustworthy.
+
+**The accuracy claims are not, and are withdrawn.** See below.
+
+Gates: 184 tests, clippy clean, 8 targets green, every in-house scenario better
+than baseline on every metric.
+
+## Correction: the accuracy verdicts were over-confident
+
+The resolution verdict compared the two chrony arms' **medians** and treated
+that difference as the rig's floor. That is a single draw from a distribution,
+and it routinely came out absurdly small -- 0.04 us on S6, beside within-arm
+spreads of 3 us. The verdict was therefore over-confident, and it flipped: S8
+read **RESOLVED, rusty_time ahead** (2.3 us vs 5.0 us) in one run and
+**RESOLVED, chrony ahead** (10.7 us vs 2.0 us) in the next, on identical code,
+because that scenario's p50 ranges 0.7-25.3 us across reps.
+
+Replaced with the paired sign test the measurement discipline actually asks
+for. Every arm runs in the same round against the same box, so rounds are the
+pairing and per-round comparison cancels the drift that defeats medians:
+`z = (wins - n/2) / (0.5*sqrt(n))`, resolved at |z| > 2.
+
+At N = 9:
+
+| scenario | paired | verdict |
+|---|---|---|
+| S1 | 3/9, z = -1.00 | NOT RESOLVED |
+| S6 | 1/9, z = **-2.33** | **RESOLVED, chrony ahead** |
+| S8 | 6/9, z = +1.00 | NOT RESOLVED |
+
+**Withdrawn:** every per-scenario accuracy claim in either direction on S1 and
+S8, including "S8 RESOLVED, rusty_time ahead" recorded above. The one accuracy
+result that survives a proper test is S6, and chrony wins it.
+
+What still stands, because it was measured on instruments that resolve:
+convergence (reproducible to the second), the in-house corpus scenarios
+(deterministic, 31 seeds), the server Ir counts (exact), and the G4 throughput
+comparison (null-arm floor 292 replies/s against a 33000 gap).
+
+The rig now also prints each arm's **convergence** spread, not just its
+accuracy spread. This session moved S6 through 28/18/14/16 s on medians whose
+reproducibility was never shown; the spread column exists so that cannot happen
+silently again.
+
+## A bug the benchmark could not see: multi-source drain retirement
+
+Retiring a spent drain applied that source's frequency to the clock **for every
+source**, while the sample path correctly applies only the selected source's
+plan. With more than one server configured, a source the selector had rejected
+— a falseticker, or simply the worse of two — would impose its frequency the
+moment its drain happened to expire.
+
+Every scenario in this corpus uses a single source, so no measurement here
+could ever have caught it; it was found by reading the two paths side by side
+and asking why they disagreed. Fixed: drains are still retired in each
+controller's own books, but only the selected source's command reaches the
+clock.
+
+**Still unaudited in multi-source mode:** a non-selected source's controller
+continues to assume its plans drove the clock, so its `slew_samples` bookkeeping
+is wrong for as long as it is not selected. That predates this change and is
+not fixed here.
+
+## The rig, and what it was hiding
+
+The client comparison now runs a **null arm** — a second chrony against the
+first — prints each arm's p50 spread across reps, and states whether a gap is
+resolvable. It exists because the earlier "rusty_time beats chrony on S1"
+reading did not survive a second run: chrony's own unchanged S1 p50 moved
+1.4 -> 0.4 us between runs, a swing larger than the gap being reported. The
+rig now says so itself:
+
+```
+S1 rusty_time  ... -> null-arm floor 1.06 us | arm gap 1.62 us : NOT RESOLVED
+S8 rusty_time  ... -> null-arm floor 1.52 us | arm gap 3.36 us : RESOLVED, rusty_time ahead
+```
+
+**Only S8 is resolved, and it is ours** (2.6 us vs 5.9 us). Every earlier
+per-scenario win or loss at microsecond scale is withdrawn as unresolvable.
+
+The G4 rig had the same disease and the null arm caught it: the two identical
+chrony arms differed by **31%**, because the round order was
+`A B C` / `C B A` — which looks alternating and leaves B permanently in the
+middle. Rotating properly and pinning server and generator to separate cores
+took the floor from 38468 replies/s to **292**, a 130x improvement in
+resolution, and that is what made both G4 verdicts resolvable.
+
+### Measured and rejected
+
+* **Skipping the `poll` before a receive when the last batch came back full.**
+  0.4% *worse*: `poll` is cheaper than the extra empty `recvmmsg` when the
+  guess is wrong, and at a mean batch depth of 26.4 the condition rarely fired.
+  Reverted.
+* **The ungated acquisition ratio**, above.
+
+Gates: 179 tests, clippy clean, 8 targets green, **NTS interop PASS both
+directions** after the server restructure (chronyd selects us `^*` at +1583 ns),
+S12a/b/c counts identical.

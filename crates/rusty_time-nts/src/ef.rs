@@ -75,6 +75,36 @@ pub fn write_field(out: &mut Vec<u8>, field_type: u16, body: &[u8]) {
     out.resize(out.len() + (total - 4 - body.len()), 0);
 }
 
+/// Write one extension field whose body is several pieces.
+///
+/// Same bytes as `write_field` on the concatenation, without concatenating:
+/// the cookie path had a body of `key_id || nonce || sealed` and was building
+/// that in a temporary `Vec` per cookie purely to hand it over as one slice.
+pub fn write_field_parts(out: &mut Vec<u8>, field_type: u16, parts: &[&[u8]]) {
+    let body_len: usize = parts.iter().map(|p| p.len()).sum();
+    let total = (4 + body_len).next_multiple_of(4).max(MIN_EF_LEN);
+    out.reserve(total);
+    out.extend_from_slice(&field_type.to_be_bytes());
+    out.extend_from_slice(&(total as u16).to_be_bytes());
+    for part in parts {
+        out.extend_from_slice(part);
+    }
+    out.resize(out.len() + (total - 4 - body_len), 0);
+}
+
+/// Write a zero-filled field body of `len` bytes without materialising it.
+///
+/// Cookie placeholders must be exactly as long as a real cookie — that is how
+/// the server learns how much room the reply has — and their contents are all
+/// zeros. Allocating a zero `Vec` to copy zeros out of is work for nothing.
+pub fn write_zero_field(out: &mut Vec<u8>, field_type: u16, len: usize) {
+    let total = (4 + len).next_multiple_of(4).max(MIN_EF_LEN);
+    out.reserve(total);
+    out.extend_from_slice(&field_type.to_be_bytes());
+    out.extend_from_slice(&(total as u16).to_be_bytes());
+    out.resize(out.len() + total - 4, 0);
+}
+
 /// One parsed extension field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Field<'a> {
@@ -128,20 +158,20 @@ pub fn protect_request(
     write_field(&mut packet, field_type::UNIQUE_IDENTIFIER, unique_id);
     write_field(&mut packet, field_type::NTS_COOKIE, cookie);
     // Placeholders must be the same size as a real cookie: that is how the
-    // server learns how much room the reply has (RFC 8915 §5.5).
-    let placeholder = vec![0u8; cookie.len()];
+    // server learns how much room the reply has (RFC 8915 §5.5). Their body is
+    // all zeros, so it is written straight out rather than allocated first.
     for _ in 0..extra_cookies {
-        write_field(
+        write_zero_field(
             &mut packet,
             field_type::NTS_COOKIE_PLACEHOLDER,
-            &placeholder,
+            cookie.len(),
         );
     }
 
     // The authenticator covers everything written so far. A client request
     // carries no encrypted extension fields, so the plaintext is empty.
     let ciphertext = aead::seal(c2s_key, &[&packet, nonce], &[])?;
-    packet.extend_from_slice(&authenticator_field(nonce, &ciphertext));
+    write_authenticator(&mut packet, nonce, &ciphertext);
     Ok(packet)
 }
 
@@ -149,22 +179,42 @@ pub fn protect_request(
 /// Servers use this to seal their reply (with the cookies as plaintext); the
 /// client's own request path uses it with an empty plaintext.
 pub fn authenticator_field(nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(4 + nonce.len() + ciphertext.len() + 8);
-    body.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
-    body.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
-    body.extend_from_slice(nonce);
-    body.resize(
-        body.len() + nonce.len().next_multiple_of(4) - nonce.len(),
-        0,
+    let mut field = Vec::with_capacity(
+        8 + nonce.len().next_multiple_of(4) + ciphertext.len().next_multiple_of(4),
     );
-    body.extend_from_slice(ciphertext);
-    body.resize(
-        body.len() + ciphertext.len().next_multiple_of(4) - ciphertext.len(),
-        0,
-    );
-    let mut field = Vec::with_capacity(4 + body.len());
-    write_field(&mut field, field_type::NTS_AUTHENTICATOR, &body);
+    write_authenticator(&mut field, nonce, ciphertext);
     field
+}
+
+/// Append the authenticator field straight to `out`.
+///
+/// Byte-for-byte what [`authenticator_field`] produces, without building it
+/// first. The returning form assembled the body into one `Vec`, copied that
+/// into a second `Vec` to add the field header, and left the caller to copy
+/// that into the reply — three allocations and three passes over the
+/// ciphertext to emit bytes that were always going on the end of a buffer the
+/// caller already had. On a server answering NTS this runs once per request.
+pub fn write_authenticator(out: &mut Vec<u8>, nonce: &[u8], ciphertext: &[u8]) {
+    // The body is the two lengths followed by each value padded to 4 bytes,
+    // so its length is already a multiple of 4.
+    let body_len = 4 + nonce.len().next_multiple_of(4) + ciphertext.len().next_multiple_of(4);
+    let total = (4 + body_len).next_multiple_of(4).max(MIN_EF_LEN);
+    out.reserve(total);
+    out.extend_from_slice(&field_type::NTS_AUTHENTICATOR.to_be_bytes());
+    out.extend_from_slice(&(total as u16).to_be_bytes());
+    out.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
+    out.extend_from_slice(nonce);
+    out.resize(out.len() + nonce.len().next_multiple_of(4) - nonce.len(), 0);
+    out.extend_from_slice(ciphertext);
+    out.resize(
+        out.len() + ciphertext.len().next_multiple_of(4) - ciphertext.len(),
+        0,
+    );
+    // The pad `write_field` would add when a short field is raised to the
+    // minimum length. Zero in every real case, since `body_len` is already a
+    // multiple of 4 — kept so the two forms cannot drift apart.
+    out.resize(out.len() + (total - 4 - body_len), 0);
 }
 
 /// What a verified server response yielded.

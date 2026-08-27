@@ -1,11 +1,16 @@
 [package]
 name = "rusty_time-wasm"
-description = "Disciplined virtual clock for wasm targets (browser + edge)"
+description = "Disciplined virtual clock for wasm targets: runs the same rusty_time codec and sample filter as the native client, over an NTP-in-HTTP gateway, so a browser page can hold real NTP time."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-wasm"
+readme = "README.md"
+keywords = ["ntp", "wasm", "time", "browser", "clock"]
+categories = ["wasm", "date-and-time", "network-programming"]
 
 [lib]
 # cdylib for the wasm module itself; rlib so the logic stays testable as plain

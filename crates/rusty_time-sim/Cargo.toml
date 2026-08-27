@@ -1,17 +1,23 @@
 [package]
 name = "rusty_time-sim"
-description = "timecorp — deterministic TIMECORP corpus runner (mission plan §7)"
+description = "timecorp, the deterministic corpus runner for rusty_time: simulated clock and network scenarios producing reproducible convergence, accuracy and server-load numbers, plus instruction-count benchmarks."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty_time-sim"
+readme = "README.md"
+keywords = ["ntp", "simulation", "benchmark", "corpus", "time"]
+categories = ["development-tools::testing", "simulation", "date-and-time"]
 
 [[bin]]
 name = "timecorp"
 path = "src/main.rs"
 
 [dependencies]
+
 rusty_time-core.workspace = true
 rusty_time-alloc = { workspace = true }
 serde = { workspace = true }

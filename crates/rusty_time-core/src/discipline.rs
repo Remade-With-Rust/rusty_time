@@ -68,6 +68,39 @@ pub struct DisciplineConfig {
     /// Weight the slope fit by the time each sample represents, so an `iburst`
     /// cluster cannot act as a high-leverage anchor on the frequency estimate.
     pub slope_density_weighting: bool,
+    /// Absolute steady-state correction time, seconds. 0 keeps the default
+    /// behaviour of `CORR_TIME_RATIO * poll_interval`.
+    ///
+    /// The drain rate is `offset / correction_time`, and tying that time to the
+    /// POLL makes the loop's aggressiveness a function of how often it looks.
+    /// Polling twice as fast then does not average twice as much — it halves
+    /// the time constant and writes twice as much sample noise into the clock,
+    /// which is why every attempt to buy accuracy with packets has failed here:
+    /// the packets were spent on twitchiness, not precision.
+    ///
+    /// With an absolute time constant, a faster poll delivers what it should —
+    /// more samples inside the same correction window.
+    ///
+    /// **Off by default: measured, and it does not deliver.** The diagnosis is
+    /// sound — an absolute time constant plus chrony's packet rate is the only
+    /// pairing that could turn per-packet parity into raw-accuracy advantage,
+    /// and neither half can show it alone. Paired against chrony, forty seeded
+    /// worlds each:
+    ///
+    /// ```text
+    ///                S1      S2      S4      S6      S8     poll
+    /// base        -0.63   +0.63   -1.90   -2.21   -1.26    ~40 s
+    /// t=200       -0.95   +0.63   -0.63   -3.48   -1.26    ~38 s
+    /// t=120,k8    +0.32   +1.90   -0.32   -2.21   -1.90    ~32 s
+    /// t=200,k8    +0.32   +0.63   -0.32   -2.53   -2.85    ~31 s
+    /// ```
+    ///
+    /// Nothing resolves ahead anywhere, and S6 stays resolved behind in every
+    /// arm. The absolute constant also destabilises the poll adaptation — S2
+    /// fell to a 21 s poll, spending a third more packets for no gain — because
+    /// the stability test that raises the interval is calibrated against a
+    /// correction time that now no longer moves with it.
+    pub corr_time_s: f64,
 }
 
 impl Default for DisciplineConfig {
@@ -88,6 +121,7 @@ impl Default for DisciplineConfig {
             offset_age_halflife_s: f64::INFINITY,
             offset_weight_dispersion_k: 0.0,
             slope_density_weighting: false,
+            corr_time_s: 0.0,
         }
     }
 }
@@ -510,7 +544,13 @@ impl Discipline {
             ((offset.abs() / (ACQUIRE_CORR_RATIO * poll_s)) * 1e6)
                 .min(self.cfg.max_slew_ppm * self.acquire_share(offset, noise))
         } else {
-            (offset.abs() / (CORR_TIME_RATIO * poll_s)) * 1e6
+            // Correction time: poll-scaled by default, absolute when asked.
+            let corr_time = if self.cfg.corr_time_s > 0.0 {
+                self.cfg.corr_time_s
+            } else {
+                CORR_TIME_RATIO * poll_s
+            };
+            (offset.abs() / corr_time) * 1e6
         };
         let drain_rate_ppm = wanted_rate_ppm.min(self.cfg.max_slew_ppm);
         self.last_drain_share = if self.cfg.max_slew_ppm > 0.0 {

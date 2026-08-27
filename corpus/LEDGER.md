@@ -1634,3 +1634,68 @@ What would actually move it, stated so it is not re-derived:
 * **The S6/S4 standing bias**, now with two mechanisms excluded.
 * **S4's tail**: worst case 13887 us against chrony's 6337 in the same worlds,
   the largest single discrepancy left anywhere in the corpus.
+
+### Why more packets never helped: the time constant is tied to the poll
+
+The steady-state drain rate is `offset / (CORR_TIME_RATIO * poll_interval)`.
+That makes the loop's aggressiveness a function of how often it looks: polling
+twice as fast does not average twice as much, it halves the time constant and
+writes twice as much sample noise into the clock. Every attempt to buy accuracy
+with packets failed for this reason — the packets bought twitchiness.
+
+Re-testing the poll rate after the offset/slope split (a refutation expires when
+its baseline moves) confirmed it. Matched to chrony's packet rate:
+
+```
+        S1      S2      S4      S6      S8     poll
+k8   +0.95   +2.53   +0.95   -2.21   -4.43    32.7 s   (chrony 33.9 s)
+```
+
+S1, S2 and S4 improve; S6 and S8 become RESOLVED losses. Same trade, one level
+down.
+
+So the two were combined — an absolute correction time AND chrony's packet
+rate, the one pairing that could convert per-packet parity into raw advantage,
+and which neither knob alone can show:
+
+```
+                S1      S2      S4      S6      S8     poll
+base         -0.63   +0.63   -1.90   -2.21   -1.26    ~40 s
+t=200        -0.95   +0.63   -0.63   -3.48   -1.26    ~38 s
+t=120,k8     +0.32   +1.90   -0.32   -2.21   -1.90    ~32 s
+t=200,k8     +0.32   +0.63   -0.32   -2.53   -2.85    ~31 s
+```
+
+**Nothing resolves ahead anywhere, in any arm.** S6 stays resolved behind in all
+four. The absolute constant additionally destabilises the poll adaptation — S2
+fell to a 21 s poll, a third more packets for no gain — because the stability
+test that raises the interval is calibrated against a correction time that now
+does not move with it. Rejected.
+
+### Concluded: parity, and the goal is not met
+
+Nine levers: poll rate (twice, before and after the split), weight floor,
+integral trim, offset/slope split, offset age decay, an adaptive gate on it, a
+dispersion-scaled floor, slope density weighting, and an absolute correction
+time. **One shipped.** Everything else trades one scenario against another or is
+refuted outright.
+
+The answer to "can we be better than chrony in steady state" is **no, not by any
+of these routes**. At one hundred seeds per scenario the shipped loop is level:
+nothing resolved in either direction on raw accuracy, and chrony's S2 accuracy
+delivered on 16% fewer packets.
+
+That is a real improvement on where this started — S2 and S6 were resolved
+behind at z = -5.38 and -3.79 — and it is not what was asked for. Recorded
+plainly so nobody has to infer it from a table.
+
+**The structural reason, which is the actual finding.** Every knob in this loop
+is one number serving five paths that want different things: a steady oscillator
+and a random-walk one, a path whose jitter is a tenth of its length and one whose
+jitter is four times it, a cold start and a settled clock. Nine sweeps produced
+nine versions of the same answer. The next real gain is not another constant, it
+is an estimator that measures which case it is in — and the one attempt at that
+failed because a half-window slope test cannot separate measurement noise from
+oscillator wander. Doing it needs discrimination by LAG: an Allan variance over
+successive frequency estimates. That is the whole next campaign, and it is the
+only route left with a mechanism behind it rather than a hope.

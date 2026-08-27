@@ -27,7 +27,7 @@ interleaved), ntpd-rs, and the project's own wasm client.
 a pure-Rust NTPv4 + NTS time client and server for Linux, macOS, Windows and wasm, with
 no C toolchain anywhere in the build.
 
-Performance claims live in [corpus/LEDGER.md](https://github.com/remade-with-rust/rusty_time/blob/master/corpus/LEDGER.md)
+Performance claims live in [corpus/LEDGER.md](https://github.com/remade-with-rust/rusty_time/blob/main/corpus/LEDGER.md)
 with the run that produced them. Anything not in the ledger is not claimed.
 
 ## Licence

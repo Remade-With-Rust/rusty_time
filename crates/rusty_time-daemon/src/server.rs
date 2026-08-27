@@ -486,14 +486,18 @@ fn handle_ke(
             record_type::NEXT_PROTOCOL => {
                 proto_ok = record
                     .body
-                    .chunks_exact(2)
-                    .any(|c| u16::from_be_bytes([c[0], c[1]]) == NEXT_PROTO_NTPV4);
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|c| u16::from_be_bytes(*c) == NEXT_PROTO_NTPV4);
             }
             record_type::AEAD_ALGORITHM => {
                 aead_ok = record
                     .body
-                    .chunks_exact(2)
-                    .any(|c| u16::from_be_bytes([c[0], c[1]]) == AEAD_AES_SIV_CMAC_256);
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|c| u16::from_be_bytes(*c) == AEAD_AES_SIV_CMAC_256);
             }
             _ => {}
         }

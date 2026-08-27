@@ -109,10 +109,12 @@ impl ClockRead for SystemClock {
         if rc != 0 {
             return Err(errno_detail("clock_gettime(REALTIME)"));
         }
-        // `i64::from` rather than `as i64`: `time_t` is already i64 on 64-bit
-        // targets, where the cast is redundant, but it is 32-bit on some others
-        // where it is required. `From` is correct on both and is not a cast.
-        Ok((i64::from(ts.tv_sec), ts.tv_nsec as u32))
+        // No conversion on `tv_sec`: `time_t` is 64-bit on every target this
+        // crate ships to, so `as i64` is an unnecessary cast and `i64::from` a
+        // useless conversion -- clippy rejects both, and it is right about
+        // both. A 32-bit-time_t target would fail to compile here, which is
+        // the right way to find out that it needs one.
+        Ok((ts.tv_sec, ts.tv_nsec as u32))
     }
 
     fn mono_s(&self) -> Result<f64, ClockError> {

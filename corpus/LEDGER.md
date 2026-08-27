@@ -2030,3 +2030,108 @@ Each carries a number because each was tried and rejected on evidence:
 * **Caching the offset weights like the base weights: +27k.** The weight must be
   carried in the row, because trimming leaves a row unable to find its own index
   again, and the wider row costs what the saved divisions gain.
+
+---
+
+## 0.1.4 — a failure audit, and two real defects
+
+Deliberately hunting for what breaks in production rather than what is slow.
+Two defects found and fixed, two fuzz targets added over code that had none,
+and one gap documented rather than fixed.
+
+### Defect 1: a refused clock command left the books poisoned
+
+`SyncController::on_sample` books a plan's effects the moment it produces it —
+the frequency change tilts every stored sample, a step shifts them, the drain
+budget starts counting. The daemon *then* hands the command to the driver,
+which can refuse it. The old code logged the error and carried on.
+
+So after a refusal the register held a correction that never happened. The
+regression read that history as truth, the frequency estimate absorbed it, and
+the daemon went on reporting itself synchronised while the clock ran free.
+**Nothing looks wrong in that state**, which is the worst property a failure can
+have in a time daemon.
+
+It is reachable: `clock_adjtime` returns `EPERM` the moment `CAP_SYS_TIME` goes
+away, and a seccomp policy or a container with a read-only clock refuses it too.
+The startup capability probe does not help — capabilities can be dropped after
+it passes.
+
+Fixed with `revert_last_plan`, the exact inverse of what a plan applied, plus
+`confirm_last_plan` on the success path. The daemon now reverts a refused
+command and gives up after ten consecutive refusals rather than continuing to
+report a synchronisation that is not happening. Two tests, including one that
+proves a reverted controller does NOT behave like one whose command landed.
+
+This is the third appearance of the same law in this project: **the loop's
+arithmetic has to describe what the clock actually did.** First the 500 ppm
+`ADJ_FREQUENCY` clamp, then booking a drain's budget instead of its delivery,
+now booking a command the driver rejected.
+
+### Defect 2: timestamps quantised to 238 ns, doubling in February 2038
+
+Wall time was carried as f64 *seconds since 1970*. Unix time is ~1.79e9, where
+an f64 has a **238 ns gap between representable values** — so every timestamp
+was rounded to 238 ns before any arithmetic, and a difference of two could be
+off by 477 ns. The kernel's `SO_TIMESTAMPING` path was worst: an exact
+`timespec` folded into f64 seconds the instant it arrived.
+
+The wire carries 2^-32 s = **0.233 ns**. Three orders of magnitude were being
+discarded, against a measured steady-state error of about 1300 ns.
+
+And it degrades on a schedule. **When Unix time crosses 2^31 in February 2038**
+the exponent steps and the gap doubles to 477 ns, making the error in a
+difference ~954 ns — comparable to the entire steady-state error. Nothing would
+break loudly; the daemon would simply become less accurate, on a date.
+
+Fixed by keeping integer nanoseconds end to end (`kernel_rx_ns: Option<i64>`,
+exact until the year 2262) and taking all four timestamps RELATIVE to T1, with
+the difference computed in the 32.32 fixed-point domain where the subtraction is
+exact. Three tests pin it, with a tolerance of one NTP tick — the wire's own
+resolution, because a tighter tolerance would be testing the test.
+
+That change also **deleted the era guess**. Picking an NTP era by proximity to
+the local clock is only as good as that clock; a difference under ±68 years is
+unambiguous by RFC 5905's arithmetic, and every difference here is milliseconds.
+`ntp_to_unix_near` is gone.
+
+**No corpus regression**: forty seeded worlds per scenario, paired against
+chrony, nothing resolved in either direction (S1 18/40, S2 20/40, S4 17/40,
+S6 18/40, S8 18/40), with S2 still resolved ahead per packet at 40/40, z=+6.32.
+The improvement itself is **not** corpus-visible — 238 ns sits far below the
+rig's 10 us of jitter — which is exactly why it needed a deterministic test
+rather than a rig run.
+
+### New fuzz coverage over code that had none
+
+The three existing targets all fuzz parsers. Two more now cover the stateful
+code behind them:
+
+```
+discipline_loop     644,779 runs   clean
+client_table      2,933,043 runs   clean
+```
+
+`discipline_loop` asserts the property that matters at the boundary: **a clock
+command is never nonsense.** A NaN frequency does not merely compute a poor
+answer — it reaches `clock_adjtime` through an `as i64` conversion that
+saturates rather than trapping, so a NaN becomes 0 and an infinity becomes
+`i64::MAX`. Samples are constrained to what `exchange()` actually admits, since
+fuzzing values the daemon refuses would test unreachable code.
+
+`client_table` hunts one specific hazard: `admit_handle` returns a
+`ClientHandle { slot, generation }` that outlives what it points at. Between
+taking a handle and using it the client can be evicted and its slot recycled, so
+a wrong generation check would write one client's timestamps into another's
+record — cross-client state confusion reachable from unauthenticated packets.
+The target holds a handle across deliberate eviction churn and asserts no other
+key's record ever moves. It did not.
+
+### Documented, not fixed: no bound on how far a source can move the clock
+
+There is no `maxchange` equivalent. A single source can step the clock
+arbitrarily on first sync, and afterwards drag it at up to `max_slew_ppm`
+indefinitely. **chrony's default applies no limit either**, so this matches the
+reference rather than falling short of it — but on a mesh where the node is
+hardware you do not own, and where a capability's expiry is decided by this
+clock, it is worth having. Recorded as an open item rather than invented here.

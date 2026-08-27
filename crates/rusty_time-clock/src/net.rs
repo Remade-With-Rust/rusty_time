@@ -70,13 +70,22 @@ pub struct Received {
     /// to read it. The gap between those two is scheduling latency, and on a
     /// busy machine it is the single largest error in an otherwise good
     /// exchange.
-    pub kernel_rx_s: Option<f64>,
+    /// Kernel receive time, in whole NANOSECONDS since the Unix epoch.
+    ///
+    /// Integer, not seconds-as-f64. The kernel hands over an exact `timespec`;
+    /// folding it into an f64 of seconds-since-1970 rounds it to the 238 ns
+    /// gap between representable values at today's epoch, and to 477 ns once
+    /// Unix time crosses 2^31 in February 2038. The wire resolution this
+    /// timestamp is compared against is 2^-32 s — 0.233 ns — so that
+    /// conversion was discarding three orders of magnitude before any
+    /// arithmetic happened.
+    pub kernel_rx_ns: Option<i64>,
 }
 
 /// Ask the kernel to attach receive timestamps to datagrams on this socket.
 ///
 /// Requests hardware timestamps too; the kernel simply does not supply them
-/// where the NIC cannot, and `Received::kernel_rx_s` is `None` then. Failure is
+/// where the NIC cannot, and `Received::kernel_rx_ns` is `None` then. Failure is
 /// not fatal — the caller falls back to reading the clock after `recv`, which
 /// is what every implementation did before this existed.
 #[cfg(target_os = "linux")]
@@ -191,7 +200,7 @@ pub const BATCH_SIZE: usize = 32;
 pub struct BatchScratch {
     /// Whether to ask the kernel for control data (receive timestamps).
     ///
-    /// Only worth paying for if the caller reads `Received::kernel_rx_s`. The
+    /// Only worth paying for if the caller reads `Received::kernel_rx_ns`. The
     /// server does not — it stamps the batch itself — so it asks for none, and
     /// the kernel skips the control-message machinery for every datagram.
     want_control: bool,
@@ -213,7 +222,7 @@ impl BatchScratch {
         scratch
     }
 
-    /// Scratch for a caller that does not read `Received::kernel_rx_s`.
+    /// Scratch for a caller that does not read `Received::kernel_rx_ns`.
     pub fn without_timestamps() -> Self {
         let mut scratch = BatchScratch::default();
         scratch.ensure(BATCH_SIZE);
@@ -357,11 +366,11 @@ pub fn recv_batch(
         if let Some(peer) = peer {
             // SAFETY: the kernel filled msg_control with msg_controllen bytes
             // of well-formed cmsgs, or set the length to zero.
-            let kernel_rx_s = unsafe { kernel_timestamp(&msg.msg_hdr) };
+            let kernel_rx_ns = unsafe { kernel_timestamp(&msg.msg_hdr) };
             out.push(Received {
                 len,
                 peer,
-                kernel_rx_s,
+                kernel_rx_ns,
             });
         }
     }
@@ -385,7 +394,7 @@ const CONTROL_LEN: usize = 128;
 /// `hdr` must be a msghdr the kernel has just filled, with `msg_control`
 /// pointing at `msg_controllen` valid bytes.
 #[cfg(target_os = "linux")]
-unsafe fn kernel_timestamp(hdr: &libc::msghdr) -> Option<f64> {
+unsafe fn kernel_timestamp(hdr: &libc::msghdr) -> Option<i64> {
     if hdr.msg_controllen == 0 || hdr.msg_control.is_null() {
         return None;
     }
@@ -401,7 +410,9 @@ unsafe fn kernel_timestamp(hdr: &libc::msghdr) -> Option<f64> {
                 // SAFETY: index is within the three-element array above.
                 let ts = unsafe { *stamps.add(index) };
                 if ts.tv_sec != 0 || ts.tv_nsec != 0 {
-                    return Some(ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9);
+                    // Exact. i64 nanoseconds hold Unix time until the year
+                    // 2262; f64 seconds lose 238 ns of it today.
+                    return Some(ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64);
                 }
             }
         }
@@ -624,7 +635,7 @@ pub fn recv_batch(
             out.push(Received {
                 len,
                 peer,
-                kernel_rx_s: None,
+                kernel_rx_ns: None,
             });
             Ok(1)
         }

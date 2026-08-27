@@ -11,7 +11,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/../.." || exit 1
 
 SECONDS_PER_TARGET=${SECONDS_PER_TARGET:-60}
-TARGETS=${TARGETS:-"ntp_parse config_parse nts_records"}
+TARGETS=${TARGETS:-"ntp_parse config_parse nts_records discipline_loop client_table"}
 fail=0
 
 if ! command -v cargo-fuzz >/dev/null 2>&1; then

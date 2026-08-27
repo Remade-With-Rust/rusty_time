@@ -199,6 +199,13 @@ pub fn run(opts: &SyncOptions) -> i32 {
     // before drains carried a budget.
     let stop_drains = std::env::var_os("RUSTY_TIME_NO_DRAIN_STOP").is_none();
 
+    // Consecutive refusals from the clock driver. A handful can be transient;
+    // a run of them means this process cannot steer the clock at all, and
+    // continuing would be a daemon that logs errors while quietly reporting
+    // success.
+    const MAX_REFUSALS: u32 = 10;
+    let mut refused_in_a_row: u32 = 0;
+
     let mut drains_retired: u64 = 0;
     let started = Instant::now();
     let mut driver = SystemClock;
@@ -250,7 +257,12 @@ pub fn run(opts: &SyncOptions) -> i32 {
                 if !opts.dry_run
                     && let Err(e) = driver.apply(&command)
                 {
-                    eprintln!("rtimed sync: ending drain: {e}");
+                    // Retiring a drain only ever asks the clock to STOP
+                    // draining, so a refusal leaves it running faster than the
+                    // books say. Count it with the rest: the condition it
+                    // signals is the same one.
+                    refused_in_a_row += 1;
+                    eprintln!("rtimed sync: ending drain: {e} (refused {refused_in_a_row}x)");
                 }
             }
         }
@@ -314,12 +326,38 @@ pub fn run(opts: &SyncOptions) -> i32 {
                     // Only the selected source drives the clock.
                     if selected_index(&sources) == Some(index) && !opts.dry_run {
                         match driver.apply(&step.plan.command) {
-                            Ok(()) => applied_any = true,
-                            Err(e) => eprintln!("rtimed sync: applying clock command: {e}"),
+                            Ok(()) => {
+                                applied_any = true;
+                                refused_in_a_row = 0;
+                                sources[index].controller.confirm_last_plan();
+                            }
+                            Err(e) => {
+                                // The command did not reach the clock, so the
+                                // books that assumed it did must be put back.
+                                // Left standing, the register would carry a
+                                // correction that never happened and the
+                                // regression would read it as truth — the
+                                // daemon would report itself synchronised while
+                                // the clock ran free.
+                                sources[index].controller.revert_last_plan();
+                                refused_in_a_row += 1;
+                                eprintln!(
+                                    "rtimed sync: applying clock command: {e}                                      (refused {refused_in_a_row}x; correction reverted)"
+                                );
+                                if refused_in_a_row >= MAX_REFUSALS {
+                                    eprintln!(
+                                        "rtimed sync: the clock has refused {MAX_REFUSALS}                                          consecutive corrections — giving up rather than                                          reporting a synchronisation that is not happening"
+                                    );
+                                    return 1;
+                                }
+                            }
                         }
                         if let ClockCommand::Step { add_seconds } = step.plan.command {
                             println!("rtimed sync: stepped clock by {add_seconds:+.6} s");
                         }
+                    } else {
+                        // Not driving the clock, so there is nothing to undo.
+                        sources[index].controller.confirm_last_plan();
                     }
                 }
                 None => {
@@ -429,7 +467,20 @@ fn exchange(
     let nonce = NtpTimestamp(nonce_value(source.exchanges));
     let request = NtpPacket::client_request(4, nonce).to_bytes();
 
-    let t1_wall = clock.wall_ns().ok()? as f64 * 1e-9;
+    // Kept as INTEGER nanoseconds, not seconds-as-f64.
+    //
+    // Unix time is about 1.79e9 seconds now, and an f64 there has a 238 ns
+    // gap between representable values — so converting a timestamp to seconds
+    // rounds away 238 ns before any arithmetic happens, and a difference of
+    // two such values can be off by 477 ns. The wire carries 2^-32 s, which is
+    // 0.233 ns: three orders of magnitude finer than what was being kept.
+    //
+    // That already costs a third of the measured error budget, and it gets
+    // worse on a schedule. **In February 2038 Unix time crosses 2^31**, the
+    // exponent steps, and the gap doubles to 477 ns — the error in a difference
+    // becoming 954 ns, comparable to the entire steady-state error. Nothing
+    // would break loudly; the daemon would simply get less accurate, on a date.
+    let t1_ns = clock.wall_ns().ok()?;
     let t1_mono = clock.mono_s().ok()?;
     source.socket.send(&request).ok()?;
 
@@ -442,7 +493,7 @@ fn exchange(
     // `recvmsg` — a plain `recv` supplies no control buffer and silently
     // discards it. (clknetsim asserts on exactly that mismatch, which is how
     // this was caught.)
-    let (packet, t4_wall, t4_mono) = loop {
+    let (packet, t4_ns, t4_mono) = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return None;
@@ -457,7 +508,7 @@ fn exchange(
         };
         // Read the local clock once, right after the syscall, for any datagram
         // the kernel did not stamp itself.
-        let userspace_wall = clock.wall_ns().ok()? as f64 * 1e-9;
+        let userspace_wall_ns = clock.wall_ns().ok()?;
         let mono = clock.mono_s().ok()?;
         let mut found = None;
         for (index, message) in received.iter().enumerate().take(count) {
@@ -470,8 +521,13 @@ fn exchange(
                     // stack; the userspace read is taken after we were
                     // scheduled. Prefer the former — the difference is
                     // scheduling latency, and it lands straight in the offset.
-                    let t4 = message.kernel_rx_s.unwrap_or(userspace_wall);
-                    found = Some((p, t4, mono - (userspace_wall - t4).max(0.0)));
+                    let t4_ns: i128 = message
+                        .kernel_rx_ns
+                        .map(i128::from)
+                        .unwrap_or(userspace_wall_ns);
+                    // Scheduling latency, in seconds, for the monotonic stamp.
+                    let latency = ((userspace_wall_ns - t4_ns) as f64 * 1e-9).max(0.0);
+                    found = Some((p, t4_ns, mono - latency));
                     break;
                 }
                 _ => continue,
@@ -491,9 +547,26 @@ fn exchange(
         return None;
     }
 
-    let t2 = ntp_to_unix_near(packet.receive_ts, t1_wall);
-    let t3 = ntp_to_unix_near(packet.transmit_ts, t4_wall);
-    let (offset, delay) = ntp::offset_delay(t1_wall, t2, t3, t4_wall);
+    // All four timestamps RELATIVE to T1, so the magnitudes are milliseconds
+    // rather than decades and every bit of the wire's precision survives.
+    //
+    // `seconds_since` takes the difference in the 32.32 fixed-point domain — an
+    // exact integer subtraction — and only then divides. The result is a small
+    // number, which f64 represents to well under a nanosecond.
+    //
+    // It also removes the era guess. Picking an era by proximity to the local
+    // clock is only as good as that clock; a difference under ±68 years is
+    // unambiguous by RFC 5905's own arithmetic, and every difference here is
+    // milliseconds.
+    let t1_ntp = NtpTimestamp::from_unix(
+        t1_ns.div_euclid(1_000_000_000) as i64,
+        t1_ns.rem_euclid(1_000_000_000) as u32,
+    );
+    let t1 = 0.0;
+    let t2 = packet.receive_ts.seconds_since(t1_ntp);
+    let t3 = packet.transmit_ts.seconds_since(t1_ntp);
+    let t4 = (t4_ns - t1_ns) as f64 * 1e-9;
+    let (offset, delay) = ntp::offset_delay(t1, t2, t3, t4);
     if delay < 0.0 {
         return None;
     }
@@ -523,22 +596,6 @@ fn nonce_value(counter: u64) -> u64 {
             .unwrap_or(0),
     );
     h.finish()
-}
-
-fn ntp_to_unix_near(ts: NtpTimestamp, pivot_unix_s: f64) -> f64 {
-    const ERA: f64 = 4_294_967_296.0;
-    let base = ts.seconds() as f64 - ntp::UNIX_EPOCH_OFFSET as f64 + ts.fraction() as f64 / ERA;
-    let mut best = base;
-    let mut best_dist = (base - pivot_unix_s).abs();
-    for k in [-1.0f64, 1.0] {
-        let candidate = base + k * ERA;
-        let distance = (candidate - pivot_unix_s).abs();
-        if distance < best_dist {
-            best = candidate;
-            best_dist = distance;
-        }
-    }
-    best
 }
 
 #[cfg(test)]

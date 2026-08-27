@@ -330,6 +330,92 @@ pub fn offset_delay(t1: f64, t2: f64, t3: f64, t4: f64) -> (f64, f64) {
 }
 
 #[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    /// Timestamps must keep the wire's resolution, not the epoch's.
+    ///
+    /// An NTP timestamp carries 2^-32 s — 0.233 ns. Unix time is around
+    /// 1.79e9 seconds, and an f64 there has a 238 ns gap between representable
+    /// values, so the moment a timestamp is expressed as seconds-since-1970 in
+    /// an f64, three orders of magnitude of it are gone. Worse, it is gone on a
+    /// schedule: when Unix time crosses 2^31 in **February 2038** the exponent
+    /// steps and the gap doubles to 477 ns.
+    ///
+    /// The daemon therefore takes differences in the fixed-point domain, where
+    /// the subtraction is exact, and only then converts. This test pins that
+    /// property by showing the two routes disagree by far more than the
+    /// quantity being measured.
+    /// One tick of the NTP fraction: 2^-32 s, about 233 ps. This is the finest
+    /// distinction the wire format can draw, so it is the right tolerance for
+    /// any claim about timestamp arithmetic — a tighter one is testing the
+    /// test, not the code.
+    const TICK: f64 = 1.0 / 4_294_967_296.0;
+
+    #[test]
+    fn differences_keep_sub_nanosecond_resolution() {
+        // A realistic 2026 instant, and a second one 1 ns later.
+        let secs = 1_787_856_000i64;
+        let a = NtpTimestamp::from_unix(secs, 0);
+        let b = NtpTimestamp::from_unix(secs, 1);
+
+        // The exact route: subtract in fixed point, then convert.
+        let exact = b.seconds_since(a);
+        assert!(
+            exact > 0.0,
+            "a 1 ns step vanished entirely in the fixed-point difference"
+        );
+        assert!(
+            (exact - 1e-9).abs() <= TICK,
+            "fixed-point difference gave {exact} s for a 1 ns step"
+        );
+
+        // The lossy route: seconds-since-1970 as f64, then subtract.
+        let ulp = (secs as f64).next_up() - secs as f64;
+        assert!(
+            ulp > 200e-9,
+            "this test assumes an f64 at the Unix epoch is coarse; ULP is {ulp} s"
+        );
+    }
+
+    /// The same, at the 2038 boundary — where it gets worse rather than breaking.
+    #[test]
+    fn the_2038_exponent_step_does_not_reach_the_difference() {
+        // 2038-01-19, just past 2^31 seconds.
+        let secs = 2_147_500_000i64;
+        let a = NtpTimestamp::from_unix(secs, 0);
+        let b = NtpTimestamp::from_unix(secs, 100);
+        let exact = b.seconds_since(a);
+        assert!(
+            (exact - 100e-9).abs() <= TICK,
+            "a 100 ns step past 2038 measured as {exact} s"
+        );
+
+        // Meanwhile the f64-seconds representation there cannot even hold it.
+        let ulp = (secs as f64).next_up() - secs as f64;
+        assert!(
+            ulp > 400e-9,
+            "expected the post-2038 f64 gap to exceed 400 ns, got {ulp} s"
+        );
+    }
+
+    /// A difference must stay correct across the 2036 era wrap, which is the
+    /// other half of why the daemon no longer guesses an era from the local
+    /// clock: for spans this short the arithmetic is unambiguous on its own.
+    #[test]
+    fn a_difference_spans_the_era_boundary() {
+        // Straddle 2036-02-07, where the NTP second count wraps.
+        let before = NtpTimestamp::from_unix(2_085_978_495, 0);
+        let after = NtpTimestamp::from_unix(2_085_978_497, 0);
+        let delta = after.seconds_since(before);
+        assert!(
+            (delta - 2.0).abs() <= TICK,
+            "two seconds across the era wrap measured as {delta}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

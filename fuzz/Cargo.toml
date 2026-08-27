@@ -27,6 +27,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "discipline_loop"
+path = "fuzz_targets/discipline_loop.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_table"
+path = "fuzz_targets/client_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "nts_records"
 path = "fuzz_targets/nts_records.rs"
 test = false

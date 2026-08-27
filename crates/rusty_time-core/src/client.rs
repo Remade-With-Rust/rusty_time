@@ -50,6 +50,20 @@ pub struct SyncController {
     drain_remaining_s: f64,
     /// Monotonic time of the last plan, for working out how much drain ran.
     last_plan_mono_s: Option<f64>,
+    /// What the last plan changed, so it can be undone if the driver refused it.
+    unapplied: Option<Unapplied>,
+}
+
+/// The bookkeeping one plan performed, kept only until the caller says whether
+/// the clock actually accepted it.
+#[derive(Clone, Copy, Debug)]
+struct Unapplied {
+    mono_s: f64,
+    dfreq_ppm: f64,
+    step_s: f64,
+    freq_cmd_before: f64,
+    drain_ppm_before: f64,
+    drain_remaining_before: f64,
 }
 
 /// What the controller decided, plus what the caller must do about it.
@@ -81,7 +95,42 @@ impl SyncController {
             drain_ppm: 0.0,
             drain_remaining_s: 0.0,
             last_plan_mono_s: None,
+            unapplied: None,
         }
+    }
+
+    /// Undo the bookkeeping of the last plan, because the driver refused it.
+    ///
+    /// **The loop's arithmetic has to describe what the clock actually did.**
+    /// A plan books its own effects the moment it is produced: the frequency
+    /// change tilts every stored sample, a step shifts them, and the drain
+    /// budget starts counting down. The caller then hands the command to the
+    /// platform — which can refuse it. `clock_adjtime` returns `EPERM` the
+    /// moment `CAP_SYS_TIME` goes away, and a seccomp policy or a container
+    /// with a read-only clock refuses it too.
+    ///
+    /// Without this, a refusal is silent and cumulative. The register carries
+    /// corrections that never happened, the regression reads that history as
+    /// truth, and the daemon reports itself synchronised while the clock free
+    /// runs — the worst failure a time daemon has, because nothing looks wrong.
+    ///
+    /// Returns whether there was a plan to revert.
+    pub fn revert_last_plan(&mut self) -> bool {
+        let Some(u) = self.unapplied.take() else {
+            return false;
+        };
+        // Exact inverse of what `on_sample` applied, in the opposite order.
+        self.register
+            .slew_samples(u.mono_s, -u.dfreq_ppm, -u.step_s);
+        self.freq_cmd_ppm = u.freq_cmd_before;
+        self.drain_ppm = u.drain_ppm_before;
+        self.drain_remaining_s = u.drain_remaining_before;
+        true
+    }
+
+    /// Confirm the last plan reached the clock, so it can no longer be undone.
+    pub fn confirm_last_plan(&mut self) {
+        self.unapplied = None;
     }
 
     pub fn freq_ppm(&self) -> f64 {
@@ -216,6 +265,11 @@ impl SyncController {
 
         let plan = self.discipline.on_estimate(offset, freq, sd);
         let freq_cmd_new = self.discipline.freq_ppm();
+        // Captured before the books move, so `revert_last_plan` can put them
+        // back exactly if the clock command is refused.
+        let freq_cmd_before = self.freq_cmd_ppm;
+        let drain_ppm_before = self.drain_ppm;
+        let drain_remaining_before = self.drain_remaining_s;
 
         match plan.command {
             ClockCommand::Step { add_seconds } => {
@@ -248,6 +302,18 @@ impl SyncController {
 
         self.freq_cmd_ppm = freq_cmd_new;
         self.last_plan_mono_s = Some(mono_now_s);
+        // Remember enough to undo all of the above if the driver refuses it.
+        self.unapplied = Some(Unapplied {
+            mono_s: mono_now_s,
+            dfreq_ppm: freq_cmd_new - freq_cmd_before,
+            step_s: match plan.command {
+                ClockCommand::Step { add_seconds } => add_seconds,
+                ClockCommand::Slew { .. } => 0.0,
+            },
+            freq_cmd_before,
+            drain_ppm_before,
+            drain_remaining_before,
+        });
 
         ControllerStep {
             plan,
@@ -256,6 +322,101 @@ impl SyncController {
             estimate_freq_ppm: freq,
             samples_used: self.register.len(),
         }
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use crate::filter::Sample;
+
+    fn feed(c: &mut SyncController, n: usize, base: f64) {
+        for i in 0..n {
+            let t = 16.0 * (i as f64 + 1.0);
+            c.on_sample(
+                t,
+                Sample {
+                    t,
+                    offset: base - 20e-6 * t,
+                    delay: 200e-6,
+                    dispersion: 1e-6,
+                },
+            );
+        }
+    }
+
+    /// A refused clock command must leave the controller exactly as it was.
+    ///
+    /// The regression that matters: without this, a daemon that has lost
+    /// CAP_SYS_TIME keeps planning corrections, keeps booking them against its
+    /// own history, and keeps reporting itself synchronised, while the clock it
+    /// believes it is steering runs free.
+    #[test]
+    fn a_refused_command_leaves_no_trace() {
+        let cfg = DisciplineConfig::default();
+        let mut applied = SyncController::new(cfg);
+        let mut refused = SyncController::new(cfg);
+
+        feed(&mut applied, 12, 0.010);
+        feed(&mut refused, 12, 0.010);
+
+        // One more sample on each. The first controller's command reaches the
+        // clock; the second's is refused and reverted.
+        let t = 16.0 * 13.0;
+        let sample = Sample {
+            t,
+            offset: 0.010 - 20e-6 * t,
+            delay: 200e-6,
+            dispersion: 1e-6,
+        };
+        let before_freq = refused.freq_ppm();
+        let before_drain = refused.drain_ppm();
+
+        applied.on_sample(t, sample);
+        applied.confirm_last_plan();
+
+        refused.on_sample(t, sample);
+        assert!(refused.revert_last_plan(), "there was a plan to revert");
+
+        assert_eq!(
+            refused.freq_ppm(),
+            before_freq,
+            "the frequency command survived a refusal"
+        );
+        assert_eq!(
+            refused.drain_ppm(),
+            before_drain,
+            "the drain survived a refusal"
+        );
+
+        // And the stored history must be back where it was: feeding both the
+        // same next sample, the one that reverted must NOT agree with the one
+        // that applied, because their clocks genuinely differ now.
+        let t2 = 16.0 * 14.0;
+        let next = Sample {
+            t: t2,
+            offset: 0.010 - 20e-6 * t2,
+            delay: 200e-6,
+            dispersion: 1e-6,
+        };
+        let a = applied.on_sample(t2, next);
+        let r = refused.on_sample(t2, next);
+        assert_ne!(
+            a.applied_ppm, r.applied_ppm,
+            "a reverted controller behaved identically to one that applied its              command, so the revert did not actually restore the books"
+        );
+    }
+
+    /// Reverting twice, or with nothing outstanding, must be harmless.
+    #[test]
+    fn reverting_nothing_is_a_no_op() {
+        let mut c = SyncController::new(DisciplineConfig::default());
+        assert!(!c.revert_last_plan(), "nothing has been planned yet");
+        feed(&mut c, 6, 0.001);
+        let freq = c.freq_ppm();
+        assert!(c.revert_last_plan());
+        assert!(!c.revert_last_plan(), "a second revert must do nothing");
+        assert_ne!(freq, f64::NAN);
     }
 }
 

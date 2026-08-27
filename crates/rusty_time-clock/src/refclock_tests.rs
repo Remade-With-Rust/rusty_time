@@ -148,13 +148,14 @@ fn kernel_receive_timestamps_are_produced_when_the_platform_supplies_them() {
         .expect("clock")
         .as_secs_f64();
 
-    match received.kernel_rx_s {
+    match received.kernel_rx_ns {
         Some(stamp) => {
             // The whole point is that this is a *real* time, not a zero or a
             // misparsed cmsg field.
+            let stamp_s = stamp as f64 * 1e-9;
             assert!(
-                stamp >= before - 1.0 && stamp <= after + 1.0,
-                "kernel timestamp {stamp} is outside the window [{before}, {after}]"
+                stamp_s >= before - 1.0 && stamp_s <= after + 1.0,
+                "kernel timestamp {stamp_s} is outside the window [{before}, {after}]"
             );
         }
         None => {

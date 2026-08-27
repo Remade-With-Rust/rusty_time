@@ -11,6 +11,7 @@
 
 use rusty_time_clock::{ClockDrive, ClockRead, SystemClock, net};
 use rusty_time_core::client::SyncController;
+use rusty_time_core::discipline::ChangeVerdict;
 use rusty_time_core::ntp::{self, HEADER_LEN, LeapIndicator, Mode, NtpPacket, NtpTimestamp};
 use rusty_time_core::select::select;
 use rusty_time_core::{ClockCommand, DisciplineConfig, Sample, SourceEstimate};
@@ -122,6 +123,26 @@ impl SyncOptions {
                 "--corr-time" => {
                     opts.discipline.corr_time_s =
                         value()?.parse().map_err(|_| "--corr-time: not a number")?;
+                }
+                "--maxchange" => {
+                    // chrony's three-argument form: offset, start, ignore.
+                    let offset: f64 = value()?
+                        .parse()
+                        .map_err(|_| "--maxchange: offset is not a number")?;
+                    let start: u32 = value()?
+                        .parse()
+                        .map_err(|_| "--maxchange: start is not a number")?;
+                    let ignore: i32 = value()?
+                        .parse()
+                        .map_err(|_| "--maxchange: ignore is not a number")?;
+                    if !(offset.is_finite() && offset > 0.0) {
+                        return Err(
+                            "--maxchange: offset must be a positive number of seconds".into()
+                        );
+                    }
+                    opts.discipline.max_change_s = Some(offset);
+                    opts.discipline.max_change_start = start;
+                    opts.discipline.max_change_ignore = ignore;
                 }
                 "--no-makestep" => opts.discipline.makestep_threshold = None,
                 "--no-iburst" => opts.discipline.iburst = false,
@@ -321,6 +342,31 @@ pub fn run(opts: &SyncOptions) -> i32 {
                             step.samples_used,
                             step.plan.next_poll_s
                         );
+                    }
+
+                    // A correction the guard refused must not reach the clock,
+                    // and one that exhausts the allowance ends the process. A
+                    // daemon that keeps refusing corrections while reporting
+                    // success is a machine whose clock is quietly wrong, which
+                    // is the state this guard exists to make impossible.
+                    match step.verdict {
+                        ChangeVerdict::Accepted => {}
+                        ChangeVerdict::Refused { offset_s, seen } => {
+                            eprintln!(
+                                "rtimed sync: {src} asked for a {offset_s:+.3} s correction, beyond the {limit:.3} s limit — refused ({seen}x)",
+                                src = sources[index].name,
+                                limit = opts.discipline.max_change_s.unwrap_or(0.0),
+                            );
+                        }
+                        ChangeVerdict::GiveUp { offset_s } => {
+                            eprintln!(
+                                "rtimed sync: {src} still asking for a {offset_s:+.3} s correction beyond the {limit:.3} s limit after {ignore} refusals — giving up rather than running a clock this daemon has decided it cannot steer",
+                                src = sources[index].name,
+                                limit = opts.discipline.max_change_s.unwrap_or(0.0),
+                                ignore = opts.discipline.max_change_ignore,
+                            );
+                            return 1;
+                        }
                     }
 
                     // Only the selected source drives the clock.

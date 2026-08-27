@@ -71,6 +71,24 @@ its resolution floor is exactly zero. Any gap in the tables above is code.
 Every figure above, with the run that produced it and the defects the
 comparison uncovered, is in [corpus/LEDGER.md](corpus/LEDGER.md).
 
+### Bounding what a source may do to your clock
+
+```sh
+rtimed sync <server> --maxchange 1000 1 2
+```
+
+chrony's `maxchange`, and **off by default** exactly as chrony's is — the right
+value is a policy question about the deployment, not something a library can
+guess. Beyond `start` updates, a correction larger than `offset` seconds is
+refused and the clock is left running exactly as it was; after `ignore`
+consecutive refusals the daemon exits rather than keep reporting a
+synchronisation it is not performing. A negative `ignore` never exits.
+
+It matters more here than on a server you own. Authentication proves who a
+source is, not that it is telling the truth — and on a mesh, a capability's
+expiry is decided by this clock, so anything that can move it can move the
+boundary between *revoked* and *valid*.
+
 ## Install
 
 ```sh

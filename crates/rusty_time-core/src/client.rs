@@ -12,7 +12,7 @@
 //! both call it. The simulator's recorded S1/S6/S8 numbers are the regression
 //! test on that move — they must not change.
 
-use crate::discipline::{ClockCommand, Discipline, DisciplineConfig, Plan};
+use crate::discipline::{ChangeVerdict, ClockCommand, Discipline, DisciplineConfig, Plan};
 use crate::filter::{Sample, SampleRegister};
 
 /// How many samples one source keeps.
@@ -76,6 +76,9 @@ pub struct ControllerStep {
     pub estimate_offset_s: f64,
     pub estimate_freq_ppm: Option<f64>,
     pub samples_used: usize,
+    /// What the maximum-change guard made of this correction. Mirrored out of
+    /// the plan so a caller can act on it without matching on the command.
+    pub verdict: ChangeVerdict,
 }
 
 impl SyncController {
@@ -321,6 +324,7 @@ impl SyncController {
             estimate_offset_s: offset,
             estimate_freq_ppm: freq,
             samples_used: self.register.len(),
+            verdict: plan.verdict,
         }
     }
 }

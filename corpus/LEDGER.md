@@ -2127,7 +2127,7 @@ record — cross-client state confusion reachable from unauthenticated packets.
 The target holds a handle across deliberate eviction churn and asserts no other
 key's record ever moves. It did not.
 
-### Documented, not fixed: no bound on how far a source can move the clock
+### Documented, then built in 0.1.5: a bound on how far a source can move the clock
 
 There is no `maxchange` equivalent. A single source can step the clock
 arbitrarily on first sync, and afterwards drag it at up to `max_slew_ppm`
@@ -2135,3 +2135,64 @@ indefinitely. **chrony's default applies no limit either**, so this matches the
 reference rather than falling short of it — but on a mesh where the node is
 hardware you do not own, and where a capability's expiry is decided by this
 clock, it is worth having. Recorded as an open item rather than invented here.
+
+---
+
+## 0.1.5 — `maxchange`, because a clock is believed
+
+The audit left one gap open: nothing bounded how far a source could move the
+clock. A single source could step it arbitrarily on first sync and afterwards
+drag it at up to `max_slew_ppm` indefinitely. chrony applies no limit by
+default either, so this matched the reference — but matching the reference is
+not the bar when the node is hardware you do not own and a capability's expiry
+is decided by this clock. Authentication proves who a server is, not that it is
+telling the truth.
+
+```
+--maxchange <offset> <start> <ignore>
+```
+
+chrony's three-argument shape, and off by default for the same reason chrony's
+is: the right value is a policy question about the deployment, not something a
+library can guess. A machine with a dead RTC legitimately needs to move its
+clock by years on first sync; a mesh node that has been up for a week does not,
+and a source asking it to should be refused rather than obeyed.
+
+* **`offset`** — the largest correction this daemon will make, in seconds.
+* **`start`** — updates to allow through first, so a cold start can make the one
+  large correction it genuinely needs.
+* **`ignore`** — refusals to tolerate before giving up. Negative never gives up.
+
+The guard runs **before** the step decision. A step is the largest and fastest
+way to move a clock, so a guard placed after it would be guarding everything
+except the dangerous case.
+
+A refusal leaves the clock running exactly as it was — the commanded frequency
+held, nothing drained — because that is the only honest response to an estimate
+the daemon has decided not to trust. Refusals are counted **consecutively**, and
+an accepted update clears the run, so one outlier among good samples cannot
+accumulate toward a shutdown.
+
+**Giving up is the point.** A daemon that refuses corrections forever and says
+nothing is a machine whose clock is quietly wrong; the operator needs to find
+out, and an exit is how a service says so. `ignore` negative is there for the
+operator who would rather have a stuck clock than a stopped daemon — their call,
+made explicitly.
+
+Demonstrated end to end on the rig, S6's 500 ms cold start with a 1 ms limit:
+
+```
+rtimed sync: 192.168.123.1 asked for a -0.458 s correction, beyond the 0.001 s limit — refused (1x)
+rtimed sync: 192.168.123.1 asked for a -0.458 s correction, beyond the 0.001 s limit — refused (2x)
+rtimed sync: 192.168.123.1 still asking for a -0.458 s correction beyond the 0.001 s limit
+             after 2 refusals — giving up rather than running a clock this daemon has
+             decided it cannot steer
+```
+
+and the clock was left uncorrected at ~460 ms, drifting at the oscillator's own
+20 ppm, which is exactly what refusing means.
+
+Six tests pin it, including the two that matter most: that it is **off by
+default**, and that the first correction of a cold start still goes through. A
+safety limit that breaks legitimate cold starts would be turned off by every
+operator who hit it, which is worse than not shipping it.

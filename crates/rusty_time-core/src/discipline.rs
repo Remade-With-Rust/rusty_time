@@ -101,6 +101,25 @@ pub struct DisciplineConfig {
     /// the stability test that raises the interval is calibrated against a
     /// correction time that now no longer moves with it.
     pub corr_time_s: f64,
+    /// Largest correction this daemon will ever make, in seconds. `None`
+    /// applies no limit.
+    ///
+    /// chrony's `maxchange`, and off by default exactly as chrony's is —
+    /// because the right value is a policy question about the deployment, not
+    /// something a library can guess. A machine with a dead RTC legitimately
+    /// needs to move its clock by years on first sync; a mesh node that has
+    /// been up for a week does not, and a source asking it to should be
+    /// refused rather than obeyed.
+    pub max_change_s: Option<f64>,
+    /// Updates to allow before the limit applies, so a cold start can make the
+    /// one large correction it genuinely needs.
+    pub max_change_start: u32,
+    /// How many refusals to tolerate before giving up. Negative never gives up.
+    ///
+    /// Giving up is the point. A daemon that refuses corrections forever and
+    /// says nothing is a daemon whose clock is quietly wrong — the operator
+    /// needs to find out, and an exit is how a service says so.
+    pub max_change_ignore: i32,
     /// Poll intervals over which a steady-state offset is drained. Overrides
     /// `CORR_TIME_RATIO` when > 0.
     ///
@@ -132,6 +151,9 @@ impl Default for DisciplineConfig {
             slope_density_weighting: false,
             corr_time_s: 0.0,
             corr_time_ratio: 0.0,
+            max_change_s: None,
+            max_change_start: 1,
+            max_change_ignore: 2,
         }
     }
 }
@@ -157,6 +179,29 @@ pub struct Plan {
     pub next_poll_s: f64,
     /// The sample register is invalid after a step; caller must shift or clear it.
     pub reset_register: bool,
+    /// What the maximum-change guard made of this correction.
+    pub verdict: ChangeVerdict,
+}
+
+/// What the maximum-change guard decided about a correction.
+///
+/// A time daemon's most dangerous power is that it is *believed*. On a mesh,
+/// the node running your code is hardware you do not control, and a capability
+/// expires by this clock — so a source that can move it can move the boundary
+/// between "revoked" and "valid". Authentication proves who a server is, not
+/// that it is telling the truth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChangeVerdict {
+    /// Within the limit, or no limit configured.
+    Accepted,
+    /// Larger than the limit: NO correction was made. `seen` counts how many
+    /// consecutive refusals have happened, so the caller can say so once
+    /// rather than on every poll.
+    Refused { offset_s: f64, seen: u32 },
+    /// Larger than the limit, and the allowance for refusals is spent. The
+    /// caller should stop rather than keep running a clock it has decided it
+    /// cannot steer.
+    GiveUp { offset_s: f64 },
 }
 
 /// Number of quick polls in an iburst, and their spacing.
@@ -360,6 +405,8 @@ pub struct Discipline {
     offset_ewma: f64,
     /// Whether `offset_ewma` has been seeded.
     ewma_seeded: bool,
+    /// Consecutive corrections refused by the maximum-change guard.
+    change_refusals: u32,
 }
 
 impl Discipline {
@@ -376,6 +423,7 @@ impl Discipline {
             burst_used: 0,
             offset_ewma: 0.0,
             ewma_seeded: false,
+            change_refusals: 0,
         }
     }
 
@@ -421,6 +469,47 @@ impl Discipline {
     pub fn on_estimate(&mut self, offset: f64, freq_ppm_meas: Option<f64>, offset_sd: f64) -> Plan {
         self.updates += 1;
 
+        // The maximum-change guard, before anything is decided.
+        //
+        // Placed ahead of the step logic on purpose: a step is the largest and
+        // fastest way to move a clock, so a guard that ran after it would be
+        // guarding everything except the dangerous case. The allowance for
+        // early updates is what lets a cold start still make its one big
+        // legitimate correction.
+        if let Some(limit) = self.cfg.max_change_s
+            && self.updates > self.cfg.max_change_start
+            && offset.abs() > limit
+        {
+            self.change_refusals = self.change_refusals.saturating_add(1);
+            let spent = self.cfg.max_change_ignore >= 0
+                && self.change_refusals as i64 > i64::from(self.cfg.max_change_ignore);
+            self.stable_streak = 0;
+            return Plan {
+                // Hold the frequency already commanded and drain nothing: the
+                // clock keeps running as it was, which is the only honest
+                // response to an estimate this daemon has decided not to trust.
+                command: ClockCommand::Slew {
+                    freq_ppm: self.freq_ppm,
+                    drain_offset: 0.0,
+                    drain_rate_ppm: 0.0,
+                },
+                next_poll_s: self.take_poll_interval(),
+                reset_register: false,
+                verdict: if spent {
+                    ChangeVerdict::GiveUp { offset_s: offset }
+                } else {
+                    ChangeVerdict::Refused {
+                        offset_s: offset,
+                        seen: self.change_refusals,
+                    }
+                },
+            };
+        }
+        // A correction within the limit clears the run: the allowance is for
+        // CONSECUTIVE refusals, so one bad estimate among good ones does not
+        // accumulate toward giving up.
+        self.change_refusals = 0;
+
         // Step epoch: large offsets early on are stepped away, chrony `makestep`.
         if let Some(threshold) = self.cfg.makestep_threshold
             && offset.abs() > threshold
@@ -433,6 +522,7 @@ impl Discipline {
                 },
                 next_poll_s: self.take_poll_interval(),
                 reset_register: true,
+                verdict: ChangeVerdict::Accepted,
             };
         }
 
@@ -618,6 +708,7 @@ impl Discipline {
             },
             next_poll_s: self.take_poll_interval(),
             reset_register: false,
+            verdict: ChangeVerdict::Accepted,
         }
     }
 
@@ -720,6 +811,135 @@ mod acquisition_tests {
             next > IBURST_SPACING_S,
             "burst never backed off despite never converging: next poll {next} s"
         );
+    }
+}
+
+#[cfg(test)]
+mod max_change_tests {
+    use super::*;
+
+    fn guarded(limit: f64, start: u32, ignore: i32) -> Discipline {
+        Discipline::new(DisciplineConfig {
+            max_change_s: Some(limit),
+            max_change_start: start,
+            max_change_ignore: ignore,
+            // Stepping is what makes a hostile offset dangerous, so leave it on.
+            makestep_threshold: Some(1.0),
+            makestep_limit: 3,
+            ..DisciplineConfig::default()
+        })
+    }
+
+    /// Off unless asked for — the same default chrony ships.
+    #[test]
+    fn no_limit_by_default() {
+        let mut d = Discipline::new(DisciplineConfig::default());
+        let plan = d.on_estimate(86_400.0, None, 1e-6);
+        assert_eq!(plan.verdict, ChangeVerdict::Accepted);
+        assert!(
+            matches!(plan.command, ClockCommand::Step { .. }),
+            "with no limit configured a large offset must still be corrected"
+        );
+    }
+
+    /// The cold start a limit must not break: one big legitimate correction.
+    #[test]
+    fn the_first_correction_is_still_allowed_through() {
+        let mut d = guarded(1000.0, 1, 2);
+        let plan = d.on_estimate(50_000.0, None, 1e-6);
+        assert_eq!(
+            plan.verdict,
+            ChangeVerdict::Accepted,
+            "a machine with a dead clock must still be able to set it once"
+        );
+        assert!(matches!(plan.command, ClockCommand::Step { .. }));
+    }
+
+    /// After the allowance, a large correction is refused and the clock is left
+    /// exactly as it was running.
+    #[test]
+    fn a_large_correction_is_refused_and_changes_nothing() {
+        let mut d = guarded(1000.0, 1, 5);
+        d.on_estimate(0.0001, None, 1e-6); // update 1, within the allowance
+        let plan = d.on_estimate(50_000.0, None, 1e-6); // update 2, guarded
+        match plan.verdict {
+            ChangeVerdict::Refused { offset_s, seen } => {
+                assert_eq!(seen, 1);
+                assert!((offset_s - 50_000.0).abs() < 1e-9);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        match plan.command {
+            ClockCommand::Slew {
+                drain_offset,
+                drain_rate_ppm,
+                ..
+            } => {
+                assert_eq!(
+                    drain_offset, 0.0,
+                    "a refused correction still moved the clock"
+                );
+                assert_eq!(drain_rate_ppm, 0.0);
+            }
+            other => panic!("a refusal must not step or drain: {other:?}"),
+        }
+    }
+
+    /// Refusals are consecutive: a good update in between clears the run, so a
+    /// single outlier cannot accumulate toward shutting the daemon down.
+    #[test]
+    fn a_good_update_clears_the_run() {
+        let mut d = guarded(1000.0, 1, 2);
+        d.on_estimate(0.0001, None, 1e-6);
+        assert!(matches!(
+            d.on_estimate(50_000.0, None, 1e-6).verdict,
+            ChangeVerdict::Refused { seen: 1, .. }
+        ));
+        assert_eq!(
+            d.on_estimate(0.0001, None, 1e-6).verdict,
+            ChangeVerdict::Accepted
+        );
+        assert!(
+            matches!(
+                d.on_estimate(50_000.0, None, 1e-6).verdict,
+                ChangeVerdict::Refused { seen: 1, .. }
+            ),
+            "the refusal count did not reset after an accepted update"
+        );
+    }
+
+    /// A source that keeps asking exhausts the allowance and the daemon stops.
+    #[test]
+    fn persistent_refusal_gives_up() {
+        let mut d = guarded(1000.0, 1, 2);
+        d.on_estimate(0.0001, None, 1e-6);
+        for expected in 1..=2 {
+            assert!(matches!(
+                d.on_estimate(50_000.0, None, 1e-6).verdict,
+                ChangeVerdict::Refused { seen, .. } if seen == expected
+            ));
+        }
+        assert!(
+            matches!(
+                d.on_estimate(50_000.0, None, 1e-6).verdict,
+                ChangeVerdict::GiveUp { .. }
+            ),
+            "the allowance was spent and the daemon did not give up"
+        );
+    }
+
+    /// A negative allowance never gives up — for an operator who would rather
+    /// have a stuck clock than a stopped daemon.
+    #[test]
+    fn a_negative_allowance_never_gives_up() {
+        let mut d = guarded(1000.0, 1, -1);
+        d.on_estimate(0.0001, None, 1e-6);
+        for _ in 0..50 {
+            assert!(matches!(
+                d.on_estimate(50_000.0, None, 1e-6).verdict,
+                ChangeVerdict::Refused { .. }
+            ));
+        }
     }
 }
 

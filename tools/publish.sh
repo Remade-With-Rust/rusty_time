@@ -63,6 +63,11 @@ publish_one() {
 
         if ! grep -qE "^error" <<< "$out"; then
             echo "  published $crate"
+            # Each verification build gets its own dependency tree under
+            # target/package, and they are not shared between crates. Nine of
+            # them will fill a disk that had room for one. It is pure scratch
+            # once the crate is up.
+            rm -rf target/package 2>/dev/null
             return 0
         fi
         if grep -qiE "already (exists|uploaded)" <<< "$out"; then

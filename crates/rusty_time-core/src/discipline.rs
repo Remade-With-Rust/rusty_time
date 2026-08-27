@@ -65,6 +65,9 @@ pub struct DisciplineConfig {
     /// If > 0, take the offset weight floor from measured delay dispersion
     /// rather than a fraction of the minimum delay.
     pub offset_weight_dispersion_k: f64,
+    /// Weight the slope fit by the time each sample represents, so an `iburst`
+    /// cluster cannot act as a high-leverage anchor on the frequency estimate.
+    pub slope_density_weighting: bool,
 }
 
 impl Default for DisciplineConfig {
@@ -84,6 +87,7 @@ impl Default for DisciplineConfig {
             offset_weight_floor_ratio: crate::filter::OFFSET_WEIGHT_FLOOR_RATIO,
             offset_age_halflife_s: f64::INFINITY,
             offset_weight_dispersion_k: 0.0,
+            slope_density_weighting: false,
         }
     }
 }

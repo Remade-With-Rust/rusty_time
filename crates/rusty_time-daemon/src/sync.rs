@@ -114,6 +114,7 @@ impl SyncOptions {
                         .parse()
                         .map_err(|_| "--offset-weight-dispersion-k: not a number")?;
                 }
+                "--slope-density" => opts.discipline.slope_density_weighting = true,
                 "--no-makestep" => opts.discipline.makestep_threshold = None,
                 "--no-iburst" => opts.discipline.iburst = false,
                 other if other.starts_with("--") => {

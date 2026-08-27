@@ -48,6 +48,9 @@ pub struct SampleRegister {
     /// Weight-floor width used for the OFFSET only. See
     /// [`SampleRegister::set_offset_weight_floor_ratio`].
     offset_weight_floor_ratio: f64,
+    /// Weight the SLOPE by the time each sample represents, not by its
+    /// existence. See [`SampleRegister::set_slope_density_weighting`].
+    slope_density_weighting: bool,
     /// If > 0, set the offset weight floor from the measured delay DISPERSION
     /// rather than from a fraction of the minimum delay. See
     /// [`SampleRegister::set_offset_weight_dispersion_k`].
@@ -138,6 +141,7 @@ impl SampleRegister {
             capacity: capacity.max(3),
             weight_floor_ratio: WEIGHT_FLOOR_RATIO,
             offset_weight_floor_ratio: OFFSET_WEIGHT_FLOOR_RATIO,
+            slope_density_weighting: false,
             offset_weight_dispersion_k: 0.0,
             offset_age_halflife_s: f64::INFINITY,
         }
@@ -224,6 +228,33 @@ impl SampleRegister {
     /// needs a statistic that separates noise from wander by LAG — an Allan
     /// variance over successive frequency estimates — not a single window
     /// split.
+    /// Weight each sample in the SLOPE fit by the span of time it represents,
+    /// rather than letting every packet count equally.
+    ///
+    /// A least-squares slope is dominated by whatever sits furthest from the
+    /// centroid, and `iburst` puts a dense cluster exactly there. With the
+    /// extended acquisition burst a cold start lands up to twenty samples in
+    /// the first forty seconds and about twenty-five more across the next
+    /// twenty minutes: **almost half the register inside three percent of its
+    /// time span**, all of it at one end of the axis.
+    ///
+    /// That cluster is a high-leverage anchor. It was taken while the clock was
+    /// being slewed hard, so any residual error in it does not average out — it
+    /// tilts the line. A tilt is a frequency error, and a frequency error held
+    /// against a proportional drain is a STANDING OFFSET: 6 ppb over a 192 s
+    /// correction time is 1.2 us, which is the bias S6 actually carries
+    /// (+1.23 us, against chrony's +0.05).
+    ///
+    /// Scaling each weight by the local time spacing makes the fit approximate
+    /// the continuous-time regression it was always meant to be, so twenty
+    /// samples two seconds apart count for the forty seconds they cover rather
+    /// than for twenty times a sixty-four-second poll. It changes nothing on a
+    /// path that is sampled evenly, which is the point: this corrects a
+    /// pathology rather than trading one scenario against another.
+    pub fn set_slope_density_weighting(&mut self, on: bool) {
+        self.slope_density_weighting = on;
+    }
+
     /// Take the offset weight floor from the path's measured DISPERSION —
     /// `k * (median delay - min delay)` — instead of a fraction of the minimum
     /// delay. Zero (the default) keeps the min-delay fraction.
@@ -351,6 +382,44 @@ impl SampleRegister {
             let excess = (s.delay - min_delay).max(0.0) + floor;
             let w = (floor / excess) * (floor / excess);
             w.max(1e-6)
+        };
+
+        // Time each sample stands for: half the gap to either neighbour, so the
+        // factors sum to the window span however unevenly it was sampled.
+        // Normalised to mean 1 so weight magnitudes stay comparable to the
+        // un-weighted case (the `max(1e-6)` floor below is absolute).
+        let density: Vec<f64> = if self.slope_density_weighting && n >= 3 {
+            let t: Vec<f64> = self.samples.iter().map(|s| s.t).collect();
+            let mut d = Vec::with_capacity(n);
+            for i in 0..n {
+                let lo = if i == 0 { t[0] } else { (t[i] + t[i - 1]) / 2.0 };
+                let hi = if i + 1 == n { t[n - 1] } else { (t[i] + t[i + 1]) / 2.0 };
+                d.push((hi - lo).max(0.0));
+            }
+            let mean = d.iter().sum::<f64>() / n as f64;
+            if mean > 0.0 {
+                for v in &mut d {
+                    *v /= mean;
+                }
+                d
+            } else {
+                vec![1.0; n]
+            }
+        } else {
+            Vec::new()
+        };
+        // `self.samples` is time-ordered and every trimmed set is a subsequence
+        // of it, so a sample's factor is found by its time.
+        let times: Vec<f64> = self.samples.iter().map(|s| s.t).collect();
+        let weight = |s: &Sample| {
+            let w = weight(s);
+            if density.is_empty() {
+                return w;
+            }
+            match times.binary_search_by(|probe| probe.total_cmp(&s.t)) {
+                Ok(i) => w * density[i],
+                Err(_) => w,
+            }
         };
 
         let mut used: Vec<&Sample> = self.samples.iter().collect();

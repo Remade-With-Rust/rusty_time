@@ -73,6 +73,7 @@ impl SyncController {
                 r.set_offset_weight_floor_ratio(config.offset_weight_floor_ratio);
                 r.set_offset_age_halflife_s(config.offset_age_halflife_s);
                 r.set_offset_weight_dispersion_k(config.offset_weight_dispersion_k);
+                r.set_slope_density_weighting(config.slope_density_weighting);
                 r
             },
             discipline: Discipline::new(config),

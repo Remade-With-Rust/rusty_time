@@ -30,14 +30,27 @@
 # answer different questions and a loop can be good at one and bad at the other.
 
 set -u
+# Optional leading `--label NAME`, so a job list stays one line of plain words
+# and can be fed straight to `xargs -L1`.
+explicit_label=""
+if [ "${1:-}" = "--label" ]; then
+    explicit_label=$2
+    shift 2
+fi
+
 scen=$1; arm=$2; seed=$3; dur=$4; shift 4
 label=$arm
 extra=""
 if [ $# -gt 0 ]; then
     extra="$*"
-    # Label the arm by its distinguishing value so the output table reads.
+    # Label the arm by the digits in its flags. That is enough for a numeric
+    # sweep and silently WRONG for a boolean one: two arms differing only by a
+    # flag with no digits collapse to the same label, and the paired test then
+    # compares an arm against itself and reports it as a tie. Pass --label for
+    # those.
     label="$arm$(echo "$extra" | tr -cd '0-9.')"
 fi
+[ -n "$explicit_label" ] && label="$explicit_label"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 repo=$(cd "$(dirname "$0")/../.." && pwd)

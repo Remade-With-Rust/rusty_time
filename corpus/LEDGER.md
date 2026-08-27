@@ -1565,3 +1565,72 @@ reports `IDENTICAL`, not a verdict. Every earlier number in this ledger was a
 comparison between arms that genuinely differed, so none of them are affected —
 but the defect would have corrupted the first adaptive result that half-fired,
 which is exactly the case it was introduced for.
+
+### The S6 standing bias: both obvious mechanisms excluded
+
+S6 and S4 carry standing biases far larger than chrony's (+1.23 us vs +0.05;
++1149 us vs +314). A DC bias is the most attractive target left, because unlike
+every knob above it cannot trade — removing a bias costs no variance.
+
+Two mechanisms were proposed, implemented and measured. Both are wrong.
+
+**1. The extrapolation arm.** The offset is `mean_offset + b * (now - t0)`, and
+`t0` sits mid-register, hundreds of seconds back. A 6 ppb slope error over a
+192 s correction time is 1.2 us — exactly the bias. Shortening the arm by
+age-decaying the offset weights should remove it.
+
+It made S6 *worse*, and the bias went UP (+0.88 -> +1.34 us).
+
+**2. The iburst cluster as a lever.** With the extended acquisition burst, a
+cold start puts up to twenty samples in the first forty seconds and about
+twenty-five across the next twenty minutes — nearly half the register inside
+three percent of its span, all at one end of the time axis. That is textbook
+high leverage, taken while the clock was slewing hard. Weighting the slope by
+the time each sample represents should defuse it.
+
+It made S6 *much* worse — median 1.59 -> 4.01 us, bias +0.77 -> -3.72 — and S1
+worse with it:
+
+```
+         S1        S2        S4        S6        S8
+      -4.11     +2.53     +0.00     -2.85     +1.58
+```
+
+The cluster is **load-bearing**, not parasitic. Those are the only samples taken
+while the 500 ms transient was being removed, so they carry most of what is
+known about the frequency. The leverage that makes them dangerous in theory is
+the same leverage that makes them informative.
+
+Both obvious explanations are now excluded by measurement rather than by
+argument. That is worth as much as a fix: the next person does not spend a day
+on either.
+
+### Stopping, and why
+
+Seven levers now: poll rate, weight floor, integral trim, offset/slope split
+(shipped), offset age decay, an adaptive gate on that decay, a dispersion-scaled
+floor, and slope density weighting. One shipped. The rest either trade one
+scenario against another or are refuted outright.
+
+The measurement is stable and it says **parity**: at one hundred seeds per
+scenario nothing is resolved in either direction on raw accuracy, and we deliver
+chrony's S2 accuracy on 16% fewer packets. The goal asked for *better*, and
+better is not supported.
+
+Continuing to sweep scalars is now the wrong move, and it is worth naming why:
+with five scenarios and two verdict flavours, each sweep runs ten comparisons,
+so a |z| > 2 result turns up by luck roughly once per sweep. Seven sweeps in,
+the risk is no longer failing to find an effect — it is *finding* one that is
+not there. The corpus has said the same thing seven times: these scenarios want
+opposite things from any single constant.
+
+What would actually move it, stated so it is not re-derived:
+
+* **An estimator that adapts on a statistic that works.** The half-window slope
+  test failed because it cannot separate measurement noise from oscillator
+  wander. Separating those needs discrimination by LAG — an Allan variance over
+  successive frequency estimates. That is the one direction with a real
+  mechanism behind it, and it is a campaign.
+* **The S6/S4 standing bias**, now with two mechanisms excluded.
+* **S4's tail**: worst case 13887 us against chrony's 6337 in the same worlds,
+  the largest single discrepancy left anywhere in the corpus.

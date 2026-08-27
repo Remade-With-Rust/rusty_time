@@ -392,8 +392,16 @@ impl SampleRegister {
             let t: Vec<f64> = self.samples.iter().map(|s| s.t).collect();
             let mut d = Vec::with_capacity(n);
             for i in 0..n {
-                let lo = if i == 0 { t[0] } else { (t[i] + t[i - 1]) / 2.0 };
-                let hi = if i + 1 == n { t[n - 1] } else { (t[i] + t[i + 1]) / 2.0 };
+                let lo = if i == 0 {
+                    t[0]
+                } else {
+                    (t[i] + t[i - 1]) / 2.0
+                };
+                let hi = if i + 1 == n {
+                    t[n - 1]
+                } else {
+                    (t[i] + t[i + 1]) / 2.0
+                };
                 d.push((hi - lo).max(0.0));
             }
             let mean = d.iter().sum::<f64>() / n as f64;

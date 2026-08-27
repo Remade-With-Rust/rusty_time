@@ -1,5 +1,9 @@
 # rusty_time
 
+[![crates.io](https://img.shields.io/crates/v/rusty_time-core.svg)](https://crates.io/crates/rusty_time-core)
+[![docs.rs](https://docs.rs/rusty_time-core/badge.svg)](https://docs.rs/rusty_time-core)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 chrony, remade with Rust. A pure-Rust, memory-safe NTP/NTS client + server targeting
 Linux, macOS, Windows, and wasm.
 
@@ -29,8 +33,46 @@ face untrusted bytes survive ~30 million fuzz executions with zero crashes.
 TLS is rustls on a pure-Rust crypto provider; nothing in the build needs a C
 toolchain, on any of the eight supported targets.
 
-**No performance claim is made against chrony yet.** The corpus compares
-rusty_time to itself across commits; the v1.0 gates G1–G6 are open.
+### Measured against chrony
+
+Under **clknetsim** — chrony's own simulator, so the baseline uses the tooling
+its authors trust. Both arms share one config per scenario and talk to the same
+`chronyd` stratum-1 server; error is read from the simulator's ground-truth
+offset log, not from either daemon's opinion of itself. A **null arm** (chrony
+against itself) states the rig's own resolution, and verdicts come from a paired
+sign test across rounds, not from comparing two medians.
+
+| gate | result |
+|---|---|
+| **G4 server throughput** | **MET.** 138,664 replies/s vs chrony's 105,668 (**1.31×**) at **0.72×** the CPU per reply, both resolved far outside the null-arm floor. |
+| **G2 convergence** | **Not met.** S1 and S8 reach 1 ms in **5 s** against chrony's 7 s; S6 (500 ms cold start) takes **14–16 s** against chrony's 12 s. |
+| **G1 accuracy** | **Not met, and mostly unresolved.** At N=9 only S6 separates — chrony ahead. S1 and S8 sit inside the rig's noise in both directions. |
+| G3, G5, G6 | not measured; nothing claimed. |
+
+Two honest notes. Earlier per-scenario accuracy wins reported here were
+**withdrawn**: they came from comparing medians on a rig whose unchanged control
+arm moved further than the effect. And G4's p99 half is not measured — at
+saturation the number is the load generator's queue depth, not the server's
+responsiveness.
+
+Every figure above, with the run that produced it and the defects the
+comparison uncovered, is in [corpus/LEDGER.md](corpus/LEDGER.md).
+
+## Install
+
+```sh
+cargo install rusty_time-daemon    # rtimed — the daemon
+cargo install rusty_time-ctl       # rtimec — the control client
+cargo install rusty_time-sim       # timecorp — the corpus runner
+```
+
+As a library:
+
+```toml
+[dependencies]
+rusty_time-core = "0.1"    # protocol + discipline, no I/O, wasm-clean
+rusty_time-nts  = "0.1"    # NTS (RFC 8915)
+```
 
 ```sh
 # What can this machine actually do?

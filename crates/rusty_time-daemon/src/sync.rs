@@ -115,6 +115,10 @@ impl SyncOptions {
                         .map_err(|_| "--offset-weight-dispersion-k: not a number")?;
                 }
                 "--slope-density" => opts.discipline.slope_density_weighting = true,
+                "--corr-ratio" => {
+                    opts.discipline.corr_time_ratio =
+                        value()?.parse().map_err(|_| "--corr-ratio: not a number")?;
+                }
                 "--corr-time" => {
                     opts.discipline.corr_time_s =
                         value()?.parse().map_err(|_| "--corr-time: not a number")?;

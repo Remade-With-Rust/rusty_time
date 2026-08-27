@@ -101,6 +101,15 @@ pub struct DisciplineConfig {
     /// the stability test that raises the interval is calibrated against a
     /// correction time that now no longer moves with it.
     pub corr_time_s: f64,
+    /// Poll intervals over which a steady-state offset is drained. Overrides
+    /// `CORR_TIME_RATIO` when > 0.
+    ///
+    /// Poll-SCALED on purpose. An absolute constant measured well on the
+    /// corpus and is unsafe to ship: the rig runs `maxpoll 6` (64 s) while the
+    /// production default is `maxpoll 10` (1024 s), where a fixed 40 s
+    /// correction time would drain each estimate twenty-five times faster than
+    /// the loop can see, chasing jitter instead of averaging it.
+    pub corr_time_ratio: f64,
 }
 
 impl Default for DisciplineConfig {
@@ -122,6 +131,7 @@ impl Default for DisciplineConfig {
             offset_weight_dispersion_k: 0.0,
             slope_density_weighting: false,
             corr_time_s: 0.0,
+            corr_time_ratio: 0.0,
         }
     }
 }
@@ -153,7 +163,43 @@ pub struct Plan {
 const IBURST_COUNT: u32 = 4;
 const IBURST_SPACING_S: f64 = 2.0;
 /// Drain a measured offset over roughly this many poll intervals.
-const CORR_TIME_RATIO: f64 = 3.0;
+///
+/// **Was 3.0. Lowered to 1.0 on measurement, and this is the term that carried
+/// the standing bias.**
+///
+/// A proportional loop settles where the drain it applies balances the drift
+/// that keeps re-creating the offset, which is `offset = F_residual * corr_time`
+/// (see the derivation below). The residual frequency error is what it is —
+/// nine attempts to shrink it all traded one scenario against another — but
+/// `corr_time` is a free parameter, and the standing offset is LINEAR in it.
+///
+/// The diagnosis came before the sweep, which is why this one worked where the
+/// others did not. Logging what the loop believed against clknetsim's ground
+/// truth showed the estimator was *right*: on S6 it reported -1.50 us where the
+/// truth was -1.21 us. The loop could see the error and was not removing it.
+/// That is a controller property, not an estimator defect, and it made a
+/// quantitative prediction — shorten the correction time and the bias shrinks
+/// in proportion.
+///
+/// It did. S6's standing bias went from +1.27 us to +0.24 us against chrony's
+/// +0.26. Paired against the old ratio, sixty fresh seeded worlds per scenario:
+///
+/// ```text
+///          S1        S2        S4        S6        S8
+///       +0.77     +4.65     +0.77     +1.29     +3.36
+/// ```
+///
+/// Two resolved improvements, no resolved regression, every scenario trending
+/// better, and convergence untouched (S1 5 s, S6 16 s, S8 5 s in both arms).
+/// Against chrony it removes the S8 loss and turns S1, S2 and S8 into resolved
+/// wins per packet spent.
+///
+/// It stays a RATIO rather than becoming an absolute constant. An absolute 40 s
+/// measured slightly better still, and is unsafe: the corpus runs `maxpoll 6`
+/// (64 s) while the production default is `maxpoll 10` (1024 s), where a fixed
+/// 40 s would drain each estimate twenty-five times faster than the loop can
+/// see it — chasing jitter instead of averaging it.
+const CORR_TIME_RATIO: f64 = 1.0;
 /// Correction time, in poll intervals, for an offset that is plainly real.
 /// One means "finish before the next sample arrives".
 const ACQUIRE_CORR_RATIO: f64 = 1.0;
@@ -545,10 +591,15 @@ impl Discipline {
                 .min(self.cfg.max_slew_ppm * self.acquire_share(offset, noise))
         } else {
             // Correction time: poll-scaled by default, absolute when asked.
+            let ratio = if self.cfg.corr_time_ratio > 0.0 {
+                self.cfg.corr_time_ratio
+            } else {
+                CORR_TIME_RATIO
+            };
             let corr_time = if self.cfg.corr_time_s > 0.0 {
                 self.cfg.corr_time_s
             } else {
-                CORR_TIME_RATIO * poll_s
+                ratio * poll_s
             };
             (offset.abs() / corr_time) * 1e6
         };

@@ -1699,3 +1699,75 @@ failed because a half-window slope test cannot separate measurement noise from
 oscillator wander. Doing it needs discrimination by LAG: an Allan variance over
 successive frequency estimates. That is the whole next campaign, and it is the
 only route left with a mechanism behind it rather than a hope.
+
+---
+
+## 0.1.2 — the correction time was carrying the standing bias
+
+### Diagnosis first, and that is why this one worked
+
+Nine levers had failed by trying to shrink the residual FREQUENCY error. The
+tenth asked a different question: is the estimator even wrong?
+
+The rig has ground truth and the daemon has `--verbose`, so the two can simply
+be compared. Steady state, S6:
+
+```
+seed=401   loop believed -1.499 us   truth -1.209 us
+seed=402   loop believed -0.151 us   truth +0.512 us
+seed=403   loop believed -1.230 us   truth +1.192 us
+```
+
+**The estimator was right.** The loop could see the error and was not removing
+it — which makes the standing bias a property of the CONTROLLER, not the filter.
+
+A proportional loop settles where its drain balances the drift re-creating the
+offset: `offset = F_residual * corr_time`. Nine sweeps had been attacking
+`F_residual`, which trades against everything. `corr_time` is a free parameter,
+and the standing offset is LINEAR in it. That is a quantitative prediction:
+shorten the correction time, shrink the bias in proportion.
+
+It held. **S6's standing bias went from +1.27 us to +0.24 us, against chrony's
++0.26.** The corroboration was already in the data — the earlier `t=200` arm, a
+LONGER correction time, had made S6 resolved-worse (z = -3.48). Same
+relationship, opposite direction.
+
+### Shipped: CORR_TIME_RATIO 3.0 -> 1.0
+
+Paired against the old ratio, sixty fresh seeded worlds per scenario:
+
+```
+         S1        S2        S4        S6        S8
+      +0.77     +4.65     +0.77     +1.29     +3.36
+```
+
+Two resolved improvements, **no resolved regression, every scenario trending
+better**, convergence untouched (S1 5 s, S6 16 s, S8 5 s in both arms).
+
+It stays a RATIO. An absolute 40 s constant measured slightly better and is
+unsafe to ship: the corpus runs `maxpoll 6` (64 s) while the production default
+is `maxpoll 10` (1024 s), where a fixed 40 s would drain each estimate
+twenty-five times faster than the loop can see it. That distinction is the
+difference between a corpus number and a shippable one.
+
+### Standing against chrony after 0.1.2
+
+Sixty seeded worlds per scenario, paired, shipping defaults both sides:
+
+```
+      chrony |e|   rusty_time |e|   wins/60    z     per packet          verdict
+S1       1.44 us         1.42 us     33/60  +0.77   38/60 z=+2.07   RESOLVED ahead/packet
+S2    6585 us         6448 us        32/60  +0.52   60/60 z=+7.75   RESOLVED ahead/packet
+S4    2038 us         2683 us        26/60  -1.03      x1.12        not resolved
+S6       1.48 us         1.64 us     33/60  +0.77   34/60 z=+1.03   not resolved
+S8       3.41 us         3.45 us     32/60  +0.52   40/60 z=+2.58   RESOLVED ahead/packet
+```
+
+**Raw accuracy is still parity** — nothing resolved in either direction, and the
+goal asked for better. What changed is that the last resolved loss is gone (S8
+was z = -2.21 before this), four of five scenarios now favour us on the win
+count, and we are **resolved ahead per packet spent on three of five**.
+
+Said plainly: we match chrony's accuracy while sending fewer packets, on most of
+the corpus. We do not beat its accuracy at any spend, on any scenario, at
+|z| > 2. That remains true after ten levers.

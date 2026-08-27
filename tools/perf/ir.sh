@@ -68,7 +68,8 @@ echo "answered     $answered"
 echo
 echo "top functions by self Ir:"
 callgrind_annotate --threshold=90 "$cg" 2>/dev/null \
-    | sed -n '/Ir *file:function/,/^--/p' | head -26
+    | awk '/Ir  *file:function/{hit=1; next} hit && /^-+$/{next} hit && NF==0{exit} hit' \
+    | head -22 | sed 's# \[/[^]]*\]##; s#/rustc/[a-f0-9]*/library/#std:#'
 
 case "$mode" in
     save)

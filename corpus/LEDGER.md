@@ -1818,3 +1818,65 @@ line falls rather than hedging.
 Where it started: S2 and S6 both resolved AGAINST us at z = -5.38 and -3.79.
 S2 has crossed over. S6 has not, and its remaining deficit is a different
 quantity from the one that was fixed.
+
+---
+
+## The S6 client path: ten measured instruction wins, −47.4%
+
+The server had an instruction-count harness (`tools/perf/ir.sh`); the client —
+the loop that runs on every node, and the only one that runs on most of them —
+had none. `benches/client_path.rs` is that harness, shaped like S6: a 500 ms
+cold start, so it exercises the burst, the makestep, the drain retirement and
+then long steady-state operation, rather than only the cheapest state.
+
+The gate is a checksum over every plan the controller emits, folded by exact
+f64 BITS. This is instruction-count work at FIXED behaviour, so bit-identity is
+the bar; anything meant to change the numbers belongs in the corpus harness
+behind a paired test.
+
+```
+                                                       Ir            delta
+baseline                                        410,038,646
+ 1  median by SELECTION, not a full sort         328,498,788   -81,539,858  -19.89%
+ 2  each sample's weight computed ONCE           297,355,056   -31,143,732   -9.48%
+ 3  `times` built only when it is read           293,353,678    -4,001,378   -1.35%
+ 4  residual computed once, branch-free loops    285,296,800    -8,056,878   -2.75%
+ 5  median keyed on the raw bit pattern          269,911,287   -15,385,513   -5.39%
+ 6  sign-run test stops when the answer is known 267,183,063    -2,728,224   -1.01%
+ 7  window span from its ends, not a scan        249,813,175   -17,369,888   -6.50%
+ 8  min_delay maintained by `push`               243,791,090    -6,022,085   -2.41%
+ 9  flat rows instead of (&Sample, weight)       242,748,302    -1,042,788   -0.43%
+10  row buffers owned by the register            215,512,750   -27,235,556  -11.22%
+                                                              ------------
+                                                              -194,525,896  -47.44%
+```
+
+25,627 Ir per discipline step down to 13,469. Behaviour is bit-identical: five
+corpus cells across S1, S2, S4, S6 and S8 produce the same figures to four
+decimal places as the commit before this one.
+
+**The two biggest were not micro-optimisation.** A full stable sort was being
+run to answer one median question (23% of the path), and the regression's
+scratch buffers were allocated and freed on every single estimate forever at a
+size the register already knew (11%). Neither is a clever trick; both are work
+that did not need doing.
+
+**Three attempts measured WORSE and were reverted**, which is the reason each
+line above has a number beside it:
+
+* A reusable `&mut Vec` scratch for the residual pass: **+3.4M Ir**. The
+  indirection cost more than the allocation it removed.
+* A fixed `[f64; 64]` stack buffer for the same: **+0.3M**. It memsets 512
+  bytes on every call to hold twenty-odd values — the hidden-memset trap.
+* Fusing the two residual walks into one loop with an `if i < half` inside:
+  **+1.8M**. Removing duplicated arithmetic is not a win if it costs the
+  vectoriser a branch-free loop; the version that finally paid computes the
+  residuals once *and* keeps every loop branch-free.
+
+**A near-miss worth recording.** The corpus check appeared to fail — S6 seed 401
+read -2.2677 against an expected -1.2089 — and two changes were bisected out
+chasing it. The expected value was stale: -1.2089 was the *pre-0.1.2* number,
+from before `CORR_TIME_RATIO` 3.0 -> 1.0 deliberately moved it. Stashing the work
+and measuring HEAD settled it in one run. A reference value carried forward by
+hand is a baseline that expires silently, and the fix is to measure the
+baseline rather than remember it.

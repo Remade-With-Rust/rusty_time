@@ -42,6 +42,22 @@ pub struct RegressEstimate {
 pub struct SampleRegister {
     samples: Vec<Sample>,
     capacity: usize,
+    /// Reusable row buffers for `regress`.
+    ///
+    /// The regression needs two scratch windows per estimate — the working set
+    /// and the spike-trimmed candidate — and it used to allocate and free both
+    /// on every sample, forever, at a fixed size it already knew. They live
+    /// here now because `Row` is a plain value: it borrows nothing from the
+    /// register, so the buffers can outlive a call without making this type
+    /// self-referential. That is what the flattening bought beyond locality.
+    rows: Vec<Row>,
+    rows_alt: Vec<Row>,
+    /// Smallest delay currently in the register, maintained by `push`.
+    ///
+    /// The regression needs it on every estimate and it only ever changes when
+    /// the contents do, so it is tracked at the one place that can change them
+    /// rather than re-derived by scanning the whole window each time.
+    min_delay: f64,
     /// Weight-floor width, as a fraction of the minimum observed delay.
     /// See [`SampleRegister::set_weight_floor_ratio`].
     weight_floor_ratio: f64,
@@ -130,6 +146,22 @@ pub const WEIGHT_FLOOR_RATIO: f64 = 0.125;
 /// what skewed-delay averaging looks like from the outside.
 pub const OFFSET_WEIGHT_FLOOR_RATIO: f64 = 0.03125;
 
+/// One sample as the regression passes want it: the three numbers they read,
+/// plus the weight, laid out flat.
+///
+/// The passes used to walk `(&Sample, f64)` pairs, so every read of `t` or
+/// `offset` chased a pointer into the register and pulled in a 32-byte Sample
+/// to use 8 bytes of it. Copying the window into flat rows once per estimate
+/// costs one pass and makes every later pass — and there are up to a dozen —
+/// a linear walk over contiguous memory with no indirection.
+#[derive(Clone, Copy, Debug)]
+struct Row {
+    t: f64,
+    offset: f64,
+    delay: f64,
+    w: f64,
+}
+
 /// Minimum span (seconds) and count before the regression slope is reported.
 const FREQ_MIN_SPAN_S: f64 = 8.0;
 const FREQ_MIN_SAMPLES: usize = 4;
@@ -139,6 +171,9 @@ impl SampleRegister {
         SampleRegister {
             samples: Vec::with_capacity(capacity.max(3)),
             capacity: capacity.max(3),
+            rows: Vec::with_capacity(capacity.max(3)),
+            rows_alt: Vec::with_capacity(capacity.max(3)),
+            min_delay: f64::INFINITY,
             weight_floor_ratio: WEIGHT_FLOOR_RATIO,
             offset_weight_floor_ratio: OFFSET_WEIGHT_FLOOR_RATIO,
             slope_density_weighting: false,
@@ -315,15 +350,31 @@ impl SampleRegister {
     }
 
     pub fn push(&mut self, s: Sample) {
+        // The register is a time series and several readers depend on it —
+        // `regress` takes the window span from the two ends rather than
+        // scanning, which is only valid while this holds.
+        debug_assert!(
+            self.samples.last().is_none_or(|last| s.t >= last.t),
+            "samples must be pushed in non-decreasing time order"
+        );
         if self.samples.len() == self.capacity {
-            self.samples.remove(0); // capacity is ≤64; shift cost is noise here
+            let evicted = self.samples.remove(0); // capacity is ≤64
+            // Only a scan can find the new minimum once the old one leaves.
+            if evicted.delay <= self.min_delay {
+                self.min_delay = f64::INFINITY;
+                for kept in &self.samples {
+                    self.min_delay = self.min_delay.min(kept.delay);
+                }
+            }
         }
+        self.min_delay = self.min_delay.min(s.delay);
         self.samples.push(s);
     }
 
     /// Drop history (after a clock step every stored offset is stale).
     pub fn clear(&mut self) {
         self.samples.clear();
+        self.min_delay = f64::INFINITY;
     }
 
     /// Re-express stored samples after the clock is adjusted, so history stays a
@@ -366,16 +417,20 @@ impl SampleRegister {
 
     /// Weighted linear regression of offset against time, with one outlier-trim
     /// pass, extrapolated to `now`.
-    pub fn regress(&self, now: f64) -> Option<RegressEstimate> {
+    pub fn regress(&mut self, now: f64) -> Option<RegressEstimate> {
         let n = self.samples.len();
         if n < 3 {
             return None;
         }
-        let min_delay = self
-            .samples
-            .iter()
-            .map(|s| s.delay)
-            .fold(f64::INFINITY, f64::min);
+        let min_delay = self.min_delay;
+        debug_assert_eq!(
+            min_delay,
+            self.samples
+                .iter()
+                .map(|s| s.delay)
+                .fold(f64::INFINITY, f64::min),
+            "cached min_delay diverged from the register"
+        );
         // Weight favors low-delay samples: queueing noise scales with excess delay.
         let floor = (min_delay * self.weight_floor_ratio).max(1e-9);
         let weight = |s: &Sample| {
@@ -418,7 +473,17 @@ impl SampleRegister {
         };
         // `self.samples` is time-ordered and every trimmed set is a subsequence
         // of it, so a sample's factor is found by its time.
-        let times: Vec<f64> = self.samples.iter().map(|s| s.t).collect();
+        //
+        // Built only when there are factors to look up. It used to be
+        // unconditional — an allocation and a copy of every timestamp on every
+        // estimate, feeding a lookup that the very next line skipped, because
+        // density weighting is off by default. Work done for a feature this
+        // caller does not use is the cheapest kind of win there is.
+        let times: Vec<f64> = if density.is_empty() {
+            Vec::new()
+        } else {
+            self.samples.iter().map(|s| s.t).collect()
+        };
         let weight = |s: &Sample| {
             let w = weight(s);
             if density.is_empty() {
@@ -430,8 +495,29 @@ impl SampleRegister {
             }
         };
 
-        let mut used: Vec<&Sample> = self.samples.iter().collect();
-        let mut fit = wls_fit(&used, weight)?;
+        // Each sample's weight, computed ONCE.
+        //
+        // It used to be a closure handed to `wls_fit`, which evaluates it in
+        // three separate loops — and `regress` calls `wls_fit` up to six times
+        // (the initial fit, four trim refits, one spike refit). That is up to
+        // eighteen evaluations of the same value per sample per estimate, each
+        // one a subtract, two divides, a multiply and two clamps, plus a
+        // binary search when density weighting is on.
+        //
+        // Nothing it depends on changes across the passes: `min_delay` and the
+        // floor are fixed for the call, and trimming only ever REMOVES rows. So
+        // the weight travels with its sample and every pass reads it.
+        // Taken from the register and given back before returning, so the
+        // allocation happens once in the process rather than once per estimate.
+        let mut used = std::mem::take(&mut self.rows);
+        used.clear();
+        used.extend(self.samples.iter().map(|s| Row {
+            t: s.t,
+            offset: s.offset,
+            delay: s.delay,
+            w: weight(s),
+        }));
+        let mut fit = wls_fit(&used)?;
 
         // Pass 1 — distrust HISTORY, never the present: when the residuals are
         // autocorrelated (few sign runs) AND the window's two halves disagree
@@ -444,8 +530,7 @@ impl SampleRegister {
             if used.len() < 8 {
                 break;
             }
-            let runs = residual_sign_runs(&used, &fit);
-            if runs * 3 >= used.len() {
+            if residuals_well_mixed(&used, &fit) {
                 break; // residuals look well mixed: one regime
             }
             let (half_gap, mad) = residual_half_gap_and_mad(&used, &fit);
@@ -454,7 +539,7 @@ impl SampleRegister {
             }
             let drop = (used.len() / 4).max(2);
             used.drain(..drop);
-            match wls_fit(&used, weight) {
+            match wls_fit(&used) {
                 Some(refit) => fit = refit,
                 None => break,
             }
@@ -468,32 +553,40 @@ impl SampleRegister {
             let (_, mad) = residual_half_gap_and_mad(&used, &fit);
             let threshold = (3.0 * 1.4826 * mad).max(1e-9);
             let protect_from = used.len() - 3;
-            let kept: Vec<&Sample> = used
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(i, s)| {
-                    *i >= protect_from
-                        || (s.offset - (fit.a + fit.b * (s.t - fit.t0))).abs() <= threshold
-                })
-                .map(|(_, s)| s)
-                .collect();
+            let mut kept = std::mem::take(&mut self.rows_alt);
+            kept.clear();
+            kept.extend(
+                used.iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(i, r)| {
+                        *i >= protect_from
+                            || (r.offset - (fit.a + fit.b * (r.t - fit.t0))).abs() <= threshold
+                    })
+                    .map(|(_, r)| r),
+            );
             if kept.len() >= 3
                 && kept.len() < used.len()
-                && let Some(refit) = wls_fit(&kept, weight)
+                && let Some(refit) = wls_fit(&kept)
             {
-                used = kept;
+                // Swap rather than assign: both buffers stay alive and go back
+                // to the register, so neither allocation is ever repeated.
+                std::mem::swap(&mut used, &mut kept);
                 fit = refit;
             }
+            self.rows_alt = kept;
         }
 
-        let span = used
-            .iter()
-            .map(|s| s.t)
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), t| {
-                (lo.min(t), hi.max(t))
-            });
-        let span = (span.1 - span.0).max(0.0);
+        // Ends, not a scan. The register is a time series: `push` appends and
+        // `slew_samples` rewrites offsets only, so `self.samples` is ascending
+        // in `t`, and every trimmed set here is a subsequence of it — pass 1
+        // drops a prefix, pass 2 filters in order. So the first and last rows
+        // ARE the extremes, and folding min/max over the whole window was
+        // recomputing something the ordering already guarantees.
+        let span = match (used.first(), used.last()) {
+            (Some(lo), Some(hi)) => (hi.t - lo.t).max(0.0),
+            _ => 0.0,
+        };
 
         let freq_ppm = if used.len() >= FREQ_MIN_SAMPLES && span >= FREQ_MIN_SPAN_S {
             Some(fit.b * 1e6)
@@ -519,7 +612,7 @@ impl SampleRegister {
             let sharp_floor = if self.offset_weight_dispersion_k > 0.0 {
                 // Median excess delay: the path's own noise scale, robust to
                 // the long tail that a mean would follow.
-                let mut d: Vec<f64> = used.iter().map(|s| s.delay).collect();
+                let mut d: Vec<f64> = used.iter().map(|r| r.delay).collect();
                 d.sort_by(f64::total_cmp);
                 let median = d[d.len() / 2];
                 (self.offset_weight_dispersion_k * (median - min_delay))
@@ -529,14 +622,14 @@ impl SampleRegister {
                 (min_delay * self.offset_weight_floor_ratio).max(1e-9)
             };
             let halflife = self.offset_age_halflife_s;
-            let sharp = |s: &Sample| {
-                let excess = (s.delay - min_delay).max(0.0) + sharp_floor;
+            let sharp = |r: &Row| {
+                let excess = (r.delay - min_delay).max(0.0) + sharp_floor;
                 let w = (sharp_floor / excess) * (sharp_floor / excess);
                 let w = w.max(1e-6);
                 if decays {
                     // Age is measured from `now`, not from the newest sample:
                     // the lever being shortened is to the present moment.
-                    w * 0.5f64.powf(((now - s.t).max(0.0)) / halflife)
+                    w * 0.5f64.powf(((now - r.t).max(0.0)) / halflife)
                 } else {
                     w
                 }
@@ -544,11 +637,11 @@ impl SampleRegister {
             let mut sw = 0.0;
             let mut swt = 0.0;
             let mut swy = 0.0;
-            for s in &used {
-                let w = sharp(s);
+            for r in &used {
+                let w = sharp(r);
                 sw += w;
-                swt += w * s.t;
-                swy += w * s.offset;
+                swt += w * r.t;
+                swy += w * r.offset;
             }
             if sw > 0.0 {
                 let t0s = swt / sw;
@@ -560,11 +653,14 @@ impl SampleRegister {
             fit.a + fit.b * (now - fit.t0)
         };
 
+        let n_used = used.len();
+        self.rows = used;
+
         Some(RegressEstimate {
             offset: offset_now,
             freq_ppm,
             offset_sd: fit.sd,
-            n_used: used.len(),
+            n_used,
             span,
         })
     }
@@ -572,40 +668,78 @@ impl SampleRegister {
 
 /// (|mean residual of older half − mean residual of newer half|, median absolute
 /// residual). The gap detects regime changes; the MAD is a spike-robust scale.
-fn residual_half_gap_and_mad(samples: &[&Sample], fit: &Fit) -> (f64, f64) {
-    let resid = |s: &Sample| s.offset - (fit.a + fit.b * (s.t - fit.t0));
+fn residual_half_gap_and_mad(samples: &[Row], fit: &Fit) -> (f64, f64) {
+    let resid = |r: &Row| r.offset - (fit.a + fit.b * (r.t - fit.t0));
     let n = samples.len();
     if n == 0 {
         return (0.0, 0.0);
     }
     let half = n / 2;
-    let mean = |part: &[&Sample]| -> f64 {
-        if part.is_empty() {
-            0.0
-        } else {
-            part.iter().map(|s| resid(s)).sum::<f64>() / part.len() as f64
-        }
+    // The residual of each sample is computed ONCE.
+    //
+    // It used to be evaluated twice — once walking the halves for their means,
+    // once building the absolute values — and this runs up to five times per
+    // estimate. Collect the signed residuals with `collect()` (a sized
+    // iterator, so one allocation and a tight loop), sum the halves off that,
+    // then take absolute values in place. Every loop stays branch-free and
+    // vectorisable, which is what a fused loop with an `if i < half` inside it
+    // is not: that version was measured 1.8M Ir WORSE than the duplicated
+    // arithmetic it removed.
+    let mut abs: Vec<f64> = samples.iter().map(resid).collect();
+    let sum_old: f64 = abs[..half].iter().sum();
+    let sum_new: f64 = abs[half..].iter().sum();
+    let mean_old = if half == 0 {
+        0.0
+    } else {
+        sum_old / half as f64
     };
-    let gap = (mean(&samples[..half]) - mean(&samples[half..])).abs();
-    let mut abs: Vec<f64> = samples.iter().map(|s| resid(s).abs()).collect();
-    abs.sort_by(f64::total_cmp);
-    (gap, abs[abs.len() / 2])
+    let mean_new = if n == half {
+        0.0
+    } else {
+        sum_new / (n - half) as f64
+    };
+    let gap = (mean_old - mean_new).abs();
+    for v in &mut abs {
+        *v = v.abs();
+    }
+    // Selection, not a sort.
+    let mid = abs.len() / 2;
+    // Keyed on the raw bit pattern, not compared with `total_cmp`.
+    //
+    // These are absolute values, so every one is non-negative — and across
+    // non-negative floats the IEEE-754 bit pattern is monotonic, so ordering by
+    // `to_bits()` is ORDER-IDENTICAL to ordering by value. It reduces each
+    // comparison from `total_cmp`'s sign-mask arithmetic to a single integer
+    // compare, and the partition does O(n) of them.
+    abs.select_nth_unstable_by_key(mid, |v| v.to_bits());
+    (gap, abs[mid])
 }
 
-/// Number of runs of same-signed residuals, in time order. A well-mixed fit has
-/// about n/2; a kinked window (two regimes) has very few.
-fn residual_sign_runs(samples: &[&Sample], fit: &Fit) -> usize {
+/// Whether the residuals are well mixed — that is, whether the number of runs
+/// of same-signed residuals reaches a third of the window. A well-mixed fit has
+/// about n/2 runs; a kinked window (two regimes) has very few.
+///
+/// Returns the ANSWER rather than the count, so it can stop as soon as the
+/// answer is known. The caller only ever asked `runs * 3 >= len`, and on a
+/// converged loop that becomes true about a third of the way in — every sample
+/// visited after that was a residual computed to reach a conclusion already
+/// reached.
+fn residuals_well_mixed(samples: &[Row], fit: &Fit) -> bool {
+    let need = samples.len();
     let mut runs = 0usize;
     let mut last_sign = 0i8;
-    for s in samples {
-        let r = s.offset - (fit.a + fit.b * (s.t - fit.t0));
+    for row in samples {
+        let r = row.offset - (fit.a + fit.b * (row.t - fit.t0));
         let sign = if r > 0.0 { 1 } else { -1 };
         if sign != last_sign {
             runs += 1;
             last_sign = sign;
+            if runs * 3 >= need {
+                return true;
+            }
         }
     }
-    runs
+    false
 }
 
 struct Fit {
@@ -619,17 +753,17 @@ struct Fit {
     t0: f64,
 }
 
-fn wls_fit(samples: &[&Sample], weight: impl Fn(&Sample) -> f64) -> Option<Fit> {
+/// Weighted least squares over rows that already carry their weight.
+fn wls_fit(samples: &[Row]) -> Option<Fit> {
     let n = samples.len();
     if n < 2 {
         return None;
     }
     let mut sw = 0.0;
     let mut swt = 0.0;
-    for s in samples {
-        let w = weight(s);
-        sw += w;
-        swt += w * s.t;
+    for r in samples {
+        sw += r.w;
+        swt += r.w * r.t;
     }
     if sw <= 0.0 {
         return None;
@@ -639,21 +773,19 @@ fn wls_fit(samples: &[&Sample], weight: impl Fn(&Sample) -> f64) -> Option<Fit> 
     let mut sxx = 0.0;
     let mut sxy = 0.0;
     let mut sy = 0.0;
-    for s in samples {
-        let w = weight(s);
-        let x = s.t - t0;
-        sxx += w * x * x;
-        sxy += w * x * s.offset;
-        sy += w * s.offset;
+    for r in samples {
+        let x = r.t - t0;
+        sxx += r.w * x * x;
+        sxy += r.w * x * r.offset;
+        sy += r.w * r.offset;
     }
     let b = if sxx > 1e-12 { sxy / sxx } else { 0.0 };
     let a = sy / sw; // intercept at t0 (x is centered)
 
     let mut sr = 0.0;
-    for s in samples {
-        let w = weight(s);
-        let r = s.offset - (a + b * (s.t - t0));
-        sr += w * r * r;
+    for row in samples {
+        let r = row.offset - (a + b * (row.t - t0));
+        sr += row.w * r * r;
     }
     let dof = (n as f64 - 2.0).max(1.0);
     let sd = (sr / sw * n as f64 / dof).sqrt();
@@ -687,7 +819,7 @@ mod tests {
                 (t, 1e-3 + 10e-6 * t, 0.0002)
             })
             .collect();
-        let r = reg_with(&pts);
+        let mut r = reg_with(&pts);
         let est = r.regress(144.0).expect("estimate");
         let freq = est.freq_ppm.expect("freq");
         assert!((freq - 10.0).abs() < 1e-6, "freq {freq}");
@@ -705,7 +837,7 @@ mod tests {
             })
             .collect();
         pts[6].1 = 0.050; // 50 ms spike (delayed packet), same delay
-        let r = reg_with(&pts);
+        let mut r = reg_with(&pts);
         let est = r.regress(200.0).expect("estimate");
         assert_eq!(est.n_used, 11, "outlier not trimmed");
         assert!(
@@ -723,7 +855,7 @@ mod tests {
         for i in 8..12 {
             pts.push((i as f64 * 16.0, 8e-3, 0.0025));
         }
-        let r = reg_with(&pts);
+        let mut r = reg_with(&pts);
         let est = r.regress(200.0).expect("estimate");
         assert!(
             (est.offset - 1e-3).abs() < 2e-3,
@@ -735,7 +867,7 @@ mod tests {
     #[test]
     fn no_freq_before_enough_span() {
         let pts: Vec<(f64, f64, f64)> = (0..3).map(|i| (i as f64 * 2.0, 1e-3, 0.0002)).collect();
-        let r = reg_with(&pts);
+        let mut r = reg_with(&pts);
         let est = r.regress(6.0).expect("estimate");
         assert!(est.freq_ppm.is_none());
     }

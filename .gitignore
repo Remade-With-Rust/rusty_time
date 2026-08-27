@@ -1,4 +1,7 @@
 /target
+# Side target dirs, so a measurement build never waits on the lock held by a
+# publish or a long test run.
+/target-*
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts

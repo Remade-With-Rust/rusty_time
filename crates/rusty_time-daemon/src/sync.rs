@@ -79,6 +79,31 @@ impl SyncOptions {
                     opts.discipline.makestep_limit =
                         if limit < 0 { u32::MAX } else { limit as u32 };
                 }
+                "--freq-integral-gain" => {
+                    opts.discipline.freq_integral_gain = value()?
+                        .parse()
+                        .map_err(|_| "--freq-integral-gain: not a number")?;
+                }
+                "--poll-down-ratio" => {
+                    opts.discipline.poll_down_noise_ratio = value()?
+                        .parse()
+                        .map_err(|_| "--poll-down-ratio: not a number")?;
+                }
+                "--poll-up-streak" => {
+                    opts.discipline.poll_up_streak = value()?
+                        .parse()
+                        .map_err(|_| "--poll-up-streak: not a number")?;
+                }
+                "--weight-floor-ratio" => {
+                    opts.discipline.weight_floor_ratio = value()?
+                        .parse()
+                        .map_err(|_| "--weight-floor-ratio: not a number")?;
+                }
+                "--offset-weight-floor-ratio" => {
+                    opts.discipline.offset_weight_floor_ratio = value()?
+                        .parse()
+                        .map_err(|_| "--offset-weight-floor-ratio: not a number")?;
+                }
                 "--no-makestep" => opts.discipline.makestep_threshold = None,
                 "--no-iburst" => opts.discipline.iburst = false,
                 other if other.starts_with("--") => {

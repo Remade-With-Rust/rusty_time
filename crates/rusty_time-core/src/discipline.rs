@@ -21,6 +21,44 @@ pub struct DisciplineConfig {
     pub max_poll: i8,
     /// Send an initial burst of quick polls to converge fast (chrony `iburst`).
     pub iburst: bool,
+    /// Gain of the integral trim on the frequency estimate. 0 disables it,
+    /// leaving a purely proportional loop. See `FREQ_INTEGRAL_GAIN`.
+    pub freq_integral_gain: f64,
+    /// Step the poll interval back DOWN when `|offset| > this * noise`.
+    ///
+    /// This is the packet budget, and the packet budget is most of the
+    /// accuracy: offset error falls as 1/sqrt(N). Measured on the seeded rig,
+    /// clknetsim's own packet counters, same poll bounds for both arms:
+    ///
+    /// ```text
+    ///            mean poll   median |e| S1   per packet spent
+    /// chrony        33.9 s        1.52 us    (baseline)
+    /// rusty_time    40.1 s        1.47 us    x1.05
+    /// ```
+    ///
+    /// So the estimator was never the deficit — at equal cost it is at parity
+    /// on S1 and slightly ahead on S8 (x0.96). We were simply buying fewer
+    /// samples. See `POLL_DOWN_NOISE_RATIO`.
+    pub poll_down_noise_ratio: f64,
+    /// Consecutive stable samples required before the poll interval doubles.
+    ///
+    /// This, not the dead band, is what sets the packet budget. Sweeping
+    /// `poll_down_noise_ratio` from 10 down to 3 moved the mean poll by 0.3 s
+    /// and the accuracy not at all, because the step-DOWN branch only runs
+    /// when `|offset| >= 2 * noise` and a converged loop is almost never
+    /// there. It is always "stable", so it always climbs, and it pins at
+    /// maxpoll. The climb rate is the only term with any authority.
+    pub poll_up_streak: u32,
+    /// Width of the regression's weight floor, as a fraction of the minimum
+    /// observed delay. See `rusty_time_core::filter::WEIGHT_FLOOR_RATIO`.
+    ///
+    /// This is the one knob that can improve accuracy WITHOUT spending more
+    /// packets, which is why it is worth a sweep: buying accuracy with poll
+    /// rate leaves per-packet efficiency exactly where it was.
+    pub weight_floor_ratio: f64,
+    /// Weight-floor width for the OFFSET alone; the slope keeps
+    /// `weight_floor_ratio`. Equal values reproduce the single-weight fit.
+    pub offset_weight_floor_ratio: f64,
 }
 
 impl Default for DisciplineConfig {
@@ -33,6 +71,11 @@ impl Default for DisciplineConfig {
             min_poll: 6,
             max_poll: 10,
             iburst: true,
+            freq_integral_gain: FREQ_INTEGRAL_GAIN,
+            poll_down_noise_ratio: POLL_DOWN_NOISE_RATIO,
+            poll_up_streak: POLL_UP_STREAK,
+            weight_floor_ratio: crate::filter::WEIGHT_FLOOR_RATIO,
+            offset_weight_floor_ratio: crate::filter::OFFSET_WEIGHT_FLOOR_RATIO,
         }
     }
 }
@@ -127,6 +170,72 @@ const FREQ_TRUST_SLEW_SHARE: f64 = 0.25;
 /// else's server: a client that cannot converge is a client that must back off
 /// anyway, not one that should keep asking every two seconds.
 const MAX_ACQUIRE_BURST: u32 = 16;
+/// How much of an implied frequency error to absorb per update.
+///
+/// **Why there is an integral term at all.** The offset drain is proportional:
+/// each plan removes `offset / (CORR_TIME_RATIO * poll)` per second. Against a
+/// constant unmodelled drift `F`, that settles at an equilibrium rather than at
+/// zero -- removal balances accumulation when
+///
+/// ```text
+///     offset  =  CORR_TIME_RATIO * poll * F
+/// ```
+///
+/// which is a *standing error the loop maintains on purpose*. Measured on the
+/// in-house corpus it is the whole story: S1 sat at 200 us on a 0.039 ppm
+/// residual and a 1024 s poll, and 3 * 1024 * 0.039e-6 is 120 us. A
+/// proportional controller cannot remove it; only integral action can.
+///
+/// The frequency term comes from the regression slope, which is a
+/// *measurement*. If that measurement carries any bias, the equilibrium above
+/// stands forever and no amount of averaging removes it. So the loop reads the
+/// standing offset as evidence in its own right: invert the relation, and a
+/// persistent offset **is** a frequency error, expressed in seconds.
+///
+/// **Measured and rejected. The default is 0 — the trim is OFF.**
+///
+/// The reasoning above is sound and the result still went the other way. On a
+/// SEEDED rig, twenty worlds per arm, paired seed by seed:
+///
+/// ```text
+/// S8  gain=0.0   median |e| 4.78 us    8/20 wins vs chrony   z=-0.89  not resolved
+/// S8  gain=0.1   median |e| 6.20 us    5/20 wins vs chrony   z=-2.24  RESOLVED, chrony ahead
+/// S1  gain=0.0   median |e| 1.47 us
+/// S1  gain=0.1   median |e| 1.98 us
+/// ```
+///
+/// Turning the trim on is the only *resolved* accuracy result in that sweep,
+/// and it is a regression. An earlier single unpaired run had read it as an
+/// improvement on both scenarios; it was the draw, not the code.
+///
+/// Why it fails, as best the data supports: the standing offset is not a
+/// frequency error here. It is sampling error in the delay draws — it changes
+/// SIGN with the seed. Integrating it feeds noise into the frequency estimate,
+/// and on S8, whose oscillator already wanders, that is the last thing the
+/// loop needs.
+///
+/// Kept as a field rather than deleted so re-testing costs one flag if the
+/// estimator's own bias ever shrinks below this effect.
+const FREQ_INTEGRAL_GAIN: f64 = 0.0;
+
+/// How far outside the noise an offset must sit before the poll interval is
+/// stepped back down — the default for `DisciplineConfig::poll_down_noise_ratio`.
+///
+/// An offset below `2 * noise` counts as stable and, after three such samples,
+/// doubles the interval. Between that and this ratio the loop does neither, so
+/// this number IS the width of the dead band, and a wide dead band pins the
+/// client at maxpoll: at 10x it effectively never came back down.
+///
+/// The value is measured, not chosen — see the sweep in `DisciplineConfig`.
+const POLL_DOWN_NOISE_RATIO: f64 = 10.0;
+
+/// Consecutive stable samples before the poll interval doubles — the default
+/// for `DisciplineConfig::poll_up_streak`.
+const POLL_UP_STREAK: u32 = 3;
+/// Weight of the newest offset in the persistence average. Low, because the
+/// signal being extracted is the part that does *not* change.
+const OFFSET_EWMA_ALPHA: f64 = 0.25;
+
 /// The offset at which acquisition is finished and the burst may end.
 ///
 /// Tied to what "converged" means rather than to a multiple of the noise. The
@@ -151,6 +260,14 @@ pub struct Discipline {
     last_drain_share: f64,
     /// Burst polls used, including any the acquisition extension granted.
     burst_used: u32,
+    /// Slow average of recent offset estimates.
+    ///
+    /// A *persistent* offset is the signature of a frequency error the
+    /// regression has not measured, and it is the thing that decides
+    /// steady-state accuracy. See `integral_trim`.
+    offset_ewma: f64,
+    /// Whether `offset_ewma` has been seeded.
+    ewma_seeded: bool,
 }
 
 impl Discipline {
@@ -165,6 +282,8 @@ impl Discipline {
             iburst_left,
             last_drain_share: 0.0,
             burst_used: 0,
+            offset_ewma: 0.0,
+            ewma_seeded: false,
         }
     }
 
@@ -241,15 +360,45 @@ impl Discipline {
         // loud relative to the noise floor. Runs before the drain computation so
         // the drain rate is sized for the interval the plan will actually use.
         let noise = offset_sd.max(1e-7);
+
+        // Integral trim: read a standing offset as the frequency error it
+        // implies, and absorb a fraction of it. Only once acquisition is over
+        // -- during acquisition the offset is large for reasons that have
+        // nothing to do with drift, and feeding that in would be nonsense.
+        if self.ewma_seeded {
+            self.offset_ewma =
+                (1.0 - OFFSET_EWMA_ALPHA) * self.offset_ewma + OFFSET_EWMA_ALPHA * offset;
+        } else {
+            self.offset_ewma = offset;
+            self.ewma_seeded = true;
+        }
+        // ...and only when the standing offset is larger than the noise that
+        // could have produced it. Below that line the average is a sample of
+        // jitter, and feeding jitter into the frequency term writes it into the
+        // clock permanently -- the offset drain can recover from a bad estimate,
+        // the frequency term accumulates it. Measured: without this gate S1
+        // went from 199.7 us to 231.5 us while its frequency residual did not
+        // move at all, which is exactly what integrating noise looks like.
+        if self.cfg.freq_integral_gain != 0.0
+            && self.updates > ACQUIRE_UPDATES
+            && self.offset_ewma.abs() > noise
+        {
+            let poll_now = self.peek_poll_interval();
+            let implied_freq_ppm = (self.offset_ewma / (CORR_TIME_RATIO * poll_now)) * 1e6;
+            self.freq_ppm = (self.freq_ppm + self.cfg.freq_integral_gain * implied_freq_ppm)
+                .clamp(-self.cfg.max_freq_ppm, self.cfg.max_freq_ppm);
+        }
         if offset.abs() < 2.0 * noise {
             self.stable_streak += 1;
-            if self.stable_streak >= 3 && self.poll < self.cfg.max_poll {
+            if self.stable_streak >= self.cfg.poll_up_streak && self.poll < self.cfg.max_poll {
                 self.poll += 1;
                 self.stable_streak = 0;
             }
         } else {
             self.stable_streak = 0;
-            if offset.abs() > 10.0 * noise && self.poll > self.cfg.min_poll {
+            if offset.abs() > self.cfg.poll_down_noise_ratio * noise
+                && self.poll > self.cfg.min_poll
+            {
                 self.poll -= 1;
             }
         }

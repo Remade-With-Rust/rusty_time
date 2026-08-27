@@ -1095,3 +1095,379 @@ resolution, and that is what made both G4 verdicts resolvable.
 Gates: 179 tests, clippy clean, 8 targets green, **NTS interop PASS both
 directions** after the server restructure (chronyd selects us `^*` at +1583 ns),
 S12a/b/c counts identical.
+
+---
+
+## Steady-state accuracy — the rig had to be fixed first
+
+**Goal:** beat chrony on steady-state accuracy, which a distributed cloud needs
+more than it needs fast convergence.
+
+### The rig was not deterministic, and a comment said it was
+
+`bench_vs_chrony.sh` opened with:
+
+> *clknetsim is deterministic for a given config, so each number is exactly
+> reproducible rather than a sample from a noisy rig.*
+
+That was false, and further down the same file knew it — *"clknetsim redraws its
+random streams each run, so a single run is one sample"*. Two runs of
+**identical code** produced steady-state biases 2.4 us apart:
+
+```
+seeded   run 1: 99946d9ad56c9dfac72a39f06259aa42
+seeded   run 2: 99946d9ad56c9dfac72a39f06259aa42   <- bit-identical
+unseeded run 1: 09956fcbb67177f97a6da30ac40560fc
+unseeded run 2: 30a506ba1974e68fd904547fc87ea4b9   <- different world
+```
+
+clknetsim honours `CLKNETSIM_RANDOM_SEED` in **both** halves — `server.cc:233`
+for the network delay streams and `client.c:417` for the node's own `random()`.
+Setting it makes a run bit-reproducible.
+
+The rig now derives rep N's seed from `SEED_BASE + N`, so **rep N of every arm
+faces the same world, packet for packet**. That is a stronger fairness claim
+than "the same distribution", and it turns a paired comparison from a
+statistical exercise into a deterministic one.
+
+The false claim was not harmless: it is what licensed `REPS=1`, and the first
+three-arm experiment run under it produced three different answers that were
+entirely the draw.
+
+### T1 placement: a real hypothesis this rig cannot test
+
+The steady-state bias was negative (clock ends up ahead), which fits a T1
+stamped *before* `send()` returns: the packet leaves after we stamped it, so
+`(t2 - t1)` is too large, the offset reads too positive, and the loop runs the
+clock fast. T1 is local bookkeeping — the client's transmit timestamp goes on
+the wire as a nonce, never as a time — so it can legitimately move.
+
+Three arms (stamp before `send`, after `send`, midpoint), five seeds:
+
+```
+seed   arm        signed(us)  mean|e|(us)
+101    before/after/mid  -1.35         1.35
+202    before/after/mid  +0.91         0.91
+303    before/after/mid  -0.18         0.36
+404    before/after/mid  -1.68         1.68
+505    before/after/mid  -2.03         2.03
+```
+
+**Bit-identical across all three arms, in every seed.** clknetsim's virtual
+clock advances only at poll boundaries, so `send()` takes exactly zero
+simulated time and both clock reads return the same value. The arm is wired;
+the simulator cannot express the effect.
+
+Two conclusions, and the second matters more than the first:
+
+1. T1 placement is **unmeasurable on this rig**. Parked for hardware, not
+   refuted — and not shipped, because an unmeasured change is not a win.
+2. Therefore send latency **cannot be** the cause of the bias measured here.
+   The sim has none. The earlier "bias/noise = 1.00, ours is negative"
+   reading was real but its explanation was wrong.
+
+What the seeded data shows instead: the bias is **per-world, not per-code** —
+it changes sign with the seed (-1.35, +0.91, -0.18, -1.68, -2.03 us). That is
+sampling error in the delay draws, not a standing defect in the loop.
+
+The arithmetic agrees. S1 draws 10 us exponential jitter each way, so a single
+sample's offset error is about (d1 - d2)/2 with an SD near 7 us. Averaged over
+the ~30-40 samples the estimator effectively uses, that predicts ~1.1-1.3 us —
+which is what both implementations measure. **We are at the statistical floor
+for the number of samples used**, so the lever is the estimator's effective
+sample count, not the controller's gain.
+
+### The integral trim: measured and rejected
+
+Twenty seeds per arm, paired seed by seed, S1 and S8:
+
+```
+=== S1 - paired against chrony (20 seeds) ===
+  chrony             median |e|   1.52 us   worst   5.53 us
+  rusty_time gain=0.0  median |e| 1.47 us    9/20 wins  z=-0.45  NOT RESOLVED
+  rusty_time gain=0.1  median |e| 1.98 us   10/20 wins  z=+0.00  NOT RESOLVED
+
+=== S8 - paired against chrony (20 seeds) ===
+  chrony             median |e|   5.24 us   worst  12.20 us
+  rusty_time gain=0.0  median |e| 4.78 us    8/20 wins  z=-0.89  NOT RESOLVED
+  rusty_time gain=0.1  median |e| 6.20 us    5/20 wins  z=-2.24  RESOLVED, chrony ahead
+```
+
+Turning the trim on is **the only resolved result in the sweep, and it is a
+regression**. Default returned to 0.
+
+The earlier single unpaired run had read the same change as an improvement on
+*both* scenarios (S6 1.50 -> 1.28 ms, S8 4.43 -> 4.12 ms). That reading was the
+draw. This is precisely the failure the seeded rig now prevents, and it is
+worth being blunt about: the theory was right (a proportional controller cannot
+zero a constant drift), the implementation did what the theory said, and the
+measurement still says no — because the standing offset here is not a constant
+drift. It changes sign with the seed. It is sampling error, and integrating
+sampling error is how you put noise into a frequency estimate.
+
+### Where the accuracy gap actually is: packets, not the estimator
+
+clknetsim counts packets itself. Reading its statistics rather than either
+implementation's opinion, same worlds, same configured poll bounds
+(`--minpoll 4 --maxpoll 6` for both):
+
+```
+             mean poll   median |e| S1   median |e| S8
+chrony          33.9 s         1.52 us         5.24 us
+rusty_time      40.1 s         1.47 us         4.78 us
+```
+
+chrony buys **18% more samples than we do**. Offset error falls as `1/sqrt(N)`,
+so that is worth `sqrt(1.18)` = **1.087x** to chrony before its estimator does
+any work at all — against a measured raw gap of 1.12x on S1. Almost the whole
+gap is the packet budget.
+
+Dividing it out asks the question the raw win rate cannot — *which estimator is
+better at equal cost?*
+
+```
+        raw (x)   per packet spent      poll
+S1        1.12    x1.05   9/20  z=-0.45   40.1 s vs 33.9 s
+S8        1.05    x0.96  11/20  z=+0.45   41.2 s vs 33.9 s
+```
+
+**At equal cost we are at parity on S1 and slightly ahead on S8.** The
+estimator was never the deficit. Two months of this project's accuracy work
+would have gone into the filter; the counter says the filter is fine and the
+poll adaptation is what is leaving accuracy on the table.
+
+**First proposed mechanism, and its refutation.** The obvious suspect was the
+dead band: an offset below `2 * noise` counts as stable and doubles the poll
+after three such samples, while the interval only comes back down above
+`10 * noise`. A band that wide should pin the client at maxpoll.
+
+Sweeping `poll_down_noise_ratio` over 10, 6, 4, 3 — 200 cells, twenty seeds:
+
+```
+S1  ratio 10 / 6 / 4 / 3   ->  poll 40.1 s in EVERY arm, median |e| 1.47 us in every arm
+S8  ratio 10 / 6           ->  poll 41.2 s      ratio 4 / 3 -> poll 40.9 s
+```
+
+Identical. The step-DOWN branch is reached only when `|offset| >= 2 * noise`,
+and a converged loop is almost never there — it is classified stable on nearly
+every sample, so the descent path is dead code in steady state and its
+threshold cannot matter. The band is not the mechanism; the **climb** is. The
+loop reaches maxpoll after three samples and never has cause to leave.
+
+Recorded rather than quietly replaced, because the refuted version is the one
+that sounds right, and a plausible mechanism nobody measured is exactly how the
+integral trim got written.
+
+**The instrument lesson, again:** the honest comparison of two time daemons
+states how many packets each one spent. A pure accuracy number ranks whoever
+polls hardest, and every table in this ledger before this one omitted it.
+
+### Buying accuracy with packets: it works on S1, and it is not a win
+
+`poll_up_streak` — consecutive stable samples before the interval doubles — is
+the term with real authority over the packet budget. Twenty seeds, four values:
+
+```
+                    poll   median |e|   raw    win     per packet
+S1  chrony         33.9 s     1.52 us     -      -          -
+S1  streak  3      40.1 s     1.47 us  x1.12   9/20      x1.05
+S1  streak  6      35.7 s     1.16 us  x1.04   8/20      x1.01
+S1  streak 10      31.0 s     1.72 us  x1.22   8/20      x1.25
+S1  streak 16      25.5 s     1.33 us  x0.86  12/20      x1.01
+
+S8  chrony         33.9 s     5.24 us     -      -          -
+S8  streak  3      41.2 s     4.78 us  x1.05   8/20      x0.96
+S8  streak  6      36.3 s     5.08 us  x0.98  11/20      x0.96
+S8  streak 10      31.4 s     5.72 us  x1.22   3/20      x1.25   RESOLVED, chrony ahead
+S8  streak 16      26.5 s     4.55 us  x1.08   8/20      x1.20
+```
+
+Two things to take from this, and one to refuse to take.
+
+**The tension is real and it is structural.** S1 improves as the poll shortens
+and S8 does not. The register holds a fixed 64 samples, so polling faster buys
+sample COUNT by spending register SPAN — and a frequency slope is estimated
+from span, not count. S1's oscillator is a constant +20 ppm, so its slope is
+easy and the extra samples are pure gain. S8's wanders, so its slope is the
+whole problem and shortening the baseline costs more than the samples return.
+A single fixed climb rate cannot serve both.
+
+**Per packet, nothing improved.** Every arm that got more accurate did it by
+polling harder, at x1.01 to x1.25 efficiency — the estimator did not get
+better, it was handed more data. That is not a win against chrony, it is
+matching chrony's bill. The default stays at streak 3.
+
+**What to refuse:** `streak 16` posts the best raw S1 number in the table
+(x0.86, 12/20) and it would be easy to ship that line. It is z=+0.89 — not
+resolved — its per-packet figure is x1.01, and the same setting is x1.20 on S8.
+Picking the best cell out of eight comparisons is picking noise; at |z|>2 with
+eight arms, roughly one false winner per sweep is the expected yield.
+
+### The weight floor: a confirmed win that was not one
+
+The regression weights a sample by `(floor / (excess_delay + floor))^2`, with
+`floor = min_delay * 0.125`. That floor is tied to the PATH LENGTH, while the
+quantity it stands for — the error scale of a zero-excess sample — is set by
+timestamp resolution. Narrowing it should sharpen the weighting toward true
+inverse-variance.
+
+Twenty seeds, S1 and S8, four values. `0.03125` looked excellent: S1 median
+1.11 us against chrony's 1.52, per packet **x0.76**, at an unchanged poll — an
+estimator gain, not one bought with packets.
+
+Forty FRESH seeds confirmed it:
+
+```
+S1  0.03125   28/40 wins  z=+2.53   RESOLVED, rusty_time ahead   (0.97 us vs 1.50)
+```
+
+Then the same change was run across the whole corpus, paired against our own
+default, forty seeds per scenario:
+
+```
+        wins/40      z        verdict
+S1        31      +3.48   RESOLVED better
+S2         5      -4.74   RESOLVED worse
+S4        15      -1.58   worse (per packet -2.21, RESOLVED worse)
+S6         9      -3.48   RESOLVED worse
+S8        16      -1.26   worse
+```
+
+**Rejected.** It buys S1 and sells every other path in the corpus.
+
+The lesson is not "we got unlucky" — it is that the confirmation run was the
+wrong experiment. Forty fresh seeds cleared |z| > 2 honestly, and every one of
+them was on S1 or S8, the two scenarios the value had been chosen on. Varying
+the SEED is not varying the axis that can flip the answer. The rig was made
+deterministic specifically so that small effects could be resolved, and it
+resolved this one correctly and pointed the wrong way, because the question put
+to it was too narrow.
+
+**The unifying mechanism, which now has three independent confirmations.**
+Every knob that improves the offset estimate by concentrating information onto
+the best samples degrades the frequency estimate by shortening the baseline it
+is fitted over:
+
+| knob | concentrates by | S1 (constant 20 ppm) | drifting paths |
+|---|---|---|---|
+| `poll_up_streak` up | more samples, less span | better | S8 worse (RESOLVED) |
+| `weight_floor_ratio` down | fewer samples dominate | better | S2/S4/S6 worse (RESOLVED) |
+| `freq_integral_gain` up | offset fed into frequency | worse | S8 worse (RESOLVED) |
+
+S1's oscillator is a constant +20 ppm, so its slope is free and every scrap of
+concentration is pure gain. Every other scenario pays for it. A single scalar
+cannot serve both, which is why all three sweeps produced the same shape of
+answer. The next thing worth building is a fit that weights the INTERCEPT and
+the SLOPE differently — sharp weights for where the clock is, broad weights for
+how fast it is running — rather than a fourth scalar that trades one against
+the other.
+
+### Standing against chrony, steady state, as measured
+
+Forty seeded worlds per scenario, paired, shipping defaults both sides, with
+the packet count each arm spent:
+
+```
+      chrony |e|   rusty_time |e|   wins/40     z      per packet   verdict
+S1       1.09 us         1.55 us     17/40   -0.95      x0.95      not resolved
+S2    6689 us         7286 us         3/40   -5.38      x0.99      RESOLVED chrony ahead
+S4    1902 us         1865 us        23/40   +0.95      x0.61      not resolved
+S6       0.98 us         3.04 us      8/40   -3.79      x3.19      RESOLVED chrony ahead
+S8       3.24 us         4.21 us     14/40   -1.90      x1.17      not resolved
+      poll 33.9 s      poll ~41 s
+```
+
+**The goal — better than chrony in steady state — is not met.** Level on S1,
+S4 and S8; resolved behind on S2 and S6.
+
+*(Superseded below: the split-weighting change that came out of this diagnosis
+did earn its way in, and moves S2 and S6. The standing table is restated at the
+end of this section.)*
+
+Two concrete targets came out of it, both resolved and both diagnosable:
+
+* **S6, x3.4 behind (3.04 us vs 0.98 us).** The largest relative gap in the
+  corpus, and it is steady state, not the cold start S6 was built to measure.
+* **S2, 596 us of avoidable error.** The path is 26.7 ms one way and 13.3 ms
+  the other, so NTP cannot do better than `(26.7 - 13.3) / 2` = 6700 us.
+  chrony measures 6689 us — it is *at* the theoretical floor. We measure 7286.
+  The unavoidable part is not the interesting part; the 596 us is ours.
+
+### SHIPPED: the offset and the slope get their own weights
+
+Three sweeps all produced the same shape of answer — better on S1, worse on
+everything with a frequency to work for — because one weight set was answering
+two questions that want opposite things:
+
+* **Where is the clock?** Best told by the few samples that queued least.
+  Concentrate.
+* **How fast is it running?** A slope, and a slope wants a long baseline.
+  Spread out.
+
+So the fit now uses both. The slope keeps the broad weights it always had; the
+offset is re-seated on sharp ones, holding that slope fixed. With `b` already
+decided, the sharply-weighted intercept is just the weighted mean offset taken
+about the weighted mean time — the `b * (t - t0)` terms cancel there — so it is
+one extra pass, no second solve, and it cannot perturb the frequency estimate.
+
+Paired against the previous single-weight fit, fifty fresh seeded worlds per
+scenario, S8 re-run at a hundred to settle a near-miss:
+
+```
+       median |e|  ->  median |e|     wins       z      verdict
+S1        1.22 us       1.25 us      28/50    +0.85    better, not resolved
+S2      7164 us       6759 us        42/50    +4.81    RESOLVED better
+S4      2575 us       2696 us        26/50    +0.28    neutral
+S6         2.74 us       1.49 us     41/50    +4.53    RESOLVED better
+S8         3.71 us       3.64 us    47/100    -0.60    neutral
+```
+
+**Two resolved improvements, no resolved regression**, replicated across two
+independent seed sets (the discovery run read +2.19 and +2.92 on thirty). S2
+gains 405 us; S6 gains 45%. Convergence is untouched — S1 5 s, S6 14-16 s,
+S8 5 s in both arms — and p50/max improve or hold on all three.
+
+**The S8 near-miss is why the hundred-seed run exists.** At fifty seeds it read
+`18/50, z=-1.98` — close enough to the bar to be reported as a regression by
+anyone rounding. At a hundred it is `47/100, z=-0.60`, with the candidate's
+median very slightly *ahead*. A z just under the threshold is not a small
+effect, it is an unresolved one, and the fix is more seeds rather than a verdict.
+
+#### Why it works, which the diagnosis found before the fix
+
+S6's error was never noise. Sampled through a run it was positive at almost
+every point, and across forty worlds its signed bias was **+2.74 us against
+chrony's +0.05** — while our *variance* was lower than chrony's. That is a DC
+bias, and DC bias means bookkeeping, not jitter.
+
+The cause is in the corpus definition. Delay jitter is drawn `exponential`, and
+real queueing is shaped the same way: a packet can be delayed a great deal and
+cannot arrive early. Averaging a skewed distribution broadly does not just add
+noise, it adds a standing bias, because the entire tail lies on one side.
+Inverse-variance weighting on the offset rejects that tail. The slope never
+cared, because a constant bias does not tilt a line.
+
+That also predicts the shape of the result, and did so before it was measured:
+the largest gains land on the most skewed and asymmetric paths — S2 (2:1
+asymmetry) and S6 — and little changes on S1 (little jitter) or S8 (dominated by
+oscillator wander rather than delay).
+
+#### Standing against chrony after the change
+
+Fifty seeded worlds per scenario, paired, shipping defaults both sides:
+
+```
+      chrony |e|   rusty_time |e|   wins/50     z     per packet   verdict
+S1       1.35 us         1.25 us     27/50   +0.57     x0.85      level
+S2    6792 us         6759 us        28/50   +0.85     x0.91      level raw;
+                                     47/50   +6.22                RESOLVED ahead per packet
+S4    2007 us         2696 us        18/50   -1.98     x1.40      not resolved
+S6       1.12 us         1.49 us     15/50   -2.83     x1.24      RESOLVED chrony ahead
+S8       3.44 us         4.03 us     15/50   -2.83     x1.06      RESOLVED chrony ahead
+```
+
+**Still not "better than chrony" overall**, and the honest headline stays that.
+What changed is the size of the gap: S6 went from **x2.37 to x1.35**, and S2
+from resolved-behind to level (and resolved *ahead* per packet spent, 47/50,
+z=+6.22 — we reach chrony's accuracy on that path while sending ~16% fewer
+packets). S4 is now the largest untouched gap and has never been investigated.

@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/remade-with-rust/rusty_time"
@@ -24,11 +24,11 @@ rust-version = "1.95"
 unsafe_code = "deny"
 
 [workspace.dependencies]
-rusty_time-core = { path = "crates/rusty_time-core", version = "0.1.0" }
-rusty_time-nts = { path = "crates/rusty_time-nts", version = "0.1.0" }
-rusty_time-clock = { path = "crates/rusty_time-clock", version = "0.1.0" }
-rusty_time-api = { path = "crates/rusty_time-api", version = "0.1.0" }
-rusty_time-alloc = { path = "crates/rusty_time-alloc", version = "0.1.0" }
+rusty_time-core = { path = "crates/rusty_time-core", version = "0.1.1" }
+rusty_time-nts = { path = "crates/rusty_time-nts", version = "0.1.1" }
+rusty_time-clock = { path = "crates/rusty_time-clock", version = "0.1.1" }
+rusty_time-api = { path = "crates/rusty_time-api", version = "0.1.1" }
+rusty_time-alloc = { path = "crates/rusty_time-alloc", version = "0.1.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -12,8 +12,17 @@
 #     the same poll bounds -- not a strawman.
 #   * Both clients talk to the same chronyd server on node 1, so the server is
 #     not a variable.
-#   * clknetsim is deterministic for a given config, so each number is exactly
-#     reproducible rather than a sample from a noisy rig.
+#   * The simulator's random streams are SEEDED (CLKNETSIM_RANDOM_SEED), so
+#     every number here is exactly reproducible, and rep N of one arm faces
+#     the very same network draws as rep N of every other arm. That is a
+#     stronger fairness claim than "the same distribution": it is the same
+#     world, packet for packet.
+#
+#     This was not always true. Unseeded, two runs of IDENTICAL code differed
+#     by 2.4us of steady-state bias -- wider than the effect being chased --
+#     while a comment three lines up claimed the rig was already deterministic.
+#     A false determinism claim is worse than an honest noise floor, because
+#     it licenses REPS=1 and every single-run verdict taken from it.
 #
 # Metrics come from clknetsim's own offset log (-o), which records each node's
 # true error once per second. That is ground truth from the simulator, not
@@ -162,10 +171,15 @@ echo "   ${DURATION}s simulated per run, identical config per scenario"
 echo "   chrony: $("$CHRONY_DIR/chronyd" --version 2>&1 | head -1 | cut -c1-60)"
 echo
 
-# clknetsim redraws its random streams each run, so a single run is one sample
-# of a distribution, not the answer. Repeat and report the median run and the
-# worst run: a time daemon is judged on its bad days.
+# One seeded run is one WORLD, exactly reproducible -- but still only one
+# world, so it is not the answer. Repeat across worlds and report the median
+# run and the worst run: a time daemon is judged on its bad days.
 REPS=${REPS:-11}
+
+# Seed base. Rep N uses SEED_BASE+N in every arm, so arms are PAIRED: any
+# difference between two arms at the same rep is the code, never the draw.
+# Change it to sample a different set of worlds; keep it to reproduce a number.
+SEED_BASE=${SEED_BASE:-1000}
 
 # Median of a whitespace-separated list.
 median() { tr ' ' '\n' <<< "$1" | grep -v '^$' | sort -g | awk '{v[n++]=$1} END{print v[int(n/2)]}'; }
@@ -180,16 +194,18 @@ printf '%-5s %-12s %10s %10s %10s %9s %9s  %s\n' \
     scen arm "p50(med)" "p95(med)" "max(worst)" "to<1ms" "to<100us" "p50 spread"
 printf '%.0s-' {1..104}; echo
 
-# ARMS lets a tuning loop run just the implementation under test. Convergence
-# is deterministic in this simulator -- the same change gives the same number
-# to the second -- so one rep of one arm is a verdict when iterating on it.
+# ARMS lets a tuning loop run just the implementation under test. With the
+# seed pinned, one rep of one arm IS exactly reproducible -- but it is one
+# world, and a result that holds in one world and not the next four is a
+# property of that world. Vary SEED_BASE before believing a small effect.
 ARMS=${ARMS:-"chrony chrony_null rusty_time"}
 
 declare -A MED_P50 P50S
 for scenario in $SCENARIOS; do
     for arm in $ARMS; do
         p50s=""; p95s=""; mxs=""; c1s=""; c2s=""; failures=0
-        for _ in $(seq "$REPS"); do
+        for rep in $(seq "$REPS"); do
+            export CLKNETSIM_RANDOM_SEED=$((SEED_BASE + rep))
             read -r p50 p95 mx c1 c2 <<< "$(run_arm "$scenario" "$arm")"
             if [ "$p50" = "no-data" ]; then failures=$((failures+1)); continue; fi
             p50s="$p50s $p50"; p95s="$p95s $p95"; mxs="$mxs $mx"

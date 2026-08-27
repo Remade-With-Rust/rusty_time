@@ -13,23 +13,36 @@
 #       ctl              <- api, alloc, clock
 #       daemon           <- core, clock, nts, api, alloc
 #
-# crates.io allows a burst of new crates and then one roughly every ten minutes,
-# so a first publication of the whole workspace takes well over an hour. This
-# waits rather than failing, and re-running it is safe: a version already on the
-# registry is reported and skipped.
+# crates.io enforces TWO different limits, and confusing them costs an hour:
+#
+#   * a brand-NEW crate  — a small burst, then one roughly every ten minutes
+#   * a new VERSION of a crate that already exists — a burst of about thirty,
+#     then one a minute
+#
+# So the first publication of this workspace took over an hour and every
+# release since is a couple of minutes. GAP defaults to the version-bump case
+# because that is the normal one; pass FIRST=1 for a workspace that has never
+# been published. Getting it wrong is not fatal either way — a 429 is caught
+# below and waited out — it just wastes time.
+#
+# Re-running is safe: a version already on the registry is reported and skipped.
 #
 # Usage: tools/publish.sh [--dry-run]
+#        FIRST=1 tools/publish.sh        # first ever publication, slow pacing
 
 set -u
 DRY=${1:-}
 ORDER="alloc core nts api clock wasm sim ctl daemon"
 
-# Seconds to leave between two NEW crates. crates.io allows roughly one every
-# ten minutes once the initial burst is spent, and it appears to count
-# ATTEMPTS: retrying tightly against a 429 pushed the stated deadline out by
-# ten minutes each time, which turns a wait into a livelock. So this waits
-# generously and never retries fast.
-GAP=${GAP:-660}
+# Seconds to leave between publishes. The registry appears to count ATTEMPTS,
+# not successes: retrying tightly against a 429 pushed the stated deadline out
+# by ten minutes each time, which turns a wait into a livelock. So this never
+# retries fast, whichever limit is in play.
+if [ "${FIRST:-0}" = "1" ]; then
+    GAP=${GAP:-680}
+else
+    GAP=${GAP:-20}
+fi
 
 sleep_until() {   # sleep_until "Thu, 27 Aug 2026 14:28:39 GMT"
     local target now secs
@@ -61,6 +74,16 @@ publish_one() {
             when=$(sed -n 's/.*Please try again after \(.*GMT\).*/\1/p' <<< "$out" | head -1)
             echo "  $crate rate limited (attempt $attempt)"
             if [ -n "$when" ]; then sleep_until "$when"; else sleep "$GAP"; fi
+            continue
+        fi
+        # A crate that depends on one published seconds ago can fail to verify
+        # simply because the index has not caught up yet. That is a wait, not a
+        # failure, and it is the normal case when a workspace is released in
+        # dependency order.
+        if grep -qE "failed to select a version|no matching package|could not find" <<< "$out"; then
+            echo "  $crate: dependency not in the index yet (attempt $attempt)"
+            cargo search rusty_time-core >/dev/null 2>&1   # nudge the index
+            sleep 30
             continue
         fi
         echo "  FAILED $crate"

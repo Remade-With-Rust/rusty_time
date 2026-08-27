@@ -67,7 +67,12 @@ pub struct ControllerStep {
 impl SyncController {
     pub fn new(config: DisciplineConfig) -> Self {
         SyncController {
-            register: SampleRegister::new(REGISTER_CAPACITY),
+            register: {
+                let mut r = SampleRegister::new(REGISTER_CAPACITY);
+                r.set_weight_floor_ratio(config.weight_floor_ratio);
+                r.set_offset_weight_floor_ratio(config.offset_weight_floor_ratio);
+                r
+            },
             discipline: Discipline::new(config),
             freq_cmd_ppm: 0.0,
             drain_ppm: 0.0,

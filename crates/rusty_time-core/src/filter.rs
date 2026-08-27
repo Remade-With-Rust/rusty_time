@@ -42,7 +42,82 @@ pub struct RegressEstimate {
 pub struct SampleRegister {
     samples: Vec<Sample>,
     capacity: usize,
+    /// Weight-floor width, as a fraction of the minimum observed delay.
+    /// See [`SampleRegister::set_weight_floor_ratio`].
+    weight_floor_ratio: f64,
+    /// Weight-floor width used for the OFFSET only. See
+    /// [`SampleRegister::set_offset_weight_floor_ratio`].
+    offset_weight_floor_ratio: f64,
 }
+
+/// Default weight-floor width, as a fraction of the minimum observed delay.
+///
+/// The regression weights a sample by the inverse square of its excess delay,
+/// which is right: for exponential per-direction jitter the offset error of a
+/// sample scales with its excess round trip, so `1/excess^2` is inverse-variance
+/// weighting. The floor exists because that blows up as the excess goes to zero.
+///
+/// Tying its width to the PATH LENGTH is the questionable part — a sample's
+/// offset error scales with the path's JITTER, and the two are unrelated. On
+/// the corpus S1 path (200 us RTT, 10 us of jitter each way) this puts the
+/// floor at 25 us against a ~20 us jitter scale, which flattens the weighting.
+///
+/// **That reasoning is correct, it is measurable, and narrowing the floor was
+/// still rejected.** Halving it to 0.0625, paired against this default over
+/// forty seeded worlds per scenario:
+///
+/// ```text
+///        wins/40      z        verdict
+/// S1       31      +3.48   RESOLVED better
+/// S2        5      -4.74   RESOLVED worse
+/// S4       15      -1.58   worse (per packet -2.21, RESOLVED worse)
+/// S6        9      -3.48   RESOLVED worse
+/// S8       16      -1.26   worse
+/// ```
+///
+/// It buys S1 and sells every other path in the corpus. The reason is the same
+/// trade the poll-rate sweep found: a narrower floor concentrates the fit onto
+/// the few lowest-delay samples, which sharpens the OFFSET and shortens the
+/// effective baseline for the SLOPE. S1 has a constant +20 ppm and does not
+/// care about the slope; S2, S4, S6 and S8 all do.
+///
+/// The near-miss is worth recording. The change was confirmed out-of-sample on
+/// forty fresh seeds — and only on S1 and S8, the two scenarios it had been
+/// tuned on. It cleared |z| > 2 there and looked finished. Varying the SEED is
+/// not varying the axis that can flip the answer; adding S2, S4 and S6 turned
+/// a confirmed win into a three-way resolved regression.
+pub const WEIGHT_FLOOR_RATIO: f64 = 0.125;
+
+/// Weight-floor width for the OFFSET alone. Narrower than the slope's, on
+/// purpose — this is the split that `set_offset_weight_floor_ratio` exists for.
+///
+/// Delay jitter in the corpus is drawn `exponential`, and real queueing is
+/// skewed the same way: a packet can be delayed a great deal and cannot be
+/// delivered early. Averaging that broadly does not merely add noise, it adds a
+/// STANDING BIAS, because the whole tail sits on one side. Weighting the offset
+/// by inverse variance rejects the tail; the slope is untouched, since a
+/// constant bias does not tilt a line.
+///
+/// Measured against the previous single-weight fit, paired, fifty fresh seeded
+/// worlds per scenario (S8 re-run at a hundred to settle a near-miss):
+///
+/// ```text
+///        median |e|  ->  median |e|    wins      z       verdict
+/// S1        1.22 us       1.25 us     28/50   +0.85    better, not resolved
+/// S2      7164 us       6759 us       42/50   +4.81    RESOLVED better
+/// S4      2575 us       2696 us       26/50   +0.28    neutral
+/// S6         2.74 us       1.49 us    41/50   +4.53    RESOLVED better
+/// S8         3.71 us       3.64 us   47/100   -0.60    neutral
+/// ```
+///
+/// Two resolved improvements, no resolved regression, and convergence
+/// unchanged (S1 5 s, S6 14-16 s, S8 5 s in both arms).
+///
+/// The S6 result is the one that names the mechanism. Its error was not noisy,
+/// it was a standing **+2.74 us bias** where chrony sat at +0.05; the split
+/// takes it to +0.95. A DC offset on the scenario with the largest transient is
+/// what skewed-delay averaging looks like from the outside.
+pub const OFFSET_WEIGHT_FLOOR_RATIO: f64 = 0.03125;
 
 /// Minimum span (seconds) and count before the regression slope is reported.
 const FREQ_MIN_SPAN_S: f64 = 8.0;
@@ -53,7 +128,32 @@ impl SampleRegister {
         SampleRegister {
             samples: Vec::with_capacity(capacity.max(3)),
             capacity: capacity.max(3),
+            weight_floor_ratio: WEIGHT_FLOOR_RATIO,
+            offset_weight_floor_ratio: OFFSET_WEIGHT_FLOOR_RATIO,
         }
+    }
+
+    /// Set the weight-floor width. See [`WEIGHT_FLOOR_RATIO`].
+    pub fn set_weight_floor_ratio(&mut self, ratio: f64) {
+        self.weight_floor_ratio = ratio.max(1e-4);
+    }
+
+    /// Set the weight-floor width used for the OFFSET alone, leaving the slope
+    /// fitted over the broad weights.
+    ///
+    /// The regression answers two questions with one weight set, and they want
+    /// opposite things. WHERE the clock is, is best told by the few samples
+    /// that queued least — concentrate. HOW FAST it is running is a slope, and
+    /// a slope wants a long baseline — spread out. Every scalar tried on the
+    /// corpus bought one by selling the other, always with the same shape:
+    /// better on S1, whose oscillator is a constant +20 ppm and whose slope is
+    /// therefore free, and resolved worse on every path that has to work for
+    /// its frequency.
+    ///
+    /// Equal to `weight_floor_ratio` reproduces the single-weight behaviour
+    /// exactly.
+    pub fn set_offset_weight_floor_ratio(&mut self, ratio: f64) {
+        self.offset_weight_floor_ratio = ratio.max(1e-4);
     }
 
     pub fn push(&mut self, s: Sample) {
@@ -119,7 +219,7 @@ impl SampleRegister {
             .map(|s| s.delay)
             .fold(f64::INFINITY, f64::min);
         // Weight favors low-delay samples: queueing noise scales with excess delay.
-        let floor = (min_delay * 0.125).max(1e-9);
+        let floor = (min_delay * self.weight_floor_ratio).max(1e-9);
         let weight = |s: &Sample| {
             let excess = (s.delay - min_delay).max(0.0) + floor;
             let w = (floor / excess) * (floor / excess);
@@ -197,8 +297,44 @@ impl SampleRegister {
             None
         };
 
+        // Re-seat the OFFSET on sharper weights, holding the slope fixed.
+        //
+        // With the slope `b` already decided by the broad fit, the intercept
+        // that minimises the sharply-weighted residuals is just the weighted
+        // mean offset taken about the weighted mean time — the `b * (t - t0)`
+        // terms cancel there by construction. So this is one pass and no
+        // second solve, and it cannot disturb the frequency estimate.
+        //
+        // Runs only when the two ratios differ, so the default is bit-identical
+        // to the single-weight path rather than merely equivalent in algebra.
+        let offset_now = if self.offset_weight_floor_ratio != self.weight_floor_ratio {
+            let sharp_floor = (min_delay * self.offset_weight_floor_ratio).max(1e-9);
+            let sharp = |s: &Sample| {
+                let excess = (s.delay - min_delay).max(0.0) + sharp_floor;
+                let w = (sharp_floor / excess) * (sharp_floor / excess);
+                w.max(1e-6)
+            };
+            let mut sw = 0.0;
+            let mut swt = 0.0;
+            let mut swy = 0.0;
+            for s in &used {
+                let w = sharp(s);
+                sw += w;
+                swt += w * s.t;
+                swy += w * s.offset;
+            }
+            if sw > 0.0 {
+                let t0s = swt / sw;
+                (swy / sw) + fit.b * (now - t0s)
+            } else {
+                fit.a + fit.b * (now - fit.t0)
+            }
+        } else {
+            fit.a + fit.b * (now - fit.t0)
+        };
+
         Some(RegressEstimate {
-            offset: fit.a + fit.b * (now - fit.t0),
+            offset: offset_now,
             freq_ppm,
             offset_sd: fit.sd,
             n_used: used.len(),

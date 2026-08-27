@@ -1960,3 +1960,73 @@ client 13469   Ir/discipline step (from 25627 today — -47.4%)
   node.
 * **Server p99**, above.
 * **Sub-microsecond anything.** The GPS/PPS path has never run on real hardware.
+
+---
+
+## The S6 client path, round two: ten more wins, −23.3%
+
+Same harness, same gate — a checksum over every emitted plan folded by exact
+f64 bits. Starting from the 0.1.3 baseline of 215,512,762.
+
+```
+                                                       Ir            delta
+baseline (0.1.3)                                215,512,762
+11  pass 2 skips when nothing can be trimmed     211,724,501    -3,788,261  -1.76%
+12  residual sd computed once, on the survivor   202,793,243    -8,931,258  -4.22%
+13  head offset, amortised compaction            195,158,296    -7,634,947  -3.76%
+14  slew specialised on the live term            186,494,362    -8,663,934  -4.44%
+15  decay test hoisted out of the sharp walk     183,644,656    -2,849,706  -1.53%
+16  density test hoisted out of the row build    173,018,307   -10,626,349  -5.79%
+17  the MAD inlined into its two call sites      171,321,950    -1,696,357  -0.98%
+18  per-sample weight cache                      170,533,579      -788,371  -0.46%
+19  dispersion folded into the offset walk       169,941,754      -591,825  -0.35%
+20  spike test answered without a median         165,241,442    -4,700,312  -2.77%
+                                                              ------------
+                                                               -50,271,320 -23.33%
+```
+
+**13,469 Ir per discipline step down to 10,328.** Across both rounds:
+**25,627 -> 10,328, a 2.48x reduction**, behaviour bit-identical throughout —
+five corpus cells across S1, S2, S4, S6 and S8 match the published 0.1.3 to four
+decimal places.
+
+### The one worth reading
+
+Win 20. `select_nth_unstable_by_key` was **17% of the entire client path** —
+18,493 partitions for 16,000 estimates — and every one of them existed to answer
+`worst > 3 * 1.4826 * mad`, a question whose answer is almost always no.
+
+The median is not needed to answer it. `v -> 3 * 1.4826 * v` is monotone
+non-decreasing over the non-negative reals, so sorting by `v` also sorts by
+`f(v)`, which makes `f(mad)` the `mid`-th smallest `f`-value. Therefore
+`worst > f(mad)` holds exactly when at least `mid + 1` values satisfy
+`f(v) < worst` — a counting pass with no partition. The `.max(1e-9)` arm
+separates cleanly, since `worst > max(f(mad), 1e-9)` is `worst > f(mad)` and
+`worst > 1e-9`. The median is still selected on the rare path that will use it,
+so the threshold handed back is bit-identical.
+
+Not an approximation, not a fast path with a tolerance: the same answer, without
+computing the quantity it appeared to need.
+
+### Six measured and reverted
+
+Each carries a number because each was tried and rejected on evidence:
+
+* **`VecDeque` for the sliding window: +1.9M.** O(1) eviction, but its iterator
+  handles a wrap and `regress` walks every sample on every estimate. Paying on
+  the frequent path to save on the rare one loses. A head offset with amortised
+  compaction (win 13) gets the same saving and keeps the window a plain slice.
+* **A reusable `&mut Vec` for the residual pass: +1.1M, a THIRD failure.** It had
+  already lost as a caller local (+3.4M) and as a register field (+2.4M); the
+  retry was fair because win 17 made the callee inline, which moved the
+  baseline. It still lost. Settled.
+* **A `want_gap` flag so pass 2 could skip the half-means: +0.9M.** The branch
+  costs more than the two sums it guards.
+* **`fold(0.0, f64::max)` in place of an explicit `>` loop: +2.9M.** `f64::max`
+  carries IEEE NaN semantics that a comparison does not.
+* **`#[inline(always)]` on `wls_fit`: +0.9M.** Six call sites; duplicating three
+  loops at each costs more than the calls. The opposite verdict to the MAD,
+  which has two — inlining is not a direction, it is a measurement.
+* **Caching the offset weights like the base weights: +27k.** The weight must be
+  carried in the row, because trimming leaves a row unable to find its own index
+  again, and the wider row costs what the saved divisions gain.

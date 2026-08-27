@@ -2196,3 +2196,48 @@ Six tests pin it, including the two that matter most: that it is **off by
 default**, and that the first correction of a cold start still goes through. A
 safety limit that breaks legitimate cold starts would be turned off by every
 operator who hit it, which is worse than not shipping it.
+
+### What the guard costs, measured
+
+The same deterministic harness the optimisation rounds used, so the number is
+comparable to every other figure here. `client_path` gained an arm selected once
+per invocation — reading the environment inside the loop would measure `getenv`,
+not the guard — with a limit far above anything the workload produces, so the
+guard is exercised on its real hot path: **the check that passes**, not the
+refusal a deployment almost never takes.
+
+```
+                                      Ir      Ir/step     vs no guard
+before the guard existed      165,241,442     10,328.2         —
+guard present, OFF (default)  165,432,868     10,339.6     +0.116%   ~11 Ir/step
+guard present, ON             165,545,157     10,346.6     +0.184%   ~18 Ir/step
+```
+
+**The checksum is identical in all three.** The guard is transparent when it
+does not fire — enabling it changes the instruction count and nothing else about
+the plans emitted, which is the property a safety limit has to have before
+anyone will leave it on.
+
+Eighteen instructions per discipline step, against 10,328. A discipline step
+happens once a poll — roughly once every forty seconds — so in wall-clock terms
+this is unmeasurable. It is stated anyway, because "negligible" is a claim and
+this project only makes claims it has numbers for.
+
+### The NaN case, which the obvious spelling gets wrong
+
+Written naturally the test is `offset.abs() > limit`. That **accepts** a NaN
+estimate, because every comparison against NaN is false — so the one value that
+is certainly not a time would sail past the guard whose entire job is to refuse
+a correction it cannot vouch for. Nothing downstream re-checks: the command
+reaches `clock_adjtime` through an `as i64` conversion that saturates rather
+than trapping, so a NaN silently becomes zero.
+
+The test is therefore "refuse unless the offset is DEFINITELY within the limit",
+spelled through `partial_cmp` so the third case is visible in the code rather
+than implied by a negation. `NaN`, `+inf` and `-inf` are all refused, and a test
+covers each. It costs 1 Ir/step when the guard is on and nothing when it is off.
+
+Nine tests in total, and the two that matter most are still the negative ones:
+that the guard is **off by default**, and that **the first correction of a cold
+start goes through**. A safety limit that breaks legitimate cold starts is a
+limit every operator switches off.

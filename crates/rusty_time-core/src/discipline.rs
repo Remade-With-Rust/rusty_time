@@ -5,6 +5,8 @@
 //! the estimator measures frequency directly, so no PLL time constant is needed
 //! (this is the chrony approach, and the reason for its fast convergence).
 
+use std::cmp::Ordering;
+
 /// Configuration mirroring the chrony.conf directives we honor.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisciplineConfig {
@@ -471,6 +473,16 @@ impl Discipline {
 
         // The maximum-change guard, before anything is decided.
         //
+        // The test is "refuse unless the offset is DEFINITELY within the
+        // limit", spelled through `partial_cmp` so the third case is visible.
+        // Written the natural way, as `|offset| > limit`, a NaN estimate would
+        // be waved through — every comparison against NaN is false, so the one
+        // value that is certainly not a time would go straight to the clock,
+        // past the guard whose whole job is to refuse a correction it cannot
+        // vouch for. Nothing downstream re-checks: the command reaches
+        // `clock_adjtime` through an `as i64` conversion that saturates rather
+        // than trapping, so a NaN silently becomes zero.
+        //
         // Placed ahead of the step logic on purpose: a step is the largest and
         // fastest way to move a clock, so a guard that ran after it would be
         // guarding everything except the dangerous case. The allowance for
@@ -478,7 +490,10 @@ impl Discipline {
         // legitimate correction.
         if let Some(limit) = self.cfg.max_change_s
             && self.updates > self.cfg.max_change_start
-            && offset.abs() > limit
+            && !matches!(
+                offset.abs().partial_cmp(&limit),
+                Some(Ordering::Less | Ordering::Equal)
+            )
         {
             self.change_refusals = self.change_refusals.saturating_add(1);
             let spent = self.cfg.max_change_ignore >= 0
@@ -940,6 +955,69 @@ mod max_change_tests {
                 ChangeVerdict::Refused { .. }
             ));
         }
+    }
+
+    /// The boundary is inclusive: a correction exactly at the limit is allowed.
+    /// An operator who writes `--maxchange 1000 …` means "one thousand is
+    /// fine", not "one thousand is too much".
+    #[test]
+    fn a_correction_exactly_at_the_limit_is_allowed() {
+        let mut d = guarded(1000.0, 1, 2);
+        d.on_estimate(0.0001, None, 1e-6);
+        assert_eq!(
+            d.on_estimate(1000.0, None, 1e-6).verdict,
+            ChangeVerdict::Accepted
+        );
+        assert_eq!(
+            d.on_estimate(-1000.0, None, 1e-6).verdict,
+            ChangeVerdict::Accepted,
+            "the limit is on the magnitude, so it must be symmetric"
+        );
+    }
+
+    /// A NaN estimate is refused, not waved through.
+    ///
+    /// Every comparison against NaN is false, so the obvious `|offset| > limit`
+    /// would ACCEPT the one value that is certainly not a time. Nothing
+    /// downstream re-checks: the command reaches `clock_adjtime` through an
+    /// `as i64` conversion that saturates rather than trapping.
+    #[test]
+    fn a_nonsense_estimate_is_refused() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut d = guarded(1000.0, 1, 5);
+            d.on_estimate(0.0001, None, 1e-6);
+            let plan = d.on_estimate(bad, None, 1e-6);
+            assert!(
+                matches!(plan.verdict, ChangeVerdict::Refused { .. }),
+                "an estimate of {bad} was not refused"
+            );
+            match plan.command {
+                ClockCommand::Slew {
+                    freq_ppm,
+                    drain_offset,
+                    drain_rate_ppm,
+                } => {
+                    assert!(freq_ppm.is_finite(), "a refusal emitted {freq_ppm} ppm");
+                    assert_eq!(drain_offset, 0.0);
+                    assert_eq!(drain_rate_ppm, 0.0);
+                }
+                other => panic!("expected a hold, got {other:?}"),
+            }
+        }
+    }
+
+    /// `start = 0` guards from the very first update, for a node that should
+    /// never be making a large correction at all.
+    #[test]
+    fn a_zero_start_guards_immediately() {
+        let mut d = guarded(1.0, 0, 5);
+        assert!(
+            matches!(
+                d.on_estimate(500.0, None, 1e-6).verdict,
+                ChangeVerdict::Refused { seen: 1, .. }
+            ),
+            "with start = 0 even the first correction must be checked"
+        );
     }
 }
 

@@ -78,13 +78,29 @@ fn fold(sum: &mut u64, v: f64) {
 }
 
 fn main() {
+    // The maximum-change guard, as a measurement arm resolved ONCE for the
+    // whole run rather than per iteration — reading the environment inside the
+    // loop would be measuring `getenv`, not the guard.
+    //
+    // The limit is deliberately far larger than anything this workload
+    // produces, so the guard is exercised on its real hot path — the check that
+    // passes — rather than on the refusal path a real deployment almost never
+    // takes.
+    let mut cfg = DisciplineConfig::default();
+    let guarded = std::env::var_os("RUSTY_TIME_BENCH_MAXCHANGE").is_some();
+    if guarded {
+        cfg.max_change_s = Some(1.0e6);
+        cfg.max_change_start = 1;
+        cfg.max_change_ignore = -1;
+    }
+
     let mut checksum: u64 = 0xcbf2_9ce4_8422_2325;
     let mut plans: u64 = 0;
     let mut steps: u64 = 0;
 
     for session in 0..SESSIONS {
         let mut lcg = Lcg(0x5eed_0000 + session as u64);
-        let mut controller = SyncController::new(DisciplineConfig::default());
+        let mut controller = SyncController::new(cfg);
 
         // S6's shape: half a second out, on a 200 us LAN path with 10 us of
         // jitter each way, and a +20 ppm oscillator.
@@ -156,6 +172,7 @@ fn main() {
         }
     }
 
+    println!("maxchange    {}", if guarded { "on" } else { "off" });
     println!("sessions     {SESSIONS}");
     println!("steps        {steps}");
     println!("plans        {plans}");

@@ -68,7 +68,10 @@ jobs:
           CARGO_TARGET_DIR=~/rt-target cargo build --release -p rusty_time-daemon
       - name: Two-way NTS interop
         run: |
-          CHRONY_DIR=~/chrony RTIMED=~/rt-target/release/rtimed \
+          # chronyd refuses to start unprivileged ("Fatal error : Not
+          # superuser"), so without this direction B never gets off the ground
+          # and direction A finds nothing listening on the NTS-KE port.
+          sudo CHRONY_DIR="$HOME/chrony" RTIMED="$HOME/rt-target/release/rtimed" \
             bash tools/corpus/nts_interop_chrony.sh
 
   # M4 gate: chronyd must sync from us over plain NTP and in interleaved mode,
@@ -87,8 +90,8 @@ jobs:
         run: CARGO_TARGET_DIR=~/rt-target cargo build --release -p rusty_time-daemon -p rusty_time-ctl
       - name: chronyd syncs from rusty_time (plain + interleaved)
         run: |
-          CHRONY_DIR=~/chrony RTIMED=~/rt-target/release/rtimed \
-            RTIMEC=~/rt-target/release/rtimec \
+          sudo CHRONY_DIR="$HOME/chrony" RTIMED="$HOME/rt-target/release/rtimed" \
+            RTIMEC="$HOME/rt-target/release/rtimec" \
             bash tools/corpus/m4_interop_chrony.sh
 
   # M5 gate: the smoke rig on every platform we ship, including macOS — the one

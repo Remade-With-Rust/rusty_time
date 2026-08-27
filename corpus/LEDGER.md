@@ -2241,3 +2241,27 @@ Nine tests in total, and the two that matter most are still the negative ones:
 that the guard is **off by default**, and that **the first correction of a cold
 start goes through**. A safety limit that breaks legitimate cold starts is a
 limit every operator switches off.
+
+### A harness defect the release surfaced
+
+Publishing 0.1.6 stopped half-done — three crates up, six still on 0.1.5 —
+reporting a hard failure. The registry had returned 429, which the script is
+built to wait out; it did not recognise it. The check was:
+
+```sh
+grep -q "429 Too Many Requests"
+```
+
+and cargo had said `failed to get a 200 OK response, got 429`. Matching one
+PHRASING of a status rather than the status turned a routine wait into an
+abandoned release. Now matched by code, and re-running walked through the
+remaining six, waiting out two more limits on the way.
+
+Worth stating because the state it left behind was the dangerous kind: not
+broken, just inconsistent. `rusty_time-core 0.1.6` was live while `daemon`
+was still 0.1.5, and 0.1.5 remained wholly installable, so nothing failed —
+which is exactly why nobody would have noticed.
+
+Also a reminder about the OTHER limit: three releases in quick succession spend
+the burst allowance for new versions, after which it is one a minute. That is a
+reason to batch changes into a release, not to publish each fix as it lands.

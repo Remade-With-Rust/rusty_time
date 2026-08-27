@@ -74,7 +74,11 @@ publish_one() {
             echo "  $crate is already on the registry, skipping"
             return 0
         fi
-        if grep -q "429 Too Many Requests" <<< "$out"; then
+        # Match the STATUS, not one phrasing of it. cargo has said both
+        # "429 Too Many Requests" and "failed to get a 200 OK response, got 429";
+        # a pattern that knows only the older wording reports a rate limit as a
+        # hard failure and abandons a half-finished release.
+        if grep -qE "429 Too Many Requests|got 429|Too Many Requests" <<< "$out"; then
             local when
             when=$(sed -n 's/.*Please try again after \(.*GMT\).*/\1/p' <<< "$out" | head -1)
             echo "  $crate rate limited (attempt $attempt)"

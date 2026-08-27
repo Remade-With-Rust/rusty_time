@@ -71,8 +71,9 @@ fn main() {
         ef::write_authenticator(&mut reply, &aead_nonce, &ciphertext);
 
         bytes_out += reply.len() as u64;
-        for chunk in reply.chunks_exact(8) {
-            let word = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+        let (words, _) = reply.as_chunks::<8>();
+        for chunk in words {
+            let word = u64::from_le_bytes(*chunk);
             checksum = checksum.wrapping_mul(0x0100_0000_01b3).wrapping_add(word);
         }
     }

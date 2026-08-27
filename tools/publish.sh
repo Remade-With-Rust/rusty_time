@@ -58,7 +58,7 @@ publish_one() {
         fi
         if grep -q "429 Too Many Requests" <<< "$out"; then
             local when
-            when=$(sed -n 's/.*Please try again after \(.*GMT\).*//p' <<< "$out" | head -1)
+            when=$(sed -n 's/.*Please try again after \(.*GMT\).*/\1/p' <<< "$out" | head -1)
             echo "  $crate rate limited (attempt $attempt)"
             if [ -n "$when" ]; then sleep_until "$when"; else sleep "$GAP"; fi
             continue

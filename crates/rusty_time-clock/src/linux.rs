@@ -109,7 +109,10 @@ impl ClockRead for SystemClock {
         if rc != 0 {
             return Err(errno_detail("clock_gettime(REALTIME)"));
         }
-        Ok((ts.tv_sec as i64, ts.tv_nsec as u32))
+        // `i64::from` rather than `as i64`: `time_t` is already i64 on 64-bit
+        // targets, where the cast is redundant, but it is 32-bit on some others
+        // where it is required. `From` is correct on both and is not a cast.
+        Ok((i64::from(ts.tv_sec), ts.tv_nsec as u32))
     }
 
     fn mono_s(&self) -> Result<f64, ClockError> {

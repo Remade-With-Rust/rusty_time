@@ -19,7 +19,7 @@ echo "== reference clock probe =="
 echo
 
 echo "-- PHC (/dev/ptp*) --"
-if ls /dev/ptp0 >/dev/null 2>&1; then
+if [ -r /dev/ptp0 ]; then
     "$RTIMED" refclock phc 0 > "$WORK/phc.out" 2>&1
     rc=$?
     cat "$WORK/phc.out" | sed 's/^/    /'
@@ -27,6 +27,11 @@ if ls /dev/ptp0 >/dev/null 2>&1; then
     # system clock should be small. A large offset is a real finding, not a
     # pass, so the exit status is what decides.
     check $rc "PHC read and validated"
+elif [ -e /dev/ptp0 ]; then
+    # Present but not ours to open. That is a fact about this machine, not a
+    # defect in the code, and reporting it as a failure makes every unprivileged
+    # CI run red for a reason no change here can fix.
+    echo "    /dev/ptp0 exists but is not readable by $(id -un) — PENDING (needs privilege)"
 else
     echo "    no /dev/ptp* on this machine — PENDING hardware"
 fi

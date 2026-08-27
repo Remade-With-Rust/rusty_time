@@ -1880,3 +1880,83 @@ from before `CORR_TIME_RATIO` 3.0 -> 1.0 deliberately moved it. Stashing the wor
 and measuring HEAD settled it in one run. A reference value carried forward by
 hand is a baseline that expires silently, and the fix is to measure the
 baseline rather than remember it.
+
+---
+
+## 0.1.3 — where performance stands, all arms
+
+One place with every current number and its provenance, because they were
+scattered across a dozen sections and two of them were being quoted from
+memory.
+
+### Server: measured, ours
+
+```
+arm             answered   replies/s   cpu us/reply
+rusty_time        200000      138664          2.950
+chrony            200000      105668          4.100
+chrony_null       200000      105960          4.050
+```
+
+**1.31x chrony's throughput at 0.72x its CPU per reply.** Both resolved far
+above the null-arm floor — 113x for throughput, 23x for CPU. Measured before
+0.1.1 and still current: every server-path file is unchanged since, all work
+after that point being client-side.
+
+**p99 is not claimed.** At concurrency 64 against a saturated server all three
+arms sit within 3% of each other, which is generator queueing rather than the
+server. That half of G4 needs a sub-saturation rate arm that does not exist.
+
+### Steady-state accuracy: one win, one loss, three level
+
+150 seeded worlds per scenario, paired, shipping defaults both sides. Mean
+absolute error over the last quarter of the run.
+
+```
+      chrony      rusty_time    wins/150      z      per packet
+S1    1.37 us      1.30 us       67/150    -1.31    +0.80 ours
+S2 6679 us      6586 us          92/150    +2.78   +11.76 ours   RESOLVED ours
+S4 2331 us      2274 us          84/150    +1.47    +1.96
+S6    1.34 us      1.65 us       59/150    -2.61    -2.29        RESOLVED chrony
+S8    3.40 us      3.01 us       77/150    +0.33    +2.78 ours
+```
+
+### Whole-run accuracy and convergence
+
+Five reps, seeded, median across reps. This measures the WHOLE run, so it
+includes the convergence transient — which is why S4 and S6 read differently
+here than in the steady-state table above. The two answer different questions.
+
+```
+      p50 chrony -> ours     max chrony -> ours     to <1 ms
+S1     1.4 ->  0.8 us          2.1 ->  3.9 us        7s ->  5s
+S2  6.662 -> 6.729 ms        7.12 -> 7.14 ms        neither
+S4  3.927 -> 1.082 ms        11.3 ->  6.8 ms        never -> 1138s
+S6     1.4 ->  0.9 us          2.1 ->  5.4 us       12s -> 16s
+S8     5.1 ->  3.5 us         16.9 -> 10.0 us        7s ->  5s
+```
+
+**chrony and chrony_null came out bit-identical in every row.** The rig is
+seeded, so two identical arms produce identical output and the resolution floor
+is exactly zero — every gap in that table is code, not noise. It is worth
+saying plainly how unusual that is: the same rig had a 38,468 replies/s floor
+before it was fixed.
+
+S4 is the strongest whole-run result anywhere in the corpus: 3.6x better p50, a
+better tail, and it reaches 1 ms inside the run where chrony does not.
+
+### Instruction cost, deterministic
+
+```
+server   237.1 Ir/request      (from 3053.6 — -92%)
+client 13469   Ir/discipline step (from 25627 today — -47.4%)
+```
+
+### What is NOT measured, stated so nobody assumes it is
+
+* **Client CPU against chronyd.** The 47% client win is against our own
+  baseline. There is no cross-implementation CPU figure for the client path the
+  way there is for the server — and on a mesh, the client is what runs on every
+  node.
+* **Server p99**, above.
+* **Sub-microsecond anything.** The GPS/PPS path has never run on real hardware.

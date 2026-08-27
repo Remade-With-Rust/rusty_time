@@ -45,15 +45,28 @@ sign test across rounds, not from comparing two medians.
 | gate | result |
 |---|---|
 | **G4 server throughput** | **MET.** 138,664 replies/s vs chrony's 105,668 (**1.31×**) at **0.72×** the CPU per reply, both resolved far outside the null-arm floor. |
-| **G2 convergence** | **Not met.** S1 and S8 reach 1 ms in **5 s** against chrony's 7 s; S6 (500 ms cold start) takes **14–16 s** against chrony's 12 s. |
-| **G1 accuracy** | **Not met, and mostly unresolved.** At N=9 only S6 separates — chrony ahead. S1 and S8 sit inside the rig's noise in both directions. |
+| **G2 convergence** | **Mixed.** S1 and S8 reach 1 ms in **5 s** against chrony's 7 s, and S4 (10% loss) reaches it at **1138 s** where chrony does not inside the run; S6 (500 ms cold start) takes **14–16 s** against chrony's 12 s. |
+| **G1 accuracy** | **Not met — one win, one loss, three level.** 150 seeded worlds per scenario, paired: **S2 ours** (z=+2.78), **S6 chrony's** (z=−2.61), S1/S4/S8 unresolved. Ahead **per packet spent** on S1, S2 and S8 — chrony's accuracy for fewer packets. |
 | G3, G5, G6 | not measured; nothing claimed. |
 
-Two honest notes. Earlier per-scenario accuracy wins reported here were
+Whole-run p50, five seeded reps, chrony → rusty_time: S1 1.4 → **0.8 µs**,
+S4 3.927 → **1.082 ms**, S6 1.4 → **0.9 µs**, S8 5.1 → **3.5 µs**, S2
+**6.662** → 6.729 ms. That window includes the convergence transient, which is
+why it reads differently from the steady-state row above; the two measure
+different things and neither supersedes the other.
+
+Instruction cost, deterministic and internal (not a chrony comparison):
+**237 Ir per served request**, **13,469 Ir per client discipline step**.
+
+Three honest notes. Earlier per-scenario accuracy wins reported here were
 **withdrawn**: they came from comparing medians on a rig whose unchanged control
-arm moved further than the effect. And G4's p99 half is not measured — at
-saturation the number is the load generator's queue depth, not the server's
-responsiveness.
+arm moved further than the effect. G4's p99 half is not measured — at saturation
+the number is the load generator's queue depth, not the server's responsiveness.
+And there is **no cross-implementation CPU figure for the client** the way there
+is for the server, which on a mesh is the side that runs on every node.
+
+The rig is now seeded, so two identical arms produce bit-identical output and
+its resolution floor is exactly zero. Any gap in the tables above is code.
 
 Every figure above, with the run that produced it and the defects the
 comparison uncovered, is in [corpus/LEDGER.md](corpus/LEDGER.md).

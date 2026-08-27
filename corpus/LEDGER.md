@@ -1771,3 +1771,50 @@ count, and we are **resolved ahead per packet spent on three of five**.
 Said plainly: we match chrony's accuracy while sending fewer packets, on most of
 the corpus. We do not beat its accuracy at any spend, on any scenario, at
 |z| > 2. That remains true after ten levers.
+
+### At full power: one resolved win, one resolved loss
+
+The 60- and 100-seed runs all read "nothing resolved either way". That was a
+POWER statement, not a result: the win rates sat near 54%, and resolving 54%
+needs about 150 seeds. So the shipped 0.1.2 was run against chrony at 150 seeds
+per scenario, pre-registered, all five scenarios, reporting whatever came out.
+
+```
+      chrony |e|   rusty_time |e|   wins/150     z      per packet        verdict
+S1       1.37 us         1.30 us      67/150   -1.31      x1.06        level
+S2    6679 us         6586 us         92/150   +2.78      x0.85        RESOLVED, ours
+S4    2331 us         2274 us         84/150   +1.47      x0.77        level
+S6       1.34 us         1.65 us      59/150   -2.61      x1.30        RESOLVED, chrony
+S8       3.40 us         3.01 us      77/150   +0.33   92/150 +2.78    level raw,
+                                                                       RESOLVED ours/packet
+```
+
+**S2 is the first resolved raw-accuracy win over chrony in this project.** On a
+WAN path with 2:1 delay asymmetry we are ahead at z = +2.78 — and ahead per
+packet at z = +11.76, on 147 of 150 worlds.
+
+**S6 is a resolved loss**, and it is no longer a bias: 0.1.2 removed that
+(signed bias +0.06 us against chrony's -0.07). What remains is variance in the
+middle of the distribution, and it has an odd shape — chrony's median is better
+(1.34 vs 1.65) while OUR worst case is better (4.68 vs 5.84). We are steadier at
+the tail and looser in the body. For a distributed cloud that trade is arguably
+the right way round, but it is a trade, not a win.
+
+**This supersedes the earlier "parity everywhere" reading**, which was taken at
+100 seeds where S6 sat at z = -2.00, exactly on the threshold. More seeds moved
+it to -2.61 and moved S2 to +2.78. Two verdicts that were called unresolved were
+unresolved only for want of samples — which is what "NOT RESOLVED" always meant
+and is worth restating, because it is easy to read as "no difference".
+
+### The answer to the question that started this
+
+*Can we improve steady-state accuracy to better than chrony?*
+
+**Partly, and now precisely: better on one of five scenarios, worse on one,
+level on three, and ahead per packet spent on three.** Not "better than chrony"
+as a flat claim, and the corpus is now sharp enough to say exactly where the
+line falls rather than hedging.
+
+Where it started: S2 and S6 both resolved AGAINST us at z = -5.38 and -3.79.
+S2 has crossed over. S6 has not, and its remaining deficit is a different
+quantity from the one that was fixed.

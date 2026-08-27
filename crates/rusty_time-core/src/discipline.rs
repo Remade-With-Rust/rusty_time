@@ -59,6 +59,12 @@ pub struct DisciplineConfig {
     /// Weight-floor width for the OFFSET alone; the slope keeps
     /// `weight_floor_ratio`. Equal values reproduce the single-weight fit.
     pub offset_weight_floor_ratio: f64,
+    /// Half-life, seconds, of the age decay on the OFFSET weights. Infinite
+    /// disables it, weighting by delay alone.
+    pub offset_age_halflife_s: f64,
+    /// If > 0, take the offset weight floor from measured delay dispersion
+    /// rather than a fraction of the minimum delay.
+    pub offset_weight_dispersion_k: f64,
 }
 
 impl Default for DisciplineConfig {
@@ -76,6 +82,8 @@ impl Default for DisciplineConfig {
             poll_up_streak: POLL_UP_STREAK,
             weight_floor_ratio: crate::filter::WEIGHT_FLOOR_RATIO,
             offset_weight_floor_ratio: crate::filter::OFFSET_WEIGHT_FLOOR_RATIO,
+            offset_age_halflife_s: f64::INFINITY,
+            offset_weight_dispersion_k: 0.0,
         }
     }
 }

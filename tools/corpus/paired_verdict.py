@@ -64,8 +64,18 @@ def main():
             seeds = sorted(set(base) & set(got))
             if not seeds:
                 continue
+            # TIES ARE DISCARDED, not counted as losses.
+            #
+            # Two arms that are bit-identical tie in every world. Scoring a tie
+            # as a loss made this tool report `0/40 wins, z=-6.32, RESOLVED`
+            # for an arm whose every number matched the baseline exactly -- a
+            # confident verdict on a null arm, which is the one result a paired
+            # test must never produce. Discarding ties is also the textbook
+            # sign test; counting them was simply wrong.
             wins = sum(1 for s in seeds if got[s][1] < base[s][1])
-            n = len(seeds)
+            losses = sum(1 for s in seeds if got[s][1] > base[s][1])
+            ties = len(seeds) - wins - losses
+            n = wins + losses
             z = (wins - n / 2) / (0.5 * math.sqrt(n)) if n else 0.0
             med = median([got[s][1] for s in seeds])
             bmed = median([base[s][1] for s in seeds])
@@ -74,13 +84,18 @@ def main():
             # one bad world dominating a mean.
             ratio = median([got[s][1] / base[s][1] for s in seeds
                             if base[s][1] > 0])
-            verdict = ("RESOLVED, "
-                       + (arm if wins > n / 2 else baseline)
-                       + " ahead") if abs(z) > 2 else "NOT RESOLVED"
+            if n == 0:
+                verdict = f"IDENTICAL to {baseline} in all {ties} worlds"
+            elif abs(z) > 2:
+                verdict = "RESOLVED, " + (arm if wins > n / 2 else baseline) + " ahead"
+            else:
+                verdict = "NOT RESOLVED"
             apoll = median([got[s][2] for s in seeds])
             print(f"  {arm:<18} median |e| {med:6.2f} us   worst {worst:6.2f} us"
                   f"   poll {apoll:5.1f} s")
-            print(f"  {'':<18} {wins:2d}/{n} wins  z={z:+5.2f}  x{ratio:.2f}  {verdict}")
+            tie_note = f"  ({ties} tied)" if ties else ""
+            print(f"  {'':<18} {wins:2d}/{n} wins{tie_note}  z={z:+5.2f}  "
+                  f"x{ratio:.2f}  {verdict}")
 
             # Accuracy PER PACKET SPENT. Offset error falls as 1/sqrt(N), so an
             # arm that polls more often is more accurate before its estimator
@@ -92,12 +107,18 @@ def main():
                    and base[s][1] > 0]
             if eff:
                 ewins = sum(1 for r in eff if r < 1.0)
-                ez = (ewins - len(eff) / 2) / (0.5 * math.sqrt(len(eff)))
-                everdict = ("RESOLVED, "
-                            + (arm if ewins > len(eff) / 2 else baseline)
-                            + " ahead") if abs(ez) > 2 else "NOT RESOLVED"
+                elosses = sum(1 for r in eff if r > 1.0)
+                en = ewins + elosses
+                ez = (ewins - en / 2) / (0.5 * math.sqrt(en)) if en else 0.0
+                if en == 0:
+                    everdict = "IDENTICAL"
+                elif abs(ez) > 2:
+                    everdict = ("RESOLVED, "
+                                + (arm if ewins > en / 2 else baseline) + " ahead")
+                else:
+                    everdict = "NOT RESOLVED"
                 print(f"  {'':<18} per-packet: x{median(eff):.2f}  "
-                      f"{ewins:2d}/{len(eff)} wins  z={ez:+5.2f}  {everdict}")
+                      f"{ewins:2d}/{en} wins  z={ez:+5.2f}  {everdict}")
             if abs(z) <= 2 and wins != n / 2:
                 # Seeds needed for this win RATE to clear |z|=2.
                 p = wins / n

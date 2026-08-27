@@ -104,6 +104,16 @@ impl SyncOptions {
                         .parse()
                         .map_err(|_| "--offset-weight-floor-ratio: not a number")?;
                 }
+                "--offset-age-halflife" => {
+                    opts.discipline.offset_age_halflife_s = value()?
+                        .parse()
+                        .map_err(|_| "--offset-age-halflife: not a number")?;
+                }
+                "--offset-weight-dispersion-k" => {
+                    opts.discipline.offset_weight_dispersion_k = value()?
+                        .parse()
+                        .map_err(|_| "--offset-weight-dispersion-k: not a number")?;
+                }
                 "--no-makestep" => opts.discipline.makestep_threshold = None,
                 "--no-iburst" => opts.discipline.iburst = false,
                 other if other.starts_with("--") => {

@@ -48,6 +48,14 @@ pub struct SampleRegister {
     /// Weight-floor width used for the OFFSET only. See
     /// [`SampleRegister::set_offset_weight_floor_ratio`].
     offset_weight_floor_ratio: f64,
+    /// If > 0, set the offset weight floor from the measured delay DISPERSION
+    /// rather than from a fraction of the minimum delay. See
+    /// [`SampleRegister::set_offset_weight_dispersion_k`].
+    offset_weight_dispersion_k: f64,
+    /// Half-life, seconds, of the age decay applied to the OFFSET weights.
+    /// Infinite disables it. See
+    /// [`SampleRegister::set_offset_age_halflife_s`].
+    offset_age_halflife_s: f64,
 }
 
 /// Default weight-floor width, as a fraction of the minimum observed delay.
@@ -130,6 +138,8 @@ impl SampleRegister {
             capacity: capacity.max(3),
             weight_floor_ratio: WEIGHT_FLOOR_RATIO,
             offset_weight_floor_ratio: OFFSET_WEIGHT_FLOOR_RATIO,
+            offset_weight_dispersion_k: 0.0,
+            offset_age_halflife_s: f64::INFINITY,
         }
     }
 
@@ -154,6 +164,123 @@ impl SampleRegister {
     /// exactly.
     pub fn set_offset_weight_floor_ratio(&mut self, ratio: f64) {
         self.offset_weight_floor_ratio = ratio.max(1e-4);
+    }
+
+    /// Set the half-life of the age decay on the OFFSET weights. Infinite (the
+    /// default) weights every surviving sample by delay alone.
+    ///
+    /// This shortens an ARM, not a memory. The offset handed to the discipline
+    /// is `mean_offset + b * (now - t0)`, where `t0` is the weighted mean
+    /// sample time — and with delay-only weights that sits near the middle of
+    /// the register, hundreds of seconds behind `now`. So the slope is
+    /// multiplied by a long lever before it reaches the answer, and a slope
+    /// error that is far too small to see becomes a standing offset: 2 ppb over
+    /// 500 s is 1 us, which is the exact scale of the bias left on S6 after the
+    /// weights were split.
+    ///
+    /// Decaying by age pulls `t0` toward `now` and shrinks the lever. It costs
+    /// effective samples, so it is a trade rather than a free win, and the
+    /// slope is deliberately left alone — it wants the long baseline.
+    ///
+    /// **Off by default, because the corpus will not agree on a value.** Paired
+    /// against no decay, forty seeded worlds per scenario:
+    ///
+    /// ```text
+    ///            S1        S2        S4        S6        S8
+    /// h=150   +3.16     -4.43     +1.26     -3.16     +4.43
+    /// h=300   +3.16     -5.06     +0.63     -3.16     +4.11
+    /// h=600   +3.16     -5.06     -0.95     -3.16     +1.90
+    /// ```
+    ///
+    /// Resolved better on S1 and S8, resolved worse on S2 and S6, at every
+    /// half-life tried. Set it only if you know your own path drifts.
+    ///
+    /// The lever-arm reasoning above is also NOT why it helps where it helps:
+    /// S6's standing bias went UP with decay (+0.88 -> +1.34 us), which the
+    /// shortened lever was supposed to reduce. The mechanism is unexplained;
+    /// only the measurement is trustworthy.
+    ///
+    /// **A gate on this was tried and removed.** The obvious fix for a knob the
+    /// corpus disagrees about is to apply it only where it belongs — decay when
+    /// the oscillator actually drifts, since that is the one thing that makes an
+    /// old sample stale. The register fitted its two halves separately and
+    /// compared the slopes against the standard error of their difference.
+    /// Measured across the corpus, that statistic does not discriminate:
+    ///
+    /// ```text
+    ///        p50    p75    p90    max    fires at K=1.5
+    /// S1    0.49   0.80   1.19   1.98        2.5%
+    /// S2    1.35   1.65   1.91   2.40       38.3%     <- steady, decay HURTS
+    /// S4    1.03   1.78   2.28   3.55       40.9%
+    /// S6    0.78   1.03   1.29   1.98        7.4%
+    /// S8    0.79   1.26   2.26   2.77       20.0%     <- drifting, decay HELPS
+    /// ```
+    ///
+    /// It fires nearly twice as often on S2, whose frequency is constant, as on
+    /// S8, whose frequency is the random walk the test was built to find — S8's
+    /// median separation sits BELOW S2's. No threshold can separate them,
+    /// because on a high-jitter path the two half-slopes disagree from
+    /// measurement noise long before any oscillator moves. Detecting drift
+    /// needs a statistic that separates noise from wander by LAG — an Allan
+    /// variance over successive frequency estimates — not a single window
+    /// split.
+    /// Take the offset weight floor from the path's measured DISPERSION —
+    /// `k * (median delay - min delay)` — instead of a fraction of the minimum
+    /// delay. Zero (the default) keeps the min-delay fraction.
+    ///
+    /// The floor stands for the error scale of a zero-excess sample, and that
+    /// scale is set by how much the path's delay VARIES, not by how long the
+    /// path is. Tying it to `min_delay` makes the weighting a different shape on
+    /// every path, and the corpus shows how far that goes:
+    ///
+    /// ```text
+    ///        min delay   jitter scale   floor at 0.03125*min   weight at typical excess
+    /// S1        200 us         ~20 us              6.2 us              ~0.09
+    /// S2         40 ms          ~4 ms              1.2 ms              ~0.09
+    /// S4         10 ms         ~40 ms              312 us            ~0.0002
+    /// ```
+    ///
+    /// S1 and S2 happen to land in the same place because their jitter is a
+    /// similar fraction of their path length. S4's is not — its jitter is four
+    /// times its minimum delay — so the same constant produces weights three
+    /// orders of magnitude smaller and the fit collapses onto one or two
+    /// packets. That is the shape of S4's result: median 2781 us against
+    /// chrony's 2022, and a worst case of 15150 against 10907.
+    ///
+    /// Setting the floor from dispersion makes the weighting the same SHAPE
+    /// everywhere, which is what the inverse-variance argument assumed.
+    ///
+    /// **Off by default: the reasoning is right and the result does not carry.**
+    /// Paired against the min-delay floor, forty seeded worlds per scenario:
+    ///
+    /// ```text
+    ///            S1        S2        S4        S6        S8
+    /// k=0.15  -0.63     +4.11     +0.95     -0.95     -0.63
+    /// k=0.30  -0.63     -2.85     -0.32     -0.32     -2.21
+    /// k=0.60  +0.95     -4.74     +0.00     -2.85     -0.32
+    /// ```
+    ///
+    /// `k=0.15` does what the model predicted where the model applies — it is
+    /// resolved better on S2 and trends better on S4, the two paths whose
+    /// dispersion is least like S1's — and it trends mildly WORSE on the three
+    /// paths the old constant already suited. One resolved gain against three
+    /// unresolved losses is not a win, and the larger k values are resolved
+    /// regressions outright.
+    ///
+    /// Kept as a knob because the argument survives the measurement: if a path
+    /// has jitter far out of proportion to its length, the min-delay fraction
+    /// is the wrong shape there and this is the correction. It is simply not a
+    /// better DEFAULT for the corpus as it stands.
+    pub fn set_offset_weight_dispersion_k(&mut self, k: f64) {
+        self.offset_weight_dispersion_k = k.max(0.0);
+    }
+
+    pub fn set_offset_age_halflife_s(&mut self, halflife_s: f64) {
+        self.offset_age_halflife_s = if halflife_s > 0.0 {
+            halflife_s
+        } else {
+            f64::INFINITY
+        };
     }
 
     pub fn push(&mut self, s: Sample) {
@@ -307,12 +434,35 @@ impl SampleRegister {
         //
         // Runs only when the two ratios differ, so the default is bit-identical
         // to the single-weight path rather than merely equivalent in algebra.
-        let offset_now = if self.offset_weight_floor_ratio != self.weight_floor_ratio {
-            let sharp_floor = (min_delay * self.offset_weight_floor_ratio).max(1e-9);
+        let decays = self.offset_age_halflife_s.is_finite();
+        let offset_now = if self.offset_weight_floor_ratio != self.weight_floor_ratio
+            || self.offset_weight_dispersion_k > 0.0
+            || decays
+        {
+            let sharp_floor = if self.offset_weight_dispersion_k > 0.0 {
+                // Median excess delay: the path's own noise scale, robust to
+                // the long tail that a mean would follow.
+                let mut d: Vec<f64> = used.iter().map(|s| s.delay).collect();
+                d.sort_by(f64::total_cmp);
+                let median = d[d.len() / 2];
+                (self.offset_weight_dispersion_k * (median - min_delay))
+                    .max(min_delay * 1e-4)
+                    .max(1e-9)
+            } else {
+                (min_delay * self.offset_weight_floor_ratio).max(1e-9)
+            };
+            let halflife = self.offset_age_halflife_s;
             let sharp = |s: &Sample| {
                 let excess = (s.delay - min_delay).max(0.0) + sharp_floor;
                 let w = (sharp_floor / excess) * (sharp_floor / excess);
-                w.max(1e-6)
+                let w = w.max(1e-6);
+                if decays {
+                    // Age is measured from `now`, not from the newest sample:
+                    // the lever being shortened is to the present moment.
+                    w * 0.5f64.powf(((now - s.t).max(0.0)) / halflife)
+                } else {
+                    w
+                }
             };
             let mut sw = 0.0;
             let mut swt = 0.0;

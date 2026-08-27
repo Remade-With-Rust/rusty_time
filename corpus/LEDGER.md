@@ -1471,3 +1471,97 @@ What changed is the size of the gap: S6 went from **x2.37 to x1.35**, and S2
 from resolved-behind to level (and resolved *ahead* per packet spent, 47/50,
 z=+6.22 — we reach chrony's accuracy on that path while sending ~16% fewer
 packets). S4 is now the largest untouched gap and has never been investigated.
+
+---
+
+## Steady state, settled: parity with chrony, and what stopped it going further
+
+### The definitive standing
+
+One hundred seeded worlds per scenario, paired, shipping 0.1.1 both sides, with
+the packets each arm spent:
+
+```
+      chrony |e|   rusty_time |e|   wins/100    z     per packet   verdict
+S1       1.38 us         1.23 us      52/100  +0.40     x0.84      level
+S2    6717 us         6722 us         54/100  +0.80     x0.91      level raw;
+                                      92/100  +8.40                RESOLVED ahead per packet
+S4    2022 us         2781 us         42/100  -1.60     x1.19      not resolved
+S6       1.35 us         1.77 us      40/100  -2.00     x1.04      not resolved
+S8       4.02 us         4.21 us      40/100  -2.00     x0.99      not resolved
+      poll 33.9 s      poll ~40 s
+```
+
+**Nothing is resolved against us anywhere.** At the start of this work S2 and S6
+were resolved behind at z = -5.38 and -3.79; both are now inside the noise, and
+on S2 we deliver chrony's accuracy on **16% fewer packets** (92/100, z = +8.40).
+
+**And nothing is resolved for us on raw accuracy either.** That is parity, not
+"better than chrony", and the goal asked for better. Said plainly so no later
+reader has to infer it.
+
+### Four more knobs, four more times the corpus refused to agree
+
+Every lever tried after the offset/slope split produced the same shape of
+answer, and it is worth putting them in one table because the shape IS the
+finding:
+
+| knob | helps | hurts |
+|---|---|---|
+| `poll_up_streak` (more packets) | S1 | S8 (RESOLVED) |
+| `weight_floor_ratio` down (single weight) | S1 | S2, S4, S6 (RESOLVED) |
+| `freq_integral_gain` up | — | S8 (RESOLVED) |
+| `offset_age_halflife_s` | S1, S8 (RESOLVED) | S2, S6 (RESOLVED) |
+| `offset_weight_dispersion_k` = 0.15 | S2 (RESOLVED), S4 | S1, S6, S8 (mild) |
+
+Five scalars, five splits. The corpus is not being awkward — the scenarios
+genuinely want opposite things, and a single constant cannot serve a steady
+oscillator and a wandering one, or a path whose jitter is a tenth of its length
+and one whose jitter is four times it.
+
+### The adaptive gate that should have fixed that, and why it did not
+
+If a constant cannot serve both, gate it on which case you are in. Decay is
+right exactly when old samples are STALE, and stale is a property of the
+oscillator — so the register fitted its older and newer halves separately and
+compared the slopes against the standard error of their difference.
+
+Measured across the corpus, that statistic does not discriminate:
+
+```
+       p50    p75    p90    max    fires at K=1.5
+S1    0.49   0.80   1.19   1.98        2.5%
+S2    1.35   1.65   1.91   2.40       38.3%     <- steady frequency, decay HURTS
+S4    1.03   1.78   2.28   3.55       40.9%
+S6    0.78   1.03   1.29   1.98        7.4%
+S8    0.79   1.26   2.26   2.77       20.0%     <- wandering frequency, decay HELPS
+```
+
+It fires nearly **twice as often on S2, whose frequency is constant, as on S8,
+whose frequency is the random walk the test exists to find** — S8's median
+separation sits *below* S2's. No threshold separates them, because on a
+high-jitter path two half-window slopes disagree from measurement noise long
+before any oscillator moves. Removed rather than shipped: a knob named for
+drift detection that actually measures jitter is worse than no knob.
+
+Separating wander from noise needs a statistic that discriminates by **LAG** —
+an Allan variance over successive frequency estimates — not a single window
+split. That is the next real piece of work, and it is a campaign, not a knob.
+
+### The instrument reported a confident verdict on a null arm
+
+`paired_verdict.py` scored ties as losses. Two bit-identical arms therefore read
+
+```
+rusty_time150   0/40 wins  z=-6.32  RESOLVED, rusty_time0 ahead
+```
+
+— a resolved verdict, with a large z, on code that was byte-for-byte the same
+on both sides. It was caught only because the medians and the signed bias
+matched to the last digit, which is what a null arm looks like.
+
+Ties are now discarded (the textbook sign test) and an all-tied comparison
+reports `IDENTICAL`, not a verdict. Every earlier number in this ledger was a
+comparison between arms that genuinely differed, so none of them are affected —
+but the defect would have corrupted the first adaptive result that half-fired,
+which is exactly the case it was introduced for.

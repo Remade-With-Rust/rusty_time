@@ -2374,3 +2374,24 @@ the real default exposed it.
 
 Nothing here is a regression — the code has always behaved this way. What
 changed is that it is now measured.
+
+### Which of these run in CI, and why the other two do not
+
+`refclock_loopback.sh` runs in CI, in the `refclocks` job. It passes, it is
+fast, and it guards an ABI contract with somebody else's program — exactly what
+a standing check is for.
+
+`multisource.sh` and `soak.sh` are **manual**, and deliberately so. Both
+currently FAIL, and a permanently red build teaches a team to ignore the colour.
+They are the reproductions for two open defects, to be run when someone works on
+them and to be added to CI on the commit that fixes them:
+
+```sh
+tools/corpus/multisource.sh 600          # 3 servers, one lying
+MAXPOLL=10 ARM=rusty_time tools/corpus/soak.sh 86400
+MAXPOLL=10 ARM=chrony     tools/corpus/soak.sh 86400   # the control
+```
+
+An untended harness rots, so this is a debt, not a plan. It is written down
+because the alternative — a test nobody runs and nobody remembers — is how the
+maxpoll gap survived eleven releases.

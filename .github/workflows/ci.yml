@@ -169,5 +169,12 @@ jobs:
       - run: cargo build --release -p rusty_time-daemon
       - name: Capability inventory
         run: bash tools/corpus/probe_hw_capabilities.sh
+      - name: Reference clocks, driven by a foreign producer
+        # Reads the SHM segment and SOCK datagram from an independent Python
+        # producer writing the byte layouts gpsd and chrony define. This is the
+        # only thing standing between the refclock ABI and a silent
+        # misinterpretation: a misread segment still yields a number, so a test
+        # that writes its own layout would agree with itself forever.
+        run: RTIMED="$PWD/target/release/rtimed" bash tools/corpus/refclock_loopback.sh
       - name: Reference clock transports
         run: RTIMED=./target/release/rtimed bash tools/corpus/refclock_probe.sh

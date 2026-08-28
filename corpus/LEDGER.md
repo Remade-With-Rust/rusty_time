@@ -2488,3 +2488,91 @@ The behaviour is therefore left exactly as it shipped, the comment now says the
 call is known-questionable rather than claiming there is nothing to undo, and
 the harness stays as the reproduction. **Multi-source remains an open defect and
 the README says so.**
+
+## 0.1.8 — multi-source: the real cause, found by instrumenting instead of patching
+
+The five failed patches above shared one mistake: every one of them assumed the
+defect was in the per-source bookkeeping, and none of them looked. Instrumenting
+the selection call answered it in a single run.
+
+**Selection was returning nothing at all — 74 polls out of 89.** Not "picking
+the liar": picking *nobody*. At t=6.0 the three offsets were
+`[+0.011203, +0.006801, +5.009011]`; the two honest servers sat 4.4 ms apart
+while their root distances were ~100 µs, so their intervals could not overlap
+and no majority existed to be found. Root distance was
+`root_delay/2 + dispersion + delay/2` — a description of how well the PATH is
+known, carrying nothing about how well *our own estimate* is known, which during
+acquisition is milliseconds. The earlier note in this ledger, "two perfect
+servers 70 ms apart", was reading that same symptom and blaming the wrong cause.
+
+Three changes, each measured on its own:
+
+| | worlds within 1 ms | worst final error |
+|---|---|---|
+| baseline (0.1.7) | 4 / 8 | 2996 ms |
+| `+ estimate_sd_s` in the root distance | 5 / 8 | 43 ms |
+| `+ hold the clock when no majority` | 6 / 8 | 25 ms |
+| `+ hold at the APPLIED rate` | **15 / 16** | **58 ms** |
+| chrony, same 16 worlds | 16 / 16 | 0.005 ms |
+
+The third of those was a defect in the second. Holding used
+`sources[index].controller.freq_ppm()` — the source just *polled*, which can be
+the falseticker, whose controller saturates at the −500 ppm slew clamp trying to
+correct its own five-second lie. A hold installed exactly the correction
+selection exists to reject, and walked the clock 53 ms out in two minutes. The
+log said `holding the clock at -500.000 ppm`, which is the kind of number that
+is its own bug report.
+
+**Nothing follows the liar to five seconds any more.** What remains is a
+convergence gap, not a capture.
+
+### Two more attempts, both reverted, and one honest no-op
+
+The revert-the-unselected-plan idea was retried once the baseline had moved —
+a refutation expires when its baseline moves — and scored 3/8 against 5/8.
+Then `adopt_external`: revert this source's fiction *and* book the correction
+that really landed, which is what the "arithmetic must describe what the clock
+did" law demands. **4 of 16, against 15 of 16 for doing nothing.** Seven
+attempts in this family now, all worse.
+
+The hypothesis that survives, stated as a hypothesis: a register holds
+*measured* offsets, and a measurement already contains whatever every source did
+to the clock. Re-tilting it by a correction booked elsewhere counts it twice. If
+that is right, the fix is not bookkeeping — it is ONE discipline loop fed by the
+selected source (chrony's structure) instead of N loops sharing a clock. That is
+a refactor, and it is recorded as the next step rather than half-attempted.
+
+An acquisition quorum was also added: with several servers configured, a lone
+early reply is trivially its own majority, so a falseticker answering first
+could steer the clock until the honest servers arrived. **It did not change the
+rig outcome — 15/16 either way.** It is kept as a safety property with two unit
+tests, not claimed as a fix, because it bought no number.
+
+### Single-source: unchanged, verified rather than argued
+
+Every change above is confined to the selection path, and with one source
+`selected_index` always returns `Some(0)`. That argument is exactly the kind
+this project has been burned by, so it was settled by measurement: the shipped
+0.1.7 binary was rebuilt from `b8f3c83` and run against the current one on S6,
+40 seeded worlds each.
+
+```
+0.1.7    p50 1.0 us  p95 2.0 us  max 4.7 us   13/40  z = -2.21
+current  p50 1.0 us  p95 2.0 us  max 4.7 us   13/40  z = -2.21
+```
+
+Bit-identical, including the verdict. Worth recording plainly: **that verdict is
+RESOLVED, chrony ahead** — 1.0 µs against 0.7 µs median. It is inherited from
+0.1.7, not caused here, and the ledger's earlier "nothing resolved either way"
+no longer holds for S6 at 40 reps. Full gate, 40 reps × 5 scenarios:
+S1 15/40 (z −1.58), S6 13/40 (z −2.21, chrony ahead), S8 14/40 (z −1.90),
+S2 27/40 (z +2.21, rusty_time ahead), S4 20/40 (z ±0.00).
+
+### A self-inflicted one, recorded because the memory already warned about it
+
+A shell heredoc rewriting `sync.rs` died mid-write and truncated the file to
+zero bytes, losing every change in this session's working tree. The saved memory
+`windows-shell-utf8-trap` says to use the Edit/Write tools for source files on
+this box for precisely this reason. The file was restored from `b8f3c83` and all
+changes re-applied with Edit; the rebuilt source reproduces 15/16 and the
+bit-identical S6 above, so nothing was lost but the time.

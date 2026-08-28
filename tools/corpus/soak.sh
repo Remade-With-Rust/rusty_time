@@ -127,9 +127,9 @@ if [ "$ARM" != chrony ]; then
         exit 1
     fi
 fi
-if grep -qiE "panic|giving up|no source selected" "$CLKNETSIM_TMPDIR/log.2" 2>/dev/null; then
+if grep -qiE "panic|giving up|holding the clock" "$CLKNETSIM_TMPDIR/log.2" 2>/dev/null; then
     echo "  daemon reported a problem:"
-    grep -iE "panic|giving up|no source selected" "$CLKNETSIM_TMPDIR/log.2" | head -3 | sed 's/^/    /'
+    grep -iE "panic|giving up|holding the clock" "$CLKNETSIM_TMPDIR/log.2" | head -3 | sed 's/^/    /'
 fi
 
 verdict=$(awk -v r="$ratio" -v g="$GROWTH" \

@@ -190,6 +190,11 @@ struct Source {
     has_estimate: bool,
     exchanges: u64,
     lost: u64,
+    /// Losses since the last successful exchange. Cumulative `lost` cannot
+    /// answer "is this source answering right now", which is what the quorum
+    /// below needs: a source that dropped four packets an hour ago is not
+    /// unreachable.
+    lost_in_a_row: u32,
     /// Whether this source announced a leap second in its last reply. The
     /// indicator is set for the whole UTC day the leap falls in, so it arrives
     /// long before the step does.
@@ -247,6 +252,14 @@ pub fn run(opts: &SyncOptions) -> i32 {
     // success.
     const MAX_REFUSALS: u32 = 10;
     let mut refused_in_a_row: u32 = 0;
+
+    // Whether the clock is being held because the sources disagree. Tracked so
+    // the message appears once per episode rather than once per poll.
+    let mut holding = false;
+    // The frequency the clock is actually running at: the last one a driver
+    // call accepted. Zero until the first correction lands, which is also the
+    // clock's own starting rate.
+    let mut applied_freq_ppm: f64 = 0.0;
 
     let mut drains_retired: u64 = 0;
     let started = Instant::now();
@@ -353,8 +366,18 @@ pub fn run(opts: &SyncOptions) -> i32 {
                             .controller
                             .on_sample_with_leap(mono_now, sample, leap_pending);
                     source.exchanges += 1;
+                    source.lost_in_a_row = 0;
                     source.last_offset_s = step.estimate_offset_s;
-                    source.last_root_distance_s = root_distance;
+                    // Root distance describes how well the PATH is known. On its
+                    // own it says nothing about how well this source's offset is
+                    // known, and during acquisition those differ by orders of
+                    // magnitude — a hundred microseconds of path against
+                    // milliseconds of estimate. Selection compares intervals of
+                    // `offset ± root_distance`, so leaving the estimate's own
+                    // dispersion out makes every interval far too narrow to
+                    // overlap: on the three-server rig a set of perfectly
+                    // healthy servers formed no majority on 74 polls out of 89.
+                    source.last_root_distance_s = root_distance + step.estimate_sd_s;
                     source.last_stratum = stratum;
                     source.has_estimate = true;
                     source.due = Instant::now() + Duration::from_secs_f64(step.plan.next_poll_s);
@@ -398,11 +421,58 @@ pub fn run(opts: &SyncOptions) -> i32 {
                     }
 
                     // Only the selected source drives the clock.
-                    if selected_index(&sources) == Some(index) && !opts.dry_run {
+                    let selected = selected_index(&sources);
+                    // No majority means the sources do not agree on what time it
+                    // is. Hold the clock rather than coast: with nothing selected
+                    // the daemon commands nothing, so the last frequency keeps
+                    // running and the clock walks away from a disagreement it has
+                    // already detected. Refusing to steer is a decision; coasting
+                    // is the absence of one.
+                    //
+                    // A single source always intersects itself, so this never
+                    // fires on a one-server deployment.
+                    match selected {
+                        None if !opts.dry_run => {
+                            if !holding {
+                                eprintln!(
+                                    "rtimed sync: no majority among {n} sources — holding the clock at {applied_freq_ppm:+.3} ppm rather than coasting",
+                                    n = sources.len(),
+                                );
+                                holding = true;
+                            }
+                            // Hold at the rate the clock is ALREADY running, not
+                            // at the freshly polled source's opinion of it.
+                            // `index` is whichever source this iteration happened
+                            // to poll, and that can be the falseticker — whose
+                            // controller saturates at the -500 ppm slew clamp
+                            // trying to correct its own lie. Reading its frequency
+                            // here installed exactly the correction selection
+                            // exists to reject: measured on the three-server rig,
+                            // a hold at -500 ppm walked the clock 53 ms out in two
+                            // minutes.
+                            let hold = ClockCommand::Slew {
+                                freq_ppm: applied_freq_ppm,
+                                drain_offset: 0.0,
+                                drain_rate_ppm: 0.0,
+                            };
+                            if let Err(e) = driver.apply(&hold) {
+                                eprintln!("rtimed sync: holding the clock: {e}");
+                            }
+                        }
+                        Some(_) if holding => {
+                            eprintln!("rtimed sync: majority restored — steering again");
+                            holding = false;
+                        }
+                        _ => {}
+                    }
+                    if selected == Some(index) && !opts.dry_run {
                         match driver.apply(&step.plan.command) {
                             Ok(()) => {
                                 applied_any = true;
                                 refused_in_a_row = 0;
+                                // What the clock is actually running at, which is
+                                // what a later hold must freeze it at.
+                                applied_freq_ppm = sources[index].controller.freq_ppm();
                                 sources[index].controller.confirm_last_plan();
                             }
                             Err(e) => {
@@ -430,23 +500,38 @@ pub fn run(opts: &SyncOptions) -> i32 {
                             println!("rtimed sync: stepped clock by {add_seconds:+.6} s");
                         }
                     } else {
-                        // NOT driving the clock, so this plan never reached it.
+                        // NOT driving the clock, so in principle this plan never
+                        // reached it and these books should be put back.
                         //
-                        // Confirming here is wrong in principle — it cements a
-                        // correction that did not happen — and reverting it,
-                        // which is what principle says, measured WORSE on the
-                        // multi-source rig every time it was tried. The
-                        // interaction is not understood, so the behaviour is
-                        // left exactly as it shipped rather than changed on a
-                        // theory the measurements contradict. See the ledger:
-                        // multi-source selection is a known open defect and
-                        // `tools/corpus/multisource.sh` reproduces it.
+                        // Confirming anyway is what MEASURES best, and the gap
+                        // between that and principle is documented rather than
+                        // closed on a theory. Seven attempts in this family have
+                        // now been measured on the three-server rig and every one
+                        // was worse than leaving it alone: reverting the plan
+                        // (twice before selection itself was fixed, once after),
+                        // propagating the applied frequency, splitting measure
+                        // from control, broadcasting the correction as an offset
+                        // shift, and finally reverting AND adopting the
+                        // correction that really landed — 4 of 16 seeded worlds
+                        // against 15 of 16 for doing nothing.
+                        //
+                        // The likely reason, stated as the hypothesis it is: a
+                        // register holds MEASURED offsets, and a measurement
+                        // already contains whatever every source did to the
+                        // clock. Re-tilting it by a correction booked elsewhere
+                        // counts that correction twice. If that is right the fix
+                        // is not bookkeeping at all — it is ONE discipline loop
+                        // fed by the selected source, which is chrony's
+                        // structure, rather than N loops sharing a clock. That is
+                        // a refactor, and it is recorded as the next step rather
+                        // than half-attempted here.
                         sources[index].controller.confirm_last_plan();
                     }
                 }
                 None => {
                     let source = &mut sources[index];
                     source.lost += 1;
+                    source.lost_in_a_row = source.lost_in_a_row.saturating_add(1);
                     let retry = source.controller.retry_interval_s();
                     source.due = Instant::now() + Duration::from_secs_f64(retry);
                 }
@@ -482,9 +567,40 @@ pub fn run(opts: &SyncOptions) -> i32 {
     0
 }
 
+/// Consecutive lost exchanges after which a source stops counting towards the
+/// quorum below. Without this, one dead server in a configured pair would block
+/// synchronisation forever; with it, the daemon waits a few polls and then
+/// proceeds on whatever is actually answering.
+const UNREACHABLE_AFTER: u32 = 4;
+
 /// Which source should drive the clock, by the same falseticker-rejecting
 /// selection the plan specifies.
 fn selected_index(sources: &[Source]) -> Option<usize> {
+    // QUORUM. Selection is only meaningful against the sources that could
+    // disagree, and during acquisition they have not all replied yet — so the
+    // first source to produce an estimate is trivially its own majority. With
+    // three servers configured, that lets a falseticker which answers first
+    // steer the clock with its lie until the honest two arrive.
+    //
+    // Honest note on this guard: it did NOT change the rig outcome (15 of 16
+    // seeded worlds either way), so it is not a fix for anything measured. It
+    // is here as a safety property — an unverified single source should not
+    // move a clock when the operator configured several precisely so that it
+    // could be cross-checked — and it is kept because it costs nothing, not
+    // because it bought a number.
+    //
+    // A single configured source is exempt: it is its own majority by
+    // definition, and holding out for a quorum of one would only refuse to ever
+    // synchronise.
+    let answering = sources
+        .iter()
+        .filter(|s| s.has_estimate || s.lost_in_a_row < UNREACHABLE_AFTER)
+        .count();
+    let heard = sources.iter().filter(|s| s.has_estimate).count();
+    if answering > 1 && heard * 2 <= answering {
+        return None;
+    }
+
     let estimates: Vec<SourceEstimate> = sources
         .iter()
         .enumerate()
@@ -535,6 +651,7 @@ fn open_source(
         due: Instant::now(),
         last_offset_s: 0.0,
         last_root_distance_s: 1.0,
+        lost_in_a_row: 0,
         last_stratum: 16,
         has_estimate: false,
         exchanges: 0,
@@ -720,6 +837,128 @@ mod tests {
         assert_eq!(opts.discipline.max_poll, 6);
         assert_eq!(opts.discipline.makestep_threshold, Some(1.0));
         assert_eq!(opts.discipline.makestep_limit, 3);
+    }
+
+    /// A source with a given estimate, for the selection tests. The socket is
+    /// bound but never used: selection reads only the last estimate.
+    fn stub(offset_s: f64, root_distance_s: f64) -> Source {
+        Source {
+            name: "stub".into(),
+            socket: UdpSocket::bind("127.0.0.1:0").expect("bind"),
+            controller: SyncController::new(DisciplineConfig::default()),
+            due: Instant::now(),
+            last_offset_s: offset_s,
+            last_root_distance_s: root_distance_s,
+            last_stratum: 1,
+            has_estimate: true,
+            exchanges: 1,
+            lost: 0,
+            lost_in_a_row: 0,
+            leap_pending: false,
+        }
+    }
+
+    #[test]
+    fn one_source_is_always_selected() {
+        // The hold-when-nothing-is-selected path must never fire on a
+        // single-server deployment, which is the common case, and the quorum
+        // must not stall it either. A lone source is its own majority however
+        // wide or narrow its interval is.
+        for rd in [1e-9, 1e-6, 1.0, 1e6] {
+            assert_eq!(
+                selected_index(&[stub(0.123, rd)]),
+                Some(0),
+                "a single source with root distance {rd} was not selected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_falseticker_is_rejected_and_two_honest_sources_still_agree() {
+        // Two good sources 4 ms apart and one liar 5 s out: the shape the
+        // three-server rig produces. The honest pair must form the majority.
+        let sources = [
+            stub(0.011, 0.05),
+            stub(0.007, 0.05),
+            stub(5.009, 0.05), // the falseticker
+        ];
+        let picked = selected_index(&sources).expect("a majority of two exists");
+        assert!(
+            picked < 2,
+            "selection chose the falseticker (index {picked})"
+        );
+    }
+
+    #[test]
+    fn intervals_too_narrow_to_overlap_elect_nobody() {
+        // The defect the root-distance fix addresses, pinned from the other
+        // side: with the estimate's own uncertainty omitted, two HEALTHY
+        // sources a few ms apart have intervals ~100 us wide that cannot
+        // intersect, and a set of perfectly good servers elects nobody.
+        let too_narrow = [stub(0.011, 50e-6), stub(0.007, 50e-6), stub(5.009, 50e-6)];
+        assert_eq!(
+            selected_index(&too_narrow),
+            None,
+            "three mutually disjoint intervals must not produce a majority"
+        );
+        // Widening each interval to cover the real uncertainty in the estimate
+        // — which is what adding estimate_sd_s does — recovers the majority
+        // from exactly the same offsets.
+        let honest = [
+            stub(0.011, 50e-6 + 4e-3),
+            stub(0.007, 50e-6 + 4e-3),
+            stub(5.009, 50e-6 + 4e-3),
+        ];
+        assert!(matches!(selected_index(&honest), Some(i) if i < 2));
+    }
+
+    #[test]
+    fn a_lone_early_reply_cannot_steer_a_three_server_clock() {
+        // Acquisition: only the falseticker has answered so far. It must not
+        // be its own majority, or a five-second lie drives the clock until the
+        // honest servers arrive.
+        let mut sources = [stub(5.0, 0.05), stub(0.0, 0.05), stub(0.0, 0.05)];
+        sources[1].has_estimate = false;
+        sources[2].has_estimate = false;
+        assert_eq!(
+            selected_index(&sources),
+            None,
+            "one source out of three configured must not reach quorum"
+        );
+        // A second reply reaches the quorum but not agreement: one liar and one
+        // honest server is a 1-1 split, and no majority exists to be had.
+        sources[1].has_estimate = true;
+        assert_eq!(
+            selected_index(&sources),
+            None,
+            "a liar and an honest server disagree; neither is a majority"
+        );
+        // The third reply breaks the tie, and the honest pair takes it.
+        sources[2].has_estimate = true;
+        let picked = selected_index(&sources).expect("two honest servers agree");
+        assert!(picked > 0, "selection chose the falseticker");
+    }
+
+    #[test]
+    fn a_source_that_stopped_answering_stops_blocking_the_quorum() {
+        // The other side of the quorum: two configured servers, one of them
+        // dead. Once it has missed enough polls it leaves the denominator, so
+        // the survivor can discipline the clock instead of the daemon waiting
+        // for a quorum that will never form.
+        let mut sources = [stub(0.001, 0.05), stub(0.0, 0.05)];
+        sources[1].has_estimate = false;
+        sources[1].lost_in_a_row = 1;
+        assert_eq!(
+            selected_index(&sources),
+            None,
+            "while the second server may still answer, one of two is not a majority"
+        );
+        sources[1].lost_in_a_row = UNREACHABLE_AFTER;
+        assert_eq!(
+            selected_index(&sources),
+            Some(0),
+            "an unreachable source must not block the one that is answering"
+        );
     }
 
     #[test]

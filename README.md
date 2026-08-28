@@ -85,11 +85,22 @@ day on the drifty-oscillator scenario, last-quarter mean error:
 figure from 1452 µs to 127 µs. A gap remains at long polls; `--maxpoll 6` is
 still the better setting if microseconds matter.
 
-**Multi-source selection is not reliable.** With three servers, one of them
-wrong, the client follows the liar on half of the seeded worlds tried — by as
-much as three seconds, where chrony stays within five microseconds
-(`tools/corpus/multisource.sh`). Use a single known-good source until this is
-fixed. The cause is understood and recorded in the ledger; the fix is not in.
+**Multi-source selection now rejects a falseticker, but is not yet as tight as
+chrony.** Three servers, one of them five seconds wrong
+(`tools/corpus/multisource.sh`), final error after 600 simulated seconds:
+
+| | worlds within 1 ms | worst final error |
+|---|---|---|
+| before `0.1.8` | 4 / 8 | 2996 ms — captured by the liar |
+| `0.1.8` | 15 / 16 | 58 ms |
+| chrony | 16 / 16 | 0.005 ms |
+
+Nothing follows the liar to five seconds any more; what remains is a
+convergence gap, not a capture. **One seeded world in sixteen still ends tens of
+milliseconds out**, so if your deployment needs microseconds from a multi-server
+configuration, a single known-good source is still the tighter choice. The
+remaining cause, the seven fixes measured and rejected on the way here, and the
+refactor that is likely to close it are all in the ledger.
 
 ### Bounding what a source may do to your clock
 

@@ -75,6 +75,18 @@ pub struct ControllerStep {
     /// The estimate that produced the plan, for reporting.
     pub estimate_offset_s: f64,
     pub estimate_freq_ppm: Option<f64>,
+    /// Dispersion of the estimate itself, seconds.
+    ///
+    /// Selection compares intervals of `offset ± root_distance`, and a root
+    /// distance built only from path delay describes how well the NETWORK is
+    /// known while saying nothing about how well this source's own offset is
+    /// known. During acquisition those differ by orders of magnitude: the path
+    /// is a hundred microseconds and the estimate is milliseconds.
+    ///
+    /// Omitting it makes every interval far too narrow to overlap, so a set of
+    /// perfectly healthy servers forms no majority and selection returns
+    /// nothing at all — measured on the three-server rig, 74 polls out of 89.
+    pub estimate_sd_s: f64,
     pub samples_used: usize,
     /// What the maximum-change guard made of this correction. Mirrored out of
     /// the plan so a caller can act on it without matching on the command.
@@ -338,6 +350,7 @@ impl SyncController {
             estimate_offset_s: offset,
             estimate_freq_ppm: freq,
             samples_used: self.register.len(),
+            estimate_sd_s: sd,
             verdict: plan.verdict,
         }
     }

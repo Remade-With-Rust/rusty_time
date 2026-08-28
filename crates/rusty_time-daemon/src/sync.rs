@@ -144,6 +144,11 @@ impl SyncOptions {
                     opts.discipline.max_change_start = start;
                     opts.discipline.max_change_ignore = ignore;
                 }
+                "--corr-time-max" => {
+                    opts.discipline.corr_time_max_s = value()?
+                        .parse()
+                        .map_err(|_| "--corr-time-max: not a number")?;
+                }
                 "--leapsecmode" => {
                     opts.discipline.leap_mode = match value()?.as_str() {
                         "slew" => LeapMode::Slew,
@@ -425,7 +430,17 @@ pub fn run(opts: &SyncOptions) -> i32 {
                             println!("rtimed sync: stepped clock by {add_seconds:+.6} s");
                         }
                     } else {
-                        // Not driving the clock, so there is nothing to undo.
+                        // NOT driving the clock, so this plan never reached it.
+                        //
+                        // Confirming here is wrong in principle — it cements a
+                        // correction that did not happen — and reverting it,
+                        // which is what principle says, measured WORSE on the
+                        // multi-source rig every time it was tried. The
+                        // interaction is not understood, so the behaviour is
+                        // left exactly as it shipped rather than changed on a
+                        // theory the measurements contradict. See the ledger:
+                        // multi-source selection is a known open defect and
+                        // `tools/corpus/multisource.sh` reproduces it.
                         sources[index].controller.confirm_last_plan();
                     }
                 }

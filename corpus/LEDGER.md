@@ -2395,3 +2395,96 @@ MAXPOLL=10 ARM=chrony     tools/corpus/soak.sh 86400   # the control
 An untended harness rots, so this is a debt, not a plan. It is written down
 because the alternative — a test nobody runs and nobody remembers — is how the
 maxpoll gap survived eleven releases.
+
+---
+
+## 0.1.7 — the default configuration, fixed
+
+### The defect the soak found
+
+The corpus had always run `maxpoll 6` (64 s). The shipped default is
+`maxpoll 10` (1024 s). Over a simulated day on the drifty oscillator:
+
+```
+                        rusty_time     chrony
+maxpoll 6                  22.8 us      4.3 us
+maxpoll 10 (default)     1452.5 us     10.0 us
+```
+
+**Every accuracy figure in this ledger had been measured in a configuration the
+daemon does not use.**
+
+### The first explanation was wrong
+
+The obvious cause was the proportional loop: standing offset is
+`F_residual * correction_time`, and the correction time is `ratio * poll`. So
+the correction time was capped, and swept:
+
+```
+cap    1024 s   256 s   128 s    64 s    32 s
+Q4    1452.5  1423.7  1420.0  1418.7  1417.7 us
+```
+
+Thirty-five microseconds across a 32-fold change. **Not the mechanism.** The cap
+is kept — bounding a correction time at a quarter of an hour is right on its own
+terms — but it is not what was wrong.
+
+### What was actually wrong
+
+Looking at the error rather than theorising about it: a slow random walk of
+±2 ms over hours, while chrony held ±45 µs at the same poll rate. Both polled
+102 times. That is not correction lag; it is the frequency estimate failing to
+track a wandering oscillator.
+
+At a 1024 s poll the 64-sample register spans **eighteen hours**, and the
+regression fits one straight line across all of it. Over eighteen hours that
+oscillator's frequency has wandered far more than the line can express.
+
+**The window is now chosen from the data**, by the slope's own standard error —
+`residual_dispersion / sqrt(leverage)`. More samples raise the leverage, so a
+steady oscillator keeps the long window; a wandering one makes the far end fit
+badly, the dispersion climbs faster than the leverage, and a shorter window wins
+on its own. Nothing is tuned to a scenario: the criterion is the quantity the
+frequency estimate is judged on.
+
+```
+                        before      after     chrony
+maxpoll 6              22.8 us    17.9 us     4.3 us
+maxpoll 10           1452.5 us   127.1 us    10.0 us
+```
+
+**11.4x better at the default poll**, and better at the short poll too.
+
+No corpus regression — fifty seeded worlds per scenario, paired against chrony,
+nothing resolved in either direction (S1 25/50, S2 29/50, S4 24/50, S6 22/50,
+S8 29/50), with our median improving on four of the five.
+
+A bug of my own on the way: the candidate loop tried 8, 16, 32 … and never the
+full window, so any candidate beat the initial `INFINITY` and the window always
+narrowed. That is not adaptive, it is just short — and a unit test on a
+twelve-sample register caught it.
+
+### Multi-source: five attempts, all worse, all reverted
+
+The defect is understood and reproduced (`tools/corpus/multisource.sh`, 4 of 8
+seeds fail by up to 3 s; chrony 8 of 8 at 5 µs). The cause is visible in the
+logs: an unselected source's controller books plans that never reach the clock,
+so healthy servers stop agreeing — two perfect servers 70 ms apart.
+
+Five fixes were tried: reverting unselected plans; propagating the applied
+frequency change; splitting measurement from control; broadcasting the
+integrated correction as an offset shift; and that plus the revert. Baseline is
+4 of 8 passing. **Every attempt scored 0 of 8**, several with errors an order of
+magnitude worse than doing nothing.
+
+That is not a fix waiting for one more patch. Five contradictions of the model
+mean the model is wrong, and the honest response is to stop patching and say so.
+The `confirm_last_plan()` on the unselected branch is wrong in principle — it
+cements a correction that never happened — and reverting it, which principle
+demands, measures worse every time. Something else in the interaction is not
+understood.
+
+The behaviour is therefore left exactly as it shipped, the comment now says the
+call is known-questionable rather than claiming there is nothing to undo, and
+the harness stays as the reproduction. **Multi-source remains an open defect and
+the README says so.**

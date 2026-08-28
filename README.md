@@ -73,18 +73,17 @@ comparison uncovered, is in [corpus/LEDGER.md](corpus/LEDGER.md).
 
 ### Two things to read before deploying this
 
-**The accuracy figures above were measured at `maxpoll 6` (64 s). The default is
-`maxpoll 10` (1024 s), and there the loop is far worse.** Over a simulated day
-on the drifty-oscillator scenario, last-quarter mean error:
+**Poll interval matters less than it did, but still matters.** Over a simulated
+day on the drifty-oscillator scenario, last-quarter mean error:
 
 | `maxpoll` | rusty_time | chrony |
 |---|---|---|
-| 6 (64 s) | 22.8 µs | 4.3 µs |
-| **10 (1024 s), the default** | **1452 µs** | **10.0 µs** |
+| 6 (64 s) | 17.9 µs | 4.3 µs |
+| 10 (1024 s), the default | 127 µs | 10.0 µs |
 
-The standing offset of this loop is `F_residual × correction_time`, and the
-correction time scales with the poll interval; chrony's does not. Until that is
-fixed, **configure `--maxpoll 6`** if you care about microseconds.
+`0.1.7` chooses the regression window from the data, which took the default-poll
+figure from 1452 µs to 127 µs. A gap remains at long polls; `--maxpoll 6` is
+still the better setting if microseconds matter.
 
 **Multi-source selection is not reliable.** With three servers, one of them
 wrong, the client follows the liar on half of the seeded worlds tried — by as

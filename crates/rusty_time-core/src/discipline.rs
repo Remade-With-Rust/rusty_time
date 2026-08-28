@@ -103,6 +103,22 @@ pub struct DisciplineConfig {
     /// the stability test that raises the interval is calibrated against a
     /// correction time that now no longer moves with it.
     pub corr_time_s: f64,
+    /// Choose the regression window length from the data. See
+    /// `SampleRegister::set_adaptive_window`.
+    pub adaptive_window: bool,
+    /// Longest a steady-state correction may be spread over, in seconds.
+    ///
+    /// The correction time is `corr_time_ratio * poll`, and the standing offset
+    /// of a proportional loop is `F_residual * correction_time` — so tying it to
+    /// the poll makes the error grow with the poll interval. At a 64 s ceiling
+    /// that is microseconds. At the DEFAULT 1024 s ceiling it is milliseconds,
+    /// which is how a corpus measured entirely at `maxpoll 6` reported parity
+    /// with chrony while the shipped configuration was 145x worse.
+    ///
+    /// Capping it decouples the two. Below the cap nothing changes, so every
+    /// short-poll result stands; above it the loop stops spreading a correction
+    /// over a quarter of an hour merely because that is how often it looks.
+    pub corr_time_max_s: f64,
     /// How to treat a second announced by the upstream source.
     pub leap_mode: LeapMode,
     /// Largest correction this daemon will ever make, in seconds. `None`
@@ -155,6 +171,8 @@ impl Default for DisciplineConfig {
             slope_density_weighting: false,
             corr_time_s: 0.0,
             corr_time_ratio: 0.0,
+            adaptive_window: true,
+            corr_time_max_s: CORR_TIME_MAX_S,
             leap_mode: LeapMode::Slew,
             max_change_s: None,
             max_change_start: 1,
@@ -398,6 +416,13 @@ const FREQ_INTEGRAL_GAIN: f64 = 0.0;
 ///
 /// The value is measured, not chosen — see the sweep in `DisciplineConfig`.
 const POLL_DOWN_NOISE_RATIO: f64 = 10.0;
+
+/// Default ceiling on the steady-state correction time, seconds.
+///
+/// Chosen to sit above every poll interval the corpus exercises (a 64 s poll
+/// gives a 64 s correction time) so short-poll behaviour is untouched, and far
+/// below the 1024 s the default poll ceiling would otherwise produce.
+const CORR_TIME_MAX_S: f64 = 128.0;
 
 /// How large a correction an announced leap second may excuse.
 ///
@@ -776,7 +801,7 @@ impl Discipline {
             let corr_time = if self.cfg.corr_time_s > 0.0 {
                 self.cfg.corr_time_s
             } else {
-                ratio * poll_s
+                (ratio * poll_s).min(self.cfg.corr_time_max_s)
             };
             (offset.abs() / corr_time) * 1e6
         };

@@ -18,9 +18,42 @@ use crate::filter::{Sample, SampleRegister};
 /// How many samples one source keeps.
 pub const REGISTER_CAPACITY: usize = 64;
 
-/// Drives one source's samples into clock commands.
-pub struct SyncController {
-    register: SampleRegister,
+/// One source's estimate of the clock, as the selection algorithm sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Estimate {
+    pub offset_s: f64,
+    pub freq_ppm: Option<f64>,
+    /// Dispersion of the estimate itself — how well this source knows the
+    /// offset, as opposed to how well it knows the path.
+    pub sd_s: f64,
+    pub samples: usize,
+}
+
+/// Several sources, **one clock loop**.
+///
+/// This is the structural fix for multi-source selection, and it is worth
+/// stating why the obvious alternative does not work. The daemon used to give
+/// every source its own [`SyncController`] — its own register *and* its own
+/// frequency, drain and budget — and let only the selected one reach the clock.
+/// That leaves every unselected source having produced a plan that never
+/// happened, and seven different ways of cleaning up after that plan were
+/// measured on the three-server rig. Every one was worse than leaving the
+/// wrong books in place, which is the signature of a wrong model rather than a
+/// wrong patch.
+///
+/// The model was wrong. A frequency correction, a drain and its budget are
+/// properties of THE CLOCK, of which there is one; only the sample history is a
+/// property of a source. So the registers are per-source and everything else is
+/// shared, and an unselected source never produces a plan in the first place —
+/// there is nothing to revert, confirm or adopt, because nothing was ever
+/// booked. The entire class of bug is gone rather than patched.
+///
+/// With one source this is arithmetically identical to what shipped before it,
+/// which is checked by running the corpus against the previous binary.
+pub struct MultiController {
+    /// Per source: the measurement history. Nothing here steers anything.
+    registers: Vec<SampleRegister>,
+    /// Shared: the one loop that decides what the clock is told.
     discipline: Discipline,
     /// The *permanent* frequency correction currently commanded.
     freq_cmd_ppm: f64,
@@ -50,6 +83,15 @@ pub struct SyncController {
     drain_remaining_s: f64,
     /// Monotonic time of the last plan, for working out how much drain ran.
     last_plan_mono_s: Option<f64>,
+    /// Monotonic time up to which the running drain has already been booked
+    /// against the registers.
+    ///
+    /// Separate from `last_plan_mono_s` because with several sources a poll no
+    /// longer implies a plan: an unselected source's exchange advances the
+    /// measurement history without steering anything, and the drain that ran in
+    /// the meantime still has to be booked exactly once. With one source the
+    /// two move together and the arithmetic is unchanged.
+    drain_booked_until: Option<f64>,
     /// What the last plan changed, so it can be undone if the driver refused it.
     unapplied: Option<Unapplied>,
 }
@@ -93,24 +135,27 @@ pub struct ControllerStep {
     pub verdict: ChangeVerdict,
 }
 
-impl SyncController {
-    pub fn new(config: DisciplineConfig) -> Self {
-        SyncController {
-            register: {
-                let mut r = SampleRegister::new(REGISTER_CAPACITY);
-                r.set_weight_floor_ratio(config.weight_floor_ratio);
-                r.set_offset_weight_floor_ratio(config.offset_weight_floor_ratio);
-                r.set_offset_age_halflife_s(config.offset_age_halflife_s);
-                r.set_offset_weight_dispersion_k(config.offset_weight_dispersion_k);
-                r.set_slope_density_weighting(config.slope_density_weighting);
-                r.set_adaptive_window(config.adaptive_window);
-                r
-            },
+fn new_register(config: &DisciplineConfig) -> SampleRegister {
+    let mut r = SampleRegister::new(REGISTER_CAPACITY);
+    r.set_weight_floor_ratio(config.weight_floor_ratio);
+    r.set_offset_weight_floor_ratio(config.offset_weight_floor_ratio);
+    r.set_offset_age_halflife_s(config.offset_age_halflife_s);
+    r.set_offset_weight_dispersion_k(config.offset_weight_dispersion_k);
+    r.set_slope_density_weighting(config.slope_density_weighting);
+    r.set_adaptive_window(config.adaptive_window);
+    r
+}
+
+impl MultiController {
+    pub fn new(config: DisciplineConfig, sources: usize) -> Self {
+        MultiController {
+            registers: (0..sources.max(1)).map(|_| new_register(&config)).collect(),
             discipline: Discipline::new(config),
             freq_cmd_ppm: 0.0,
             drain_ppm: 0.0,
             drain_remaining_s: 0.0,
             last_plan_mono_s: None,
+            drain_booked_until: None,
             unapplied: None,
         }
     }
@@ -135,9 +180,12 @@ impl SyncController {
         let Some(u) = self.unapplied.take() else {
             return false;
         };
-        // Exact inverse of what `on_sample` applied, in the opposite order.
-        self.register
-            .slew_samples(u.mono_s, -u.dfreq_ppm, -u.step_s);
+        // Exact inverse of what the plan applied. Every register was tilted by
+        // it — the correction was to the shared clock they all measure — so
+        // every register is put back.
+        for r in &mut self.registers {
+            r.slew_samples(u.mono_s, -u.dfreq_ppm, -u.step_s);
+        }
         self.freq_cmd_ppm = u.freq_cmd_before;
         self.drain_ppm = u.drain_ppm_before;
         self.drain_remaining_s = u.drain_remaining_before;
@@ -165,8 +213,24 @@ impl SyncController {
         self.discipline.poll_log2()
     }
 
+    /// The loop's current poll interval, in seconds.
+    ///
+    /// A source that is not steering still has to be scheduled, and the poll
+    /// interval belongs to the loop rather than to any one source.
+    pub fn poll_interval_s(&self) -> f64 {
+        (2.0f64).powi(self.discipline.poll_log2() as i32)
+    }
+
     pub fn samples(&self) -> usize {
-        self.register.len()
+        self.registers[0].len()
+    }
+
+    pub fn samples_from(&self, index: usize) -> usize {
+        self.registers[index].len()
+    }
+
+    pub fn sources(&self) -> usize {
+        self.registers.len()
     }
 
     /// Seed the frequency estimate from persisted drift, so a restart does not
@@ -201,7 +265,7 @@ impl SyncController {
         if mono_now_s < completes_at {
             return None;
         }
-        let last = self.last_plan_mono_s?;
+        let last = self.drain_booked_until?;
 
         // Book what the clock ACTUALLY received, not the budget.
         //
@@ -221,16 +285,187 @@ impl SyncController {
         // did, not what it was asked to do.
         let consumed = self.drain_ppm * 1e-6 * (mono_now_s - last).max(0.0);
         if consumed != 0.0 {
-            self.register.slew_samples(mono_now_s, 0.0, consumed);
+            for r in &mut self.registers {
+                r.slew_samples(mono_now_s, 0.0, consumed);
+            }
         }
         self.drain_ppm = 0.0;
         self.drain_remaining_s = 0.0;
         self.last_plan_mono_s = Some(mono_now_s);
+        self.drain_booked_until = Some(mono_now_s);
         Some(ClockCommand::Slew {
             freq_ppm: self.freq_cmd_ppm,
             drain_offset: 0.0,
             drain_rate_ppm: 0.0,
         })
+    }
+
+    /// Book the drain that has actually run against every register.
+    ///
+    /// Split out of the plan path because with several sources a poll no longer
+    /// implies a plan, and the drain still has to be booked exactly once, on
+    /// every register, whether or not this exchange steers anything.
+    ///
+    /// Deliberately NOT capped by the remaining budget. If the drain ran out it
+    /// was already retired by `poll_drain`, which booked it exactly and zeroed
+    /// the rate, so this reads zero. If it did not run out, it was slewing for
+    /// the whole interval and delivered every bit of it. Capping here books
+    /// less correction than the clock actually received, and the regression
+    /// reads the difference as drift: it settled the frequency estimate about
+    /// 1 ppm off true, which at a 32 s poll is a permanent ~200 us offset. S6
+    /// measured 136 us against chrony's 2.5 us until this cap came out.
+    fn settle_drain(&mut self, mono_now_s: f64) {
+        let drained = match self.drain_booked_until {
+            Some(last) if self.drain_ppm != 0.0 => {
+                self.drain_ppm * 1e-6 * (mono_now_s - last).max(0.0)
+            }
+            _ => 0.0,
+        };
+        if drained != 0.0 {
+            for r in &mut self.registers {
+                r.slew_samples(mono_now_s, 0.0, drained);
+            }
+            self.drain_remaining_s = (self.drain_remaining_s - drained.abs()).max(0.0);
+        }
+        if self.drain_booked_until.is_some() {
+            self.drain_booked_until = Some(mono_now_s);
+        }
+    }
+
+    /// Record one exchange from one source. **Measurement only** — this never
+    /// touches the clock, so calling it for a source that is not selected costs
+    /// nothing and leaves nothing to undo.
+    pub fn observe(&mut self, index: usize, mono_now_s: f64, sample: Sample) -> Estimate {
+        self.settle_drain(mono_now_s);
+        self.registers[index].push(sample);
+        self.estimate(index, mono_now_s)
+    }
+
+    /// This source's current view of the clock.
+    ///
+    /// Regression once it has enough spread; before that the lowest-delay
+    /// single sample, which is the least contaminated reading available.
+    pub fn estimate(&mut self, index: usize, mono_now_s: f64) -> Estimate {
+        let samples = self.registers[index].len();
+        match self.registers[index].regress(mono_now_s) {
+            Some(e) => Estimate {
+                offset_s: e.offset,
+                freq_ppm: e.freq_ppm,
+                sd_s: e.offset_sd.max(1e-7),
+                samples,
+            },
+            None => match self.registers[index].best() {
+                Some(best) => Estimate {
+                    offset_s: best.offset,
+                    freq_ppm: None,
+                    sd_s: (best.delay / 2.0).max(1e-7),
+                    samples,
+                },
+                None => Estimate {
+                    offset_s: 0.0,
+                    freq_ppm: None,
+                    sd_s: 1e-3,
+                    samples,
+                },
+            },
+        }
+    }
+
+    /// Steer the clock from one source's estimate.
+    ///
+    /// Call this for the SELECTED source only, passing the [`Estimate`] that
+    /// [`MultiController::observe`] just returned. Its effects are booked
+    /// against every register, because the correction lands on the one clock
+    /// they all measure.
+    ///
+    /// Taking the estimate rather than re-deriving it is not tidiness: the
+    /// regression is the expensive part of a step, and computing it in
+    /// `observe` and again here doubled the cost of the whole discipline —
+    /// measured 13,614 to 26,169 Ir per step.
+    pub fn steer(&mut self, est: Estimate, mono_now_s: f64, leap_pending: bool) -> ControllerStep {
+        let (offset, freq, sd) = (est.offset_s, est.freq_ppm, est.sd_s);
+
+        let plan = self
+            .discipline
+            .on_estimate_with_leap(offset, freq, sd, leap_pending);
+        let freq_cmd_new = self.discipline.freq_ppm();
+        // Captured before the books move, so `revert_last_plan` can put them
+        // back exactly if the clock command is refused.
+        let freq_cmd_before = self.freq_cmd_ppm;
+        let drain_ppm_before = self.drain_ppm;
+        let drain_remaining_before = self.drain_remaining_s;
+
+        // A step moves the clock at once and a frequency change tilts it from
+        // here on; either way the stored history is re-expressed in the new
+        // clock's terms rather than discarded. The new drain is accounted when
+        // it has actually run, by `settle_drain`.
+        let dfreq_ppm = freq_cmd_new - self.freq_cmd_ppm;
+        let step_s = match plan.command {
+            ClockCommand::Step { add_seconds } => add_seconds,
+            ClockCommand::Slew { .. } => 0.0,
+        };
+        match plan.command {
+            ClockCommand::Step { .. } => {
+                self.drain_ppm = 0.0;
+                self.drain_remaining_s = 0.0;
+            }
+            ClockCommand::Slew {
+                drain_offset,
+                drain_rate_ppm,
+                ..
+            } => {
+                self.drain_ppm = drain_rate_ppm.copysign(drain_offset);
+                // The budget: this drain stops once it has moved the clock by
+                // this much, whatever the poll interval says.
+                self.drain_remaining_s = drain_offset.abs();
+            }
+        }
+        // EVERY register, not just the one that produced the plan. This is the
+        // whole point of the shared loop: the correction reaches the clock all
+        // of them are measuring, so all of their histories move with it.
+        for r in &mut self.registers {
+            r.slew_samples(mono_now_s, dfreq_ppm, step_s);
+        }
+
+        self.freq_cmd_ppm = freq_cmd_new;
+        self.last_plan_mono_s = Some(mono_now_s);
+        self.drain_booked_until = Some(mono_now_s);
+        // Remember enough to undo all of the above if the driver refuses it.
+        self.unapplied = Some(Unapplied {
+            mono_s: mono_now_s,
+            dfreq_ppm,
+            step_s,
+            freq_cmd_before,
+            drain_ppm_before,
+            drain_remaining_before,
+        });
+
+        ControllerStep {
+            plan,
+            applied_ppm: self.freq_cmd_ppm + self.drain_ppm,
+            estimate_offset_s: offset,
+            estimate_freq_ppm: freq,
+            samples_used: est.samples,
+            estimate_sd_s: sd,
+            verdict: plan.verdict,
+        }
+    }
+}
+
+/// One source driving one clock — the single-source case, and the type the
+/// simulator and every existing caller use.
+///
+/// A thin facade over [`MultiController`] with exactly one register, so there
+/// is one implementation of the loop rather than two that can drift apart.
+pub struct SyncController {
+    inner: MultiController,
+}
+
+impl SyncController {
+    pub fn new(config: DisciplineConfig) -> Self {
+        SyncController {
+            inner: MultiController::new(config, 1),
+        }
     }
 
     /// Feed one completed exchange and get the resulting plan.
@@ -249,110 +484,42 @@ impl SyncController {
         sample: Sample,
         leap_pending: bool,
     ) -> ControllerStep {
-        // Account for the drain that actually ran since the last plan. It is a
-        // *consumed offset correction*, so it leaves the stored history as an
-        // offset and the regression slope keeps measuring frequency alone.
-        // What the drain actually delivered since the last plan.
-        //
-        // Deliberately NOT capped by the remaining budget. If the drain ran out
-        // it was already retired by `poll_drain`, which booked it exactly and
-        // zeroed the rate, so this reads zero. If it did not run out, it was
-        // slewing for the whole interval and delivered every bit of it.
-        // Capping here books less correction than the clock actually received,
-        // and the regression reads the difference as drift: it settled the
-        // frequency estimate about 1 ppm off true, which at a 32 s poll is a
-        // permanent ~200 us offset. S6 measured 136 us against chrony's 2.5 us
-        // until this cap came out.
-        let drained = match self.last_plan_mono_s {
-            Some(last) if self.drain_ppm != 0.0 => {
-                self.drain_ppm * 1e-6 * (mono_now_s - last).max(0.0)
-            }
-            _ => 0.0,
-        };
-        if drained != 0.0 {
-            self.register.slew_samples(mono_now_s, 0.0, drained);
-            self.drain_remaining_s = (self.drain_remaining_s - drained.abs()).max(0.0);
-        }
+        let est = self.inner.observe(0, mono_now_s, sample);
+        self.inner.steer(est, mono_now_s, leap_pending)
+    }
 
-        self.register.push(sample);
-
-        // Regression once it has enough spread; before that the lowest-delay
-        // single sample, which is the least contaminated reading available.
-        let (offset, freq, sd) = match self.register.regress(mono_now_s) {
-            Some(estimate) => (
-                estimate.offset,
-                estimate.freq_ppm,
-                estimate.offset_sd.max(1e-7),
-            ),
-            None => match self.register.best() {
-                Some(best) => (best.offset, None, (best.delay / 2.0).max(1e-7)),
-                None => (0.0, None, 1e-3),
-            },
-        };
-
-        let plan = self
-            .discipline
-            .on_estimate_with_leap(offset, freq, sd, leap_pending);
-        let freq_cmd_new = self.discipline.freq_ppm();
-        // Captured before the books move, so `revert_last_plan` can put them
-        // back exactly if the clock command is refused.
-        let freq_cmd_before = self.freq_cmd_ppm;
-        let drain_ppm_before = self.drain_ppm;
-        let drain_remaining_before = self.drain_remaining_s;
-
-        match plan.command {
-            ClockCommand::Step { add_seconds } => {
-                // A step moves the clock at once; history is re-expressed in
-                // the new clock's terms rather than discarded.
-                self.register.slew_samples(
-                    mono_now_s,
-                    freq_cmd_new - self.freq_cmd_ppm,
-                    add_seconds,
-                );
-                self.drain_ppm = 0.0;
-                self.drain_remaining_s = 0.0;
-            }
-            ClockCommand::Slew {
-                drain_offset,
-                drain_rate_ppm,
-                ..
-            } => {
-                // The permanent frequency change tilts history now; the new
-                // drain is accounted when it has actually run, at the top of
-                // the next call.
-                self.register
-                    .slew_samples(mono_now_s, freq_cmd_new - self.freq_cmd_ppm, 0.0);
-                self.drain_ppm = drain_rate_ppm.copysign(drain_offset);
-                // The budget: this drain stops once it has moved the clock by
-                // this much, whatever the poll interval says.
-                self.drain_remaining_s = drain_offset.abs();
-            }
-        }
-
-        self.freq_cmd_ppm = freq_cmd_new;
-        self.last_plan_mono_s = Some(mono_now_s);
-        // Remember enough to undo all of the above if the driver refuses it.
-        self.unapplied = Some(Unapplied {
-            mono_s: mono_now_s,
-            dfreq_ppm: freq_cmd_new - freq_cmd_before,
-            step_s: match plan.command {
-                ClockCommand::Step { add_seconds } => add_seconds,
-                ClockCommand::Slew { .. } => 0.0,
-            },
-            freq_cmd_before,
-            drain_ppm_before,
-            drain_remaining_before,
-        });
-
-        ControllerStep {
-            plan,
-            applied_ppm: self.freq_cmd_ppm + self.drain_ppm,
-            estimate_offset_s: offset,
-            estimate_freq_ppm: freq,
-            samples_used: self.register.len(),
-            estimate_sd_s: sd,
-            verdict: plan.verdict,
-        }
+    pub fn revert_last_plan(&mut self) -> bool {
+        self.inner.revert_last_plan()
+    }
+    pub fn confirm_last_plan(&mut self) {
+        self.inner.confirm_last_plan()
+    }
+    pub fn freq_ppm(&self) -> f64 {
+        self.inner.freq_ppm()
+    }
+    pub fn drain_ppm(&self) -> f64 {
+        self.inner.drain_ppm()
+    }
+    pub fn applied_ppm(&self) -> f64 {
+        self.inner.applied_ppm()
+    }
+    pub fn poll_log2(&self) -> i8 {
+        self.inner.poll_log2()
+    }
+    pub fn samples(&self) -> usize {
+        self.inner.samples()
+    }
+    pub fn preload_frequency(&mut self, freq_ppm: f64) {
+        self.inner.preload_frequency(freq_ppm)
+    }
+    pub fn retry_interval_s(&self) -> f64 {
+        self.inner.retry_interval_s()
+    }
+    pub fn drain_completes_at(&self) -> Option<f64> {
+        self.inner.drain_completes_at()
+    }
+    pub fn poll_drain(&mut self, mono_now_s: f64) -> Option<ClockCommand> {
+        self.inner.poll_drain(mono_now_s)
     }
 }
 

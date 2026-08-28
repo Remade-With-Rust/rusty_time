@@ -2576,3 +2576,123 @@ zero bytes, losing every change in this session's working tree. The saved memory
 this box for precisely this reason. The file was restored from `b8f3c83` and all
 changes re-applied with Edit; the rebuilt source reproduces 15/16 and the
 bit-identical S6 above, so nothing was lost but the time.
+
+## 0.1.9 — one loop per clock: multi-source closed, and the estimator's criterion corrected
+
+Two results, one structural and one statistical.
+
+### Multi-source: 4/8 → 16/16, matching chrony
+
+The previous entry recorded seven failed bookkeeping fixes and named the
+refactor as the next step. Doing it took the rig from 15/16 to **16 of 16
+seeded worlds within 1 ms, worst final error 0.004 ms** — against chrony's
+16/16 at 0.005 ms.
+
+The model was the bug, exactly as the seventh failure suggested. Every source
+ran its own `SyncController`: its own register *and* its own frequency, drain
+and drain budget, with only the selected source's command allowed to reach the
+clock. That guarantees every unselected source has booked a correction that
+never happened, and there is no way to clean that up correctly, because the
+clock it is modelling *was* being corrected — by somebody else.
+
+A frequency correction, a drain and its budget are properties of **the clock**,
+of which there is one. Only the sample history is a property of a source. So:
+
+    MultiController { registers: Vec<SampleRegister>,  // per source
+                      discipline, freq_cmd_ppm, drain_ppm, drain_remaining_s }
+
+An unselected source now calls `observe` — measurement only — and never produces
+a plan at all. There is nothing to revert, confirm or adopt because nothing was
+ever booked. The whole class of bug is gone rather than patched, and two hazards
+went with it: the per-source drain loop that had to withhold commands so a
+falseticker could not impose its frequency when its own drain expired, and the
+separately-tracked "rate the clock is actually running at", which is now simply
+`ctl.freq_ppm()`.
+
+`SyncController` remains as a one-register facade over the same type, so the
+simulator and the daemon still run one implementation.
+
+**Single-source is unchanged, and that was measured rather than argued.** The
+full gate, 40 reps × 5 scenarios, is bit-identical across the refactor: S1
+0.8 µs 15/40, S6 1.0 µs 13/40, S8 9.1 µs 14/40, S2 6.491 ms 27/40, S4 1.323 ms
+20/40 — every median, p95, max and win count the same.
+
+### The window criterion was optimising the wrong statistic
+
+The adaptive window minimised `residual_sd / sqrt(sxx)` — the standard error of
+the **slope**. What reaches the clock is the **offset**, whose standard error is
+
+    se(now) = residual_sd * sqrt( 1/W + (now - t0)^2 / sxx )
+
+with a `1/W` term the slope's has not: it rewards averaging more samples. One
+window cannot be optimal for both quantities, and this was optimising the one
+that is not measured.
+
+| 40 reps ×5 | slope SE (0.1.7) | offset SE (0.1.9) |
+|---|---|---|
+| S1 | 0.8 µs, 15/40 | 0.8 µs, 16/40 |
+| S6 | 1.0 µs, 13/40 **z −2.21 behind** | **0.8 µs, 16/40, level** |
+| S8 | 9.1 µs, 14/40 (z −1.90) | **4.3 µs, 19/40, level** |
+| S2 | 6.491 ms, 27/40 **z +2.21 ahead** | 6.601 ms, 24/40, level |
+| S4 | 1.323 ms, 20/40 | 1.414 ms, 19/40 |
+
+Wins 89/200 → 94/200. **S8 halved and S6 stopped being resolved-behind**; the
+cost is S2 losing its resolved-ahead status. Recorded as the trade it is.
+
+Instruction cost: **13,613.4 Ir/step against 0.1.7's 13,614.0** — free. It was
+not free at first: `observe` computed the regression and `steer` recomputed it,
+running the estimate twice per sample for **26,169 Ir/step**. `steer` now takes
+the `Estimate` the caller already has. Behaviour checksum unchanged either way,
+so that was pure waste, and it would have shipped invisibly without the Ir
+harness. (The ledger had also never recorded 0.1.7's own figure: the adaptive
+window took 10,328 → 13,614, +32%. Noted now.)
+
+### S6 above chrony: NOT achieved, and here is what the number is made of
+
+The target was to beat chrony on S6. S6 went from **resolved behind (13/40,
+z −2.21)** to **level (16/40, z −1.26)**, p50 1.0 → 0.8 µs against chrony's 0.7.
+It is not ahead.
+
+Six levers were measured and refuted, all against the new estimator:
+
+| lever | result |
+|---|---|
+| correction-time ratio, 0.5→2.0 | p50 flat at 0.8 µs across a 4× sweep |
+| offset age half-life, 1024/2048/4096 (40 reps) | 14–17/40, p50 0.8 everywhere |
+| slope weight floor, 0.03→0.25 | default 0.125 best; the old refutation survives the new baseline |
+| offset weight floor, 0.008→0.125 | default 0.03125 best |
+| integral trim (`--freq-integral-gain`) | S8 5.2→5.8 µs AND S6 convergence 14 s → 101–154 s |
+| separate slope window | p50 identical on S1/S6/S8; 96/200 vs 94/200, inside the noise |
+| window hysteresis (0.9 margin) | 91/200, net worse |
+
+The integral trim is worth a note: its own comment said "kept as a field so
+re-testing costs one flag **if the estimator's own bias ever shrinks**". The
+estimator did change, so it was re-tested — and refuted again, with a new
+reason the first rejection had not seen (it wrecks cold-start convergence).
+
+**Why none of them worked**, from folding the last-quarter error against
+position in the 64 s poll cycle:
+
+```
+                mean signed error by phase (µs)      between-phase variance
+  rusty_time    0.596 0.596 0.597 ... 0.596                0.0%
+  chrony        0.470 0.465 0.463 ... 0.471                0.1%
+```
+
+There is **no sawtooth** — inter-poll drift is not the residual, which kills the
+"residual frequency error" hypothesis outright. The last-quarter error is a
+near-constant **bias**: ours +0.596 µs, chrony's +0.470 µs, with near-identical
+noise (sd 0.14 vs 0.13 µs). The entire S6 gap is **0.13 µs of estimator bias**,
+and the loop cannot see it — the daemon's own offset estimate reads ±0.3 µs
+while the true error is +0.6 µs. No loop knob can remove a bias in the
+measurement feeding it, which is precisely why all six sweeps read flat.
+
+Where it plausibly comes from: at 64 s polls the register holds ~57 samples
+spanning ~3600 s, so the fit is extrapolated **~1800 s** forward from its
+weighted mean time. A slope bias of 0.0003 ppm over that lever is 0.54 µs — the
+right size. Shortening the lever via age decay is the obvious response and was
+measured flat (above), because a variance-based criterion always re-picks the
+long window: it can see the slope's variance and cannot see its bias.
+
+Closing that needs a criterion with a bias signal in it, not another sweep.
+Recorded as the open item, with the measurement that will falsify it.

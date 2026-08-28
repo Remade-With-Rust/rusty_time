@@ -668,8 +668,27 @@ impl SampleRegister {
             // beat it. Starting from infinity meant any candidate won by
             // default and the window always narrowed — which is not adaptive,
             // it is just short.
+            // The criterion is the standard error of the PREDICTED OFFSET at
+            // `now`, not of the slope.
+            //
+            //     se(now) = residual_sd * sqrt( 1/W + (now - t0)^2 / sxx )
+            //
+            // The slope's standard error, which this used, answers "how well do
+            // we know the frequency". That is the wrong question for steady
+            // state: what reaches the clock is the offset, and its error has a
+            // second term the slope's does not — the 1/W that rewards simply
+            // averaging more samples. Optimising the slope's error picks
+            // windows good for frequency and merely tolerable for offset.
+            let se_offset = |rows: &[Row], f: &Fit| {
+                let dt = now - f.t0;
+                residual_sd(rows, f) * (1.0 / f.sw + dt * dt / f.sxx).sqrt()
+            };
+            // Seeded with the FULL window, so a shorter one has to actually
+            // beat it. Starting from infinity meant any candidate won by
+            // default and the window always narrowed — which is not adaptive,
+            // it is just short.
             let mut best = match wls_fit(&used) {
-                Some(f) if f.sxx > 0.0 => residual_sd(&used, &f) / f.sxx.sqrt(),
+                Some(f) if f.sxx > 0.0 && f.sw > 0.0 => se_offset(&used, &f),
                 _ => f64::INFINITY,
             };
             let mut best_len = used.len();
@@ -678,10 +697,9 @@ impl SampleRegister {
                 let tail = &used[used.len() - len..];
                 if let Some(f) = wls_fit(tail)
                     && f.sxx > 0.0
+                    && f.sw > 0.0
                 {
-                    // Standard error of the slope. Long windows win on
-                    // leverage until their residuals say the line is wrong.
-                    let se = residual_sd(tail, &f) / f.sxx.sqrt();
+                    let se = se_offset(tail, &f);
                     if se < best {
                         best = se;
                         best_len = len;
@@ -1051,6 +1069,10 @@ struct Fit {
     /// this, which is what makes a long window worth having — and what makes
     /// one worth abandoning when the residuals grow.
     sxx: f64,
+    /// Total weight in the fit. With `sxx` this gives the standard error of the
+    /// PREDICTED OFFSET rather than of the slope, which is the quantity the
+    /// steady-state error is actually made of.
+    sw: f64,
 }
 
 /// Weighted least squares over rows that already carry their weight.
@@ -1086,7 +1108,7 @@ fn wls_fit(samples: &[Row]) -> Option<Fit> {
     let b = if sxx > 1e-12 { sxy / sxx } else { 0.0 };
     let a = sy / sw; // intercept at t0 (x is centered)
 
-    Some(Fit { a, b, t0, sxx })
+    Some(Fit { a, b, t0, sxx, sw })
 }
 
 /// Weighted residual standard deviation of a fit over its window.

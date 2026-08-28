@@ -45,18 +45,20 @@ sign test across rounds, not from comparing two medians.
 | gate | result |
 |---|---|
 | **G4 server throughput** | **MET.** 138,664 replies/s vs chrony's 105,668 (**1.31×**) at **0.72×** the CPU per reply, both resolved far outside the null-arm floor. |
-| **G2 convergence** | **Mixed.** S1 and S8 reach 1 ms in **5 s** against chrony's 7 s, and S4 (10% loss) reaches it at **1138 s** where chrony does not inside the run; S6 (500 ms cold start) takes **14–16 s** against chrony's 12 s. |
-| **G1 accuracy** | **Not met — one win, one loss, three level.** 150 seeded worlds per scenario, paired: **S2 ours** (z=+2.78), **S6 chrony's** (z=−2.61), S1/S4/S8 unresolved. Ahead **per packet spent** on S1, S2 and S8 — chrony's accuracy for fewer packets. |
+| **G2 convergence** | **Mixed.** S1 and S8 reach 1 ms in **5 s** against chrony's 7 s, and S4 (10% loss) reaches it at **1300 s** where chrony takes 1704 s; S6 (500 ms cold start) takes **14–16 s** against chrony's 12 s. |
+| **G1 accuracy** | **Not met — level on all five.** 40 seeded worlds per scenario, paired: nothing resolved either way (S1 16/40, S6 16/40, S8 19/40, S2 24/40, S4 20/40). Ahead **per packet spent** on S1, S2 and S8 — chrony's accuracy for fewer packets. |
 | G3, G5, G6 | not measured; nothing claimed. |
 
-Whole-run p50, five seeded reps, chrony → rusty_time: S1 1.4 → **0.8 µs**,
-S4 3.927 → **1.082 ms**, S6 1.4 → **0.9 µs**, S8 5.1 → **3.5 µs**, S2
-**6.662** → 6.729 ms. That window includes the convergence transient, which is
-why it reads differently from the steady-state row above; the two measure
-different things and neither supersedes the other.
+Steady-state p50 (last quarter), 40 seeded worlds, chrony vs rusty_time:
+S1 0.6 → 0.8 µs, S6 0.7 → 0.8 µs, S8 3.3 → **4.3 µs**, S2 6.642 → **6.601 ms**,
+S4 1.402 → **1.383 ms**. `0.1.9` chooses the regression window by the standard
+error of the **predicted offset** rather than of the slope, which took S8 from
+9.1 to 4.3 µs and S6 from 1.0 to 0.8 µs; S6 and S8 were both *resolved behind*
+chrony before that and are now level.
 
 Instruction cost, deterministic and internal (not a chrony comparison):
-**237 Ir per served request**, **13,469 Ir per client discipline step**.
+**237 Ir per served request**, **13,613 Ir per client discipline step** — within
+1 Ir of `0.1.7` despite the multi-source rework.
 
 Three honest notes. Earlier per-scenario accuracy wins reported here were
 **withdrawn**: they came from comparing medians on a rig whose unchanged control
@@ -85,22 +87,24 @@ day on the drifty-oscillator scenario, last-quarter mean error:
 figure from 1452 µs to 127 µs. A gap remains at long polls; `--maxpoll 6` is
 still the better setting if microseconds matter.
 
-**Multi-source selection now rejects a falseticker, but is not yet as tight as
-chrony.** Three servers, one of them five seconds wrong
-(`tools/corpus/multisource.sh`), final error after 600 simulated seconds:
+**Multi-source selection matches chrony.** Three servers, one of them five
+seconds wrong (`tools/corpus/multisource.sh`), final error after 600 simulated
+seconds:
 
 | | worlds within 1 ms | worst final error |
 |---|---|---|
-| before `0.1.8` | 4 / 8 | 2996 ms — captured by the liar |
-| `0.1.8` | 15 / 16 | 58 ms |
+| `0.1.7` | 4 / 8 | 2996 ms — captured by the liar |
+| `0.1.9` | **16 / 16** | **0.004 ms** |
 | chrony | 16 / 16 | 0.005 ms |
 
-Nothing follows the liar to five seconds any more; what remains is a
-convergence gap, not a capture. **One seeded world in sixteen still ends tens of
-milliseconds out**, so if your deployment needs microseconds from a multi-server
-configuration, a single known-good source is still the tighter choice. The
-remaining cause, the seven fixes measured and rejected on the way here, and the
-refactor that is likely to close it are all in the ledger.
+The fix was structural, not a tuning knob. Every source used to run its own
+copy of the discipline loop — its own frequency, drain and budget — while only
+the selected one was allowed to reach the clock, which left every unselected
+source having booked a correction that never happened. Seven different ways of
+cleaning up after that were measured and every one was worse than leaving the
+wrong books alone. There is now **one loop per clock and one register per
+source**, so an unselected source never produces a plan at all and there is
+nothing to clean up.
 
 ### Bounding what a source may do to your clock
 

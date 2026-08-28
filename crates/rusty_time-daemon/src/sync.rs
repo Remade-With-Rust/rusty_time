@@ -4,13 +4,13 @@
 //! system clock. This is the chronyd-equivalent mode, and it is what the
 //! TIMECORP cross-implementation arm measures.
 //!
-//! The discipline itself is `rusty_time_core::client::SyncController`, which
+//! The discipline itself is `rusty_time_core::client::MultiController`, which
 //! is also what the simulator drives. That shared type is the reason a corpus
 //! number here means anything: the alternative — a simulator with its own copy
 //! of the loop — measures code that never ships.
 
 use rusty_time_clock::{ClockDrive, ClockRead, SystemClock, net};
-use rusty_time_core::client::SyncController;
+use rusty_time_core::client::MultiController;
 use rusty_time_core::discipline::ChangeVerdict;
 use rusty_time_core::ntp::{self, HEADER_LEN, LeapIndicator, Mode, NtpPacket, NtpTimestamp};
 use rusty_time_core::select::select;
@@ -180,7 +180,6 @@ impl SyncOptions {
 struct Source {
     name: String,
     socket: UdpSocket,
-    controller: SyncController,
     /// Monotonic instant of the next due poll.
     due: Instant,
     /// Latest estimate, for selection across sources.
@@ -256,10 +255,12 @@ pub fn run(opts: &SyncOptions) -> i32 {
     // Whether the clock is being held because the sources disagree. Tracked so
     // the message appears once per episode rather than once per poll.
     let mut holding = false;
-    // The frequency the clock is actually running at: the last one a driver
-    // call accepted. Zero until the first correction lands, which is also the
-    // clock's own starting rate.
-    let mut applied_freq_ppm: f64 = 0.0;
+
+    // ONE loop for the clock, one register per source. The frequency, the drain
+    // and its budget are properties of the clock, of which there is exactly
+    // one; only the sample history belongs to a source. Giving every source its
+    // own copy of the loop is what made multi-source selection unreliable.
+    let mut ctl = MultiController::new(opts.discipline, sources.len());
 
     let mut drains_retired: u64 = 0;
     let started = Instant::now();
@@ -281,44 +282,30 @@ pub fn run(opts: &SyncOptions) -> i32 {
         // stopping at it. Waking for the end of the drain is what lets the
         // rate be chosen for how fast the clock may safely move.
         //
-        // Only the SELECTED source may write to the clock, exactly as on the
-        // sample path. Every source runs its own controller and therefore its
-        // own drain, so retiring them all and applying each one's command would
-        // let a source the selector rejected — a falseticker, or simply the
-        // worse of two — impose its frequency on the clock the moment its drain
-        // happened to expire. A single-source benchmark cannot see this, which
-        // is why it is worth stating rather than assuming.
-        //
-        // Their drains are still retired, because that is bookkeeping each
-        // controller owes itself; only the command is withheld.
+        // There is ONE drain, because there is one clock. This used to be a
+        // loop over per-source drains that had to withhold the command from
+        // every unselected source — otherwise a falseticker could impose its
+        // frequency the moment its own drain happened to expire. With a shared
+        // loop that hazard cannot be expressed: no unselected source owns a
+        // drain to expire.
         let mono_now = clock.mono_s().unwrap_or(0.0);
-        let driving = selected_index(&sources);
-        if stop_drains {
-            for (index, source) in sources.iter_mut().enumerate() {
-                let Some(command) = source.controller.poll_drain(mono_now) else {
-                    continue;
-                };
-                if driving != Some(index) {
-                    continue; // retired in its own books; it does not drive the clock
-                }
-                drains_retired += 1;
-                if opts.verbose {
-                    println!(
-                        "t={:8.3} drain retired (#{drains_retired}) freq={:+.3}",
-                        mono_now - mono_start,
-                        source.controller.freq_ppm()
-                    );
-                }
-                if !opts.dry_run
-                    && let Err(e) = driver.apply(&command)
-                {
-                    // Retiring a drain only ever asks the clock to STOP
-                    // draining, so a refusal leaves it running faster than the
-                    // books say. Count it with the rest: the condition it
-                    // signals is the same one.
-                    refused_in_a_row += 1;
-                    eprintln!("rtimed sync: ending drain: {e} (refused {refused_in_a_row}x)");
-                }
+        if stop_drains && let Some(command) = ctl.poll_drain(mono_now) {
+            drains_retired += 1;
+            if opts.verbose {
+                println!(
+                    "t={:8.3} drain retired (#{drains_retired}) freq={:+.3}",
+                    mono_now - mono_start,
+                    ctl.freq_ppm()
+                );
+            }
+            if !opts.dry_run
+                && let Err(e) = driver.apply(&command)
+            {
+                // Retiring a drain only ever asks the clock to STOP draining,
+                // so a refusal leaves it running faster than the books say.
+                // Count it with the rest: the condition it signals is the same.
+                refused_in_a_row += 1;
+                eprintln!("rtimed sync: ending drain: {e} (refused {refused_in_a_row}x)");
             }
         }
 
@@ -327,13 +314,12 @@ pub fn run(opts: &SyncOptions) -> i32 {
         let now = Instant::now();
         let next_due = sources.iter().map(|s| s.due).min().unwrap_or(now);
         let until_due = next_due.saturating_duration_since(now);
-        let until_drain = sources
-            .iter()
+        let until_drain = ctl
+            .drain_completes_at()
             .filter(|_| stop_drains)
-            .filter_map(|s| s.controller.drain_completes_at())
             .map(|at| at - mono_now)
             .filter(|remaining| *remaining > 0.0)
-            .fold(f64::INFINITY, f64::min);
+            .unwrap_or(f64::INFINITY);
         let wait = if until_drain.is_finite() {
             until_due.min(Duration::from_secs_f64(until_drain))
         } else {
@@ -356,38 +342,70 @@ pub fn run(opts: &SyncOptions) -> i32 {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let source = &mut sources[index];
                     // `exchange` has just recorded whether this reply carried a
                     // leap announcement, so the discipline can treat the second
                     // as expected rather than as a source misbehaving.
-                    let leap_pending = source.leap_pending;
-                    let step =
-                        source
-                            .controller
-                            .on_sample_with_leap(mono_now, sample, leap_pending);
-                    source.exchanges += 1;
-                    source.lost_in_a_row = 0;
-                    source.last_offset_s = step.estimate_offset_s;
-                    // Root distance describes how well the PATH is known. On its
-                    // own it says nothing about how well this source's offset is
-                    // known, and during acquisition those differ by orders of
-                    // magnitude — a hundred microseconds of path against
-                    // milliseconds of estimate. Selection compares intervals of
-                    // `offset ± root_distance`, so leaving the estimate's own
-                    // dispersion out makes every interval far too narrow to
-                    // overlap: on the three-server rig a set of perfectly
-                    // healthy servers formed no majority on 74 polls out of 89.
-                    source.last_root_distance_s = root_distance + step.estimate_sd_s;
-                    source.last_stratum = stratum;
-                    source.has_estimate = true;
-                    source.due = Instant::now() + Duration::from_secs_f64(step.plan.next_poll_s);
+                    let leap_pending = sources[index].leap_pending;
+
+                    // MEASURE. Every source that answers updates its own
+                    // history, whether or not it is the one steering. This
+                    // touches no clock state, so an unselected source leaves
+                    // nothing behind to revert, confirm or adopt — which is the
+                    // entire class of bug the shared loop removes.
+                    let est = ctl.observe(index, mono_now, sample);
+                    {
+                        let source = &mut sources[index];
+                        source.exchanges += 1;
+                        source.lost_in_a_row = 0;
+                        source.last_offset_s = est.offset_s;
+                        // Root distance describes how well the PATH is known. On
+                        // its own it says nothing about how well this source's
+                        // offset is known, and during acquisition those differ by
+                        // orders of magnitude — a hundred microseconds of path
+                        // against milliseconds of estimate. Selection compares
+                        // intervals of `offset ± root_distance`, so leaving the
+                        // estimate's own dispersion out makes every interval far
+                        // too narrow to overlap: on the three-server rig a set of
+                        // perfectly healthy servers formed no majority on 74
+                        // polls out of 89.
+                        source.last_root_distance_s = root_distance + est.sd_s;
+                        source.last_stratum = stratum;
+                        source.has_estimate = true;
+                    }
+
+                    // SELECT on the estimates as they now stand, including the
+                    // one that just arrived.
+                    let selected = selected_index(&sources);
+
+                    // STEER, from the selected source only. An unselected
+                    // source is rescheduled on the shared poll interval and
+                    // otherwise does nothing at all.
+                    let Some(step) = (if selected == Some(index) {
+                        Some(ctl.steer(est, mono_now, leap_pending))
+                    } else {
+                        sources[index].due =
+                            Instant::now() + Duration::from_secs_f64(ctl.poll_interval_s());
+                        None
+                    }) else {
+                        hold_if_no_majority(
+                            selected,
+                            &mut holding,
+                            &mut ctl,
+                            &mut driver,
+                            opts,
+                            sources.len(),
+                        );
+                        continue;
+                    };
+                    sources[index].due =
+                        Instant::now() + Duration::from_secs_f64(step.plan.next_poll_s);
 
                     if opts.verbose {
                         println!(
                             "t={:8.3} sample source={} offset={:+.9} freq={:+.3} \
                              samples={} poll={}",
                             mono_now - mono_start,
-                            source.name,
+                            sources[index].name,
                             step.estimate_offset_s,
                             step.applied_ppm,
                             step.samples_used,
@@ -420,70 +438,29 @@ pub fn run(opts: &SyncOptions) -> i32 {
                         }
                     }
 
-                    // Only the selected source drives the clock.
-                    let selected = selected_index(&sources);
-                    // No majority means the sources do not agree on what time it
-                    // is. Hold the clock rather than coast: with nothing selected
-                    // the daemon commands nothing, so the last frequency keeps
-                    // running and the clock walks away from a disagreement it has
-                    // already detected. Refusing to steer is a decision; coasting
-                    // is the absence of one.
-                    //
-                    // A single source always intersects itself, so this never
-                    // fires on a one-server deployment.
-                    match selected {
-                        None if !opts.dry_run => {
-                            if !holding {
-                                eprintln!(
-                                    "rtimed sync: no majority among {n} sources — holding the clock at {applied_freq_ppm:+.3} ppm rather than coasting",
-                                    n = sources.len(),
-                                );
-                                holding = true;
-                            }
-                            // Hold at the rate the clock is ALREADY running, not
-                            // at the freshly polled source's opinion of it.
-                            // `index` is whichever source this iteration happened
-                            // to poll, and that can be the falseticker — whose
-                            // controller saturates at the -500 ppm slew clamp
-                            // trying to correct its own lie. Reading its frequency
-                            // here installed exactly the correction selection
-                            // exists to reject: measured on the three-server rig,
-                            // a hold at -500 ppm walked the clock 53 ms out in two
-                            // minutes.
-                            let hold = ClockCommand::Slew {
-                                freq_ppm: applied_freq_ppm,
-                                drain_offset: 0.0,
-                                drain_rate_ppm: 0.0,
-                            };
-                            if let Err(e) = driver.apply(&hold) {
-                                eprintln!("rtimed sync: holding the clock: {e}");
-                            }
-                        }
-                        Some(_) if holding => {
-                            eprintln!("rtimed sync: majority restored — steering again");
-                            holding = false;
-                        }
-                        _ => {}
+                    // The selected source's plan goes to the clock. There is no
+                    // "else" any more: an unselected source never reached this
+                    // point, because it never produced a plan.
+                    if holding {
+                        eprintln!("rtimed sync: majority restored — steering again");
+                        holding = false;
                     }
-                    if selected == Some(index) && !opts.dry_run {
+                    if !opts.dry_run {
                         match driver.apply(&step.plan.command) {
                             Ok(()) => {
                                 applied_any = true;
                                 refused_in_a_row = 0;
-                                // What the clock is actually running at, which is
-                                // what a later hold must freeze it at.
-                                applied_freq_ppm = sources[index].controller.freq_ppm();
-                                sources[index].controller.confirm_last_plan();
+                                ctl.confirm_last_plan();
                             }
                             Err(e) => {
                                 // The command did not reach the clock, so the
                                 // books that assumed it did must be put back.
-                                // Left standing, the register would carry a
+                                // Left standing, the registers would carry a
                                 // correction that never happened and the
                                 // regression would read it as truth — the
                                 // daemon would report itself synchronised while
                                 // the clock ran free.
-                                sources[index].controller.revert_last_plan();
+                                ctl.revert_last_plan();
                                 refused_in_a_row += 1;
                                 eprintln!(
                                     "rtimed sync: applying clock command: {e}                                      (refused {refused_in_a_row}x; correction reverted)"
@@ -499,40 +476,13 @@ pub fn run(opts: &SyncOptions) -> i32 {
                         if let ClockCommand::Step { add_seconds } = step.plan.command {
                             println!("rtimed sync: stepped clock by {add_seconds:+.6} s");
                         }
-                    } else {
-                        // NOT driving the clock, so in principle this plan never
-                        // reached it and these books should be put back.
-                        //
-                        // Confirming anyway is what MEASURES best, and the gap
-                        // between that and principle is documented rather than
-                        // closed on a theory. Seven attempts in this family have
-                        // now been measured on the three-server rig and every one
-                        // was worse than leaving it alone: reverting the plan
-                        // (twice before selection itself was fixed, once after),
-                        // propagating the applied frequency, splitting measure
-                        // from control, broadcasting the correction as an offset
-                        // shift, and finally reverting AND adopting the
-                        // correction that really landed — 4 of 16 seeded worlds
-                        // against 15 of 16 for doing nothing.
-                        //
-                        // The likely reason, stated as the hypothesis it is: a
-                        // register holds MEASURED offsets, and a measurement
-                        // already contains whatever every source did to the
-                        // clock. Re-tilting it by a correction booked elsewhere
-                        // counts that correction twice. If that is right the fix
-                        // is not bookkeeping at all — it is ONE discipline loop
-                        // fed by the selected source, which is chrony's
-                        // structure, rather than N loops sharing a clock. That is
-                        // a refactor, and it is recorded as the next step rather
-                        // than half-attempted here.
-                        sources[index].controller.confirm_last_plan();
                     }
                 }
                 None => {
                     let source = &mut sources[index];
                     source.lost += 1;
                     source.lost_in_a_row = source.lost_in_a_row.saturating_add(1);
-                    let retry = source.controller.retry_interval_s();
+                    let retry = ctl.retry_interval_s();
                     source.due = Instant::now() + Duration::from_secs_f64(retry);
                 }
             }
@@ -547,7 +497,8 @@ pub fn run(opts: &SyncOptions) -> i32 {
             source.exchanges,
             source.lost,
             source.last_offset_s,
-            source.controller.freq_ppm()
+            // One clock, one frequency: this is the loop's, not this source's.
+            ctl.freq_ppm()
         );
     }
     if opts.dry_run {
@@ -565,6 +516,56 @@ pub fn run(opts: &SyncOptions) -> i32 {
         return 1;
     }
     0
+}
+
+/// Hold the clock at its current commanded rate when the sources do not agree.
+///
+/// With nothing selected the daemon commands nothing, so the last frequency
+/// keeps running and the clock walks away from a disagreement it has already
+/// detected. Refusing to steer is a decision; coasting is the absence of one.
+///
+/// The rate held is the loop's own `freq_ppm`, which with a shared loop simply
+/// IS what the clock is running at. Under per-source controllers this had to be
+/// tracked separately and got it wrong: it read the freshly polled source's
+/// frequency, which could be the falseticker saturated at the -500 ppm slew
+/// clamp, and a hold then installed exactly the correction selection exists to
+/// reject — 53 ms of walk in two minutes on the three-server rig.
+///
+/// A single source always intersects itself, so this never fires on a
+/// one-server deployment.
+fn hold_if_no_majority(
+    selected: Option<usize>,
+    holding: &mut bool,
+    ctl: &mut MultiController,
+    driver: &mut SystemClock,
+    opts: &SyncOptions,
+    sources: usize,
+) {
+    if selected.is_some() {
+        if *holding {
+            eprintln!("rtimed sync: majority restored — steering again");
+            *holding = false;
+        }
+        return;
+    }
+    if opts.dry_run {
+        return;
+    }
+    if !*holding {
+        eprintln!(
+            "rtimed sync: no majority among {sources} sources — holding the clock at {ppm:+.3} ppm rather than coasting",
+            ppm = ctl.freq_ppm(),
+        );
+        *holding = true;
+    }
+    let hold = ClockCommand::Slew {
+        freq_ppm: ctl.freq_ppm(),
+        drain_offset: 0.0,
+        drain_rate_ppm: 0.0,
+    };
+    if let Err(e) = driver.apply(&hold) {
+        eprintln!("rtimed sync: holding the clock: {e}");
+    }
 }
 
 /// Consecutive lost exchanges after which a source stops counting towards the
@@ -620,7 +621,7 @@ fn selected_index(sources: &[Source]) -> Option<usize> {
 
 fn open_source(
     name: &str,
-    discipline: &DisciplineConfig,
+    _discipline: &DisciplineConfig,
     opts: &SyncOptions,
 ) -> Result<Source, String> {
     let addr = (name, opts.port)
@@ -647,7 +648,6 @@ fn open_source(
     Ok(Source {
         name: name.to_string(),
         socket,
-        controller: SyncController::new(*discipline),
         due: Instant::now(),
         last_offset_s: 0.0,
         last_root_distance_s: 1.0,
@@ -845,7 +845,6 @@ mod tests {
         Source {
             name: "stub".into(),
             socket: UdpSocket::bind("127.0.0.1:0").expect("bind"),
-            controller: SyncController::new(DisciplineConfig::default()),
             due: Instant::now(),
             last_offset_s: offset_s,
             last_root_distance_s: root_distance_s,

@@ -16,4 +16,4 @@ categories = ["memory-management", "no-std"]
 workspace = true
 
 [dependencies]
-rusty_alloc-api = "1.1.4"
+rusty_alloc-api = "=1.1.6"

@@ -103,6 +103,8 @@ pub struct DisciplineConfig {
     /// the stability test that raises the interval is calibrated against a
     /// correction time that now no longer moves with it.
     pub corr_time_s: f64,
+    /// How to treat a second announced by the upstream source.
+    pub leap_mode: LeapMode,
     /// Largest correction this daemon will ever make, in seconds. `None`
     /// applies no limit.
     ///
@@ -153,6 +155,7 @@ impl Default for DisciplineConfig {
             slope_density_weighting: false,
             corr_time_s: 0.0,
             corr_time_ratio: 0.0,
+            leap_mode: LeapMode::Slew,
             max_change_s: None,
             max_change_start: 1,
             max_change_ignore: 2,
@@ -183,6 +186,34 @@ pub struct Plan {
     pub reset_register: bool,
     /// What the maximum-change guard made of this correction.
     pub verdict: ChangeVerdict,
+}
+
+/// What to do about a leap second the upstream source has announced.
+///
+/// A leap second is the one correction a time daemon can see coming. The server
+/// sets the leap indicator during the UTC day it happens, and at midnight the
+/// second is inserted or removed — every client sees a one-second step at the
+/// same instant.
+///
+/// Handling it is not optional in the way it looks. Unhandled, the step arrives
+/// as an ordinary offset and is corrected like any other, which takes about
+/// twelve seconds at the slew ceiling and leaves the clock a whole second wrong
+/// meanwhile. Worse, and this is the case that matters: with `max_change_s` set
+/// below one second the guard REFUSES it, and since every node in a fleet sees
+/// the same leap at the same moment, every node exhausts its allowance and exits
+/// together. A safety limit turning into a synchronised outage on a date known
+/// years in advance is not a hypothetical failure mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeapMode {
+    /// Slew the second in like any other offset, but exempt from the
+    /// maximum-change guard because it is expected, bounded and announced.
+    Slew,
+    /// Step it, which is what a machine that cannot tolerate a slow second
+    /// wants — and what most operating systems do natively.
+    Step,
+    /// Take no special action. The step is then an ordinary offset, and the
+    /// maximum-change guard applies to it like anything else.
+    Ignore,
 }
 
 /// What the maximum-change guard decided about a correction.
@@ -368,6 +399,14 @@ const FREQ_INTEGRAL_GAIN: f64 = 0.0;
 /// The value is measured, not chosen — see the sweep in `DisciplineConfig`.
 const POLL_DOWN_NOISE_RATIO: f64 = 10.0;
 
+/// How large a correction an announced leap second may excuse.
+///
+/// A leap is one second by definition, so anything materially larger is not the
+/// leap — it is a source using the announcement to smuggle a correction past
+/// the guard. Two seconds leaves room for the leap plus whatever ordinary error
+/// had accumulated, and refuses anything that is plainly something else.
+const LEAP_EXEMPTION_S: f64 = 2.0;
+
 /// Consecutive stable samples before the poll interval doubles — the default
 /// for `DisciplineConfig::poll_up_streak`.
 const POLL_UP_STREAK: u32 = 3;
@@ -469,7 +508,39 @@ impl Discipline {
     ///   positive = local slow), if trusted.
     /// * `offset_sd` — residual noise of the estimate.
     pub fn on_estimate(&mut self, offset: f64, freq_ppm_meas: Option<f64>, offset_sd: f64) -> Plan {
+        self.on_estimate_with_leap(offset, freq_ppm_meas, offset_sd, false)
+    }
+
+    /// As [`Discipline::on_estimate`], told whether the source has announced a
+    /// leap second for the current UTC day.
+    pub fn on_estimate_with_leap(
+        &mut self,
+        offset: f64,
+        freq_ppm_meas: Option<f64>,
+        offset_sd: f64,
+        leap_pending: bool,
+    ) -> Plan {
         self.updates += 1;
+
+        // An announced leap is expected, bounded and about a second. Exempting
+        // it from the maximum-change guard is the whole reason the daemon is
+        // told about it: otherwise a limit below one second turns a scheduled,
+        // fleet-wide event into a scheduled, fleet-wide shutdown.
+        let leap_exempt = leap_pending
+            && self.cfg.leap_mode != LeapMode::Ignore
+            && offset.abs() <= LEAP_EXEMPTION_S;
+        if leap_exempt && self.cfg.leap_mode == LeapMode::Step {
+            self.stable_streak = 0;
+            self.change_refusals = 0;
+            return Plan {
+                command: ClockCommand::Step {
+                    add_seconds: offset,
+                },
+                next_poll_s: self.take_poll_interval(),
+                reset_register: true,
+                verdict: ChangeVerdict::Accepted,
+            };
+        }
 
         // The maximum-change guard, before anything is decided.
         //
@@ -489,6 +560,7 @@ impl Discipline {
         // early updates is what lets a cold start still make its one big
         // legitimate correction.
         if let Some(limit) = self.cfg.max_change_s
+            && !leap_exempt
             && self.updates > self.cfg.max_change_start
             && !matches!(
                 offset.abs().partial_cmp(&limit),
@@ -826,6 +898,128 @@ mod acquisition_tests {
             next > IBURST_SPACING_S,
             "burst never backed off despite never converging: next poll {next} s"
         );
+    }
+}
+
+#[cfg(test)]
+mod leap_tests {
+    use super::*;
+
+    fn cfg(mode: LeapMode, max_change: Option<f64>) -> DisciplineConfig {
+        DisciplineConfig {
+            leap_mode: mode,
+            max_change_s: max_change,
+            max_change_start: 1,
+            max_change_ignore: 2,
+            makestep_threshold: Some(1.0),
+            makestep_limit: 3,
+            ..DisciplineConfig::default()
+        }
+    }
+
+    /// The failure this exists to prevent.
+    ///
+    /// A leap second arrives at every node in a fleet at the same instant. With
+    /// a maximum-change limit below one second and no leap handling, every node
+    /// refuses it, exhausts its allowance, and exits **together** — a safety
+    /// limit turning into a synchronised outage on a date known years ahead.
+    #[test]
+    fn an_announced_leap_does_not_trip_the_change_guard() {
+        let mut d = Discipline::new(cfg(LeapMode::Slew, Some(0.1)));
+        d.on_estimate_with_leap(0.0001, None, 1e-6, false); // settle past the allowance
+        for _ in 0..5 {
+            let plan = d.on_estimate_with_leap(1.0, None, 1e-6, true);
+            assert_eq!(
+                plan.verdict,
+                ChangeVerdict::Accepted,
+                "an announced leap second was refused by the change guard"
+            );
+        }
+    }
+
+    /// Without the announcement the same offset is refused, which is what makes
+    /// the exemption meaningful rather than a hole.
+    #[test]
+    fn the_same_offset_unannounced_is_still_refused() {
+        let mut d = Discipline::new(cfg(LeapMode::Slew, Some(0.1)));
+        d.on_estimate_with_leap(0.0001, None, 1e-6, false);
+        assert!(matches!(
+            d.on_estimate_with_leap(1.0, None, 1e-6, false).verdict,
+            ChangeVerdict::Refused { .. }
+        ));
+    }
+
+    /// The announcement excuses a leap, not an arbitrary correction. A source
+    /// that sets the bit and then asks for an hour is not describing a leap.
+    #[test]
+    fn an_announcement_does_not_excuse_an_arbitrary_correction() {
+        let mut d = Discipline::new(cfg(LeapMode::Slew, Some(0.1)));
+        d.on_estimate_with_leap(0.0001, None, 1e-6, false);
+        assert!(
+            matches!(
+                d.on_estimate_with_leap(3600.0, None, 1e-6, true).verdict,
+                ChangeVerdict::Refused { .. }
+            ),
+            "the leap bit was used to smuggle a correction past the guard"
+        );
+    }
+
+    /// `step` mode steps the second rather than slewing it in over ~12 s.
+    #[test]
+    fn step_mode_steps_the_second() {
+        let mut d = Discipline::new(cfg(LeapMode::Step, None));
+        for _ in 0..6 {
+            d.on_estimate_with_leap(0.0001, None, 1e-6, false);
+        }
+        let plan = d.on_estimate_with_leap(1.0, None, 1e-6, true);
+        match plan.command {
+            ClockCommand::Step { add_seconds } => {
+                assert!((add_seconds - 1.0).abs() < 1e-9);
+                assert!(plan.reset_register, "a step invalidates stored samples");
+            }
+            other => panic!("expected a step, got {other:?}"),
+        }
+    }
+
+    /// `ignore` restores the old behaviour exactly: no exemption, no step.
+    #[test]
+    fn ignore_mode_treats_a_leap_as_an_ordinary_offset() {
+        let mut d = Discipline::new(cfg(LeapMode::Ignore, Some(0.1)));
+        d.on_estimate_with_leap(0.0001, None, 1e-6, false);
+        assert!(matches!(
+            d.on_estimate_with_leap(1.0, None, 1e-6, true).verdict,
+            ChangeVerdict::Refused { .. }
+        ));
+    }
+
+    /// Slew is the default, and a leap under it is corrected like any offset —
+    /// just without the guard firing.
+    #[test]
+    fn slew_is_the_default_and_does_not_step() {
+        assert_eq!(DisciplineConfig::default().leap_mode, LeapMode::Slew);
+        let mut d = Discipline::new(cfg(LeapMode::Slew, None));
+        for _ in 0..6 {
+            d.on_estimate_with_leap(0.0001, None, 1e-6, false);
+        }
+        let plan = d.on_estimate_with_leap(1.0, None, 1e-6, true);
+        assert!(
+            matches!(plan.command, ClockCommand::Slew { .. }),
+            "slew mode stepped the clock"
+        );
+    }
+
+    /// A daemon told nothing behaves exactly as before.
+    #[test]
+    fn no_announcement_is_the_old_behaviour() {
+        let mut a = Discipline::new(cfg(LeapMode::Slew, None));
+        let mut b = Discipline::new(cfg(LeapMode::Slew, None));
+        for i in 0..8 {
+            let off = 0.001 * f64::from(i);
+            let p = a.on_estimate(off, None, 1e-6);
+            let q = b.on_estimate_with_leap(off, None, 1e-6, false);
+            assert_eq!(p.command, q.command);
+            assert_eq!(p.next_poll_s, q.next_poll_s);
+        }
     }
 }
 

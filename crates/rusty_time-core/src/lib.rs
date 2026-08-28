@@ -19,7 +19,7 @@ pub mod select;
 pub mod server;
 pub mod vclock;
 
-pub use discipline::{ClockCommand, Discipline, DisciplineConfig, Plan};
+pub use discipline::{ClockCommand, Discipline, DisciplineConfig, LeapMode, Plan};
 pub use filter::{RegressEstimate, Sample, SampleRegister};
 pub use ntp::{LeapIndicator, Mode, NtpPacket, NtpShort, NtpTimestamp, ParseError};
 pub use select::{Selection, SourceEstimate};

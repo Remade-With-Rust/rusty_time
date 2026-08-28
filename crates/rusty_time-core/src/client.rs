@@ -225,6 +225,17 @@ impl SyncController {
     /// `mono_now_s` is the local monotonic clock; `sample.t` should be the
     /// exchange midpoint on that same timescale.
     pub fn on_sample(&mut self, mono_now_s: f64, sample: Sample) -> ControllerStep {
+        self.on_sample_with_leap(mono_now_s, sample, false)
+    }
+
+    /// As [`SyncController::on_sample`], told whether the source has announced
+    /// a leap second for the current UTC day.
+    pub fn on_sample_with_leap(
+        &mut self,
+        mono_now_s: f64,
+        sample: Sample,
+        leap_pending: bool,
+    ) -> ControllerStep {
         // Account for the drain that actually ran since the last plan. It is a
         // *consumed offset correction*, so it leaves the stored history as an
         // offset and the regression slope keeps measuring frequency alone.
@@ -266,7 +277,9 @@ impl SyncController {
             },
         };
 
-        let plan = self.discipline.on_estimate(offset, freq, sd);
+        let plan = self
+            .discipline
+            .on_estimate_with_leap(offset, freq, sd, leap_pending);
         let freq_cmd_new = self.discipline.freq_ppm();
         // Captured before the books move, so `revert_last_plan` can put them
         // back exactly if the clock command is refused.

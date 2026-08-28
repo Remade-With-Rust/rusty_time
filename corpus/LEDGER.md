@@ -2265,3 +2265,112 @@ which is exactly why nobody would have noticed.
 Also a reminder about the OTHER limit: three releases in quick succession spend
 the burst allowance for new versions, after which it is one a minute. That is a
 reason to batch changes into a release, not to publish each fix as it lands.
+
+---
+
+## The production-readiness audit: four gaps, two closed, two exposed
+
+### 1. Leap seconds — CLOSED
+
+The daemon read the leap indicator and used it only to reject `Unsynchronized`.
+An announced leap was ignored, so the second arrived as an ordinary offset and
+was slewed away over about twelve seconds.
+
+Worse, and this is why it mattered more after 0.1.5 than before: with
+`--maxchange` set below one second the guard REFUSED it, and since every node in
+a fleet sees the same leap at the same instant, every node would exhaust its
+allowance and exit **together**. A safety limit turning into a synchronised
+outage, on a date known years in advance.
+
+`--leapsecmode slew|step|ignore` now, defaulting to `slew`. An announced leap is
+exempt from the change guard — but only up to two seconds, so the announcement
+cannot be used to smuggle an arbitrary correction past it. Seven tests, of which
+the load-bearing ones are: an announced leap is not refused, **the same offset
+unannounced still is**, and an announcement does not excuse an hour.
+
+### 2. Multi-source — EXPOSED, NOT FIXED
+
+Every scenario in this corpus had exactly one server. `tools/corpus/multisource.sh`
+adds three, one of them five seconds wrong, and asks the only question that
+matters: does the client converge to the TRUTH?
+
+```
+seed   rusty_time                    chrony
+701      0.428 ms  PASS               0.002 ms  PASS
+702   2996.520 ms  FAIL               0.004 ms  PASS
+703   2319.610 ms  FAIL              -0.002 ms  PASS
+704    295.950 ms  FAIL               0.002 ms  PASS
+705      0.028 ms  PASS              -0.005 ms  PASS
+706      1.961 ms  FAIL              -0.003 ms  PASS
+707      0.164 ms  PASS              -0.000 ms  PASS
+708     -3.875 ms  FAIL               0.001 ms  PASS
+```
+
+**Four of eight seeds fail, by as much as three seconds. chrony passes eight of
+eight at five microseconds.**
+
+The mechanism, from the per-source logs: each source runs its own controller,
+and only the SELECTED one's commands reach the clock — but every controller
+books its plan the moment it makes it. The unselected ones therefore accumulate
+corrections that never happened, and their estimates drift. Measured at t≈141 s,
+two servers that were both keeping perfect time reported offsets **70 ms apart**
+with root distances of 0.1 ms. Nothing overlapped, the intersection found no
+majority, and with no source selected the daemon simply held its last commanded
+rate and walked the clock away at 5100 ppm.
+
+**A fix was attempted and reverted.** Three shapes were tried — reverting
+unselected plans, propagating the applied adjustment to every register, and
+splitting measurement from control so only the selected source plans. Each
+measured WORSE than the baseline (up to 36 s of error), the last because
+separating the two halves broke the order the drain must be accounted in. The
+tree is back at the 0.1.6 behaviour, and the harness stays as the reproduction.
+
+Shipping a half-finished refactor of the clock loop would be worse than shipping
+a failing test that says exactly what is wrong.
+
+### 3. Reference clocks — CLOSED as far as it can be without hardware
+
+`tools/corpus/refclock_loopback.sh` drives the SHM and SOCK inputs from an
+independent producer writing the byte layouts gpsd and chrony define. Both are
+recovered exactly.
+
+It found a real bug — in the harness. The obvious producer writes twelve
+consecutive `int`s; the actual `struct shmTime` has a 64-bit `time_t`, which puts
+`clockTimeStampSec` at offset 8 as an i64 with four bytes of padding after the
+microseconds field. The consumer correctly reported no valid sample. **That is
+the argument for a foreign producer**: a misread segment still yields a number,
+and a test that writes its own layout will agree with itself forever.
+
+Stated plainly: this closes *"the code path has never been executed by anything
+but itself"*. It does not close *"runs on hardware"*. There is no PPS edge, no
+NMEA, no receiver.
+
+### 4. Soak — EXPOSED A MAJOR DEFECT
+
+`tools/corpus/soak.sh` runs a simulated day and compares quarters, with chrony
+as the control. A long run without a control cannot tell "this daemon drifts"
+from "this scenario drifts".
+
+**The corpus has always run `maxpoll 6` (64 s). The shipped default is
+`maxpoll 10` (1024 s).** Over a simulated day on S8:
+
+```
+maxpoll        rusty_time (last quarter)      chrony
+  6                        22.8 us             4.3 us
+ 10  (the default)       1452.5 us            10.0 us
+```
+
+Our error scales with the poll interval; chrony's does not. That is the
+signature of the proportional loop this ledger has documented from the start:
+the standing offset is `F_residual * correction_time`, and the correction time
+is `CORR_TIME_RATIO * poll`. At a 64 s poll it is microseconds. At 1024 s it is
+milliseconds.
+
+**Every accuracy figure in this ledger was measured at a poll ceiling the
+daemon does not use by default.** The parity result against chrony holds at
+`maxpoll 6` and nowhere else. That is not a small correction to the record; it
+is the record being measured in the wrong configuration, and only a long run at
+the real default exposed it.
+
+Nothing here is a regression — the code has always behaved this way. What
+changed is that it is now measured.

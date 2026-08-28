@@ -14,7 +14,7 @@ use rusty_time_core::client::SyncController;
 use rusty_time_core::discipline::ChangeVerdict;
 use rusty_time_core::ntp::{self, HEADER_LEN, LeapIndicator, Mode, NtpPacket, NtpTimestamp};
 use rusty_time_core::select::select;
-use rusty_time_core::{ClockCommand, DisciplineConfig, Sample, SourceEstimate};
+use rusty_time_core::{ClockCommand, DisciplineConfig, LeapMode, Sample, SourceEstimate};
 use std::net::{ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -144,6 +144,18 @@ impl SyncOptions {
                     opts.discipline.max_change_start = start;
                     opts.discipline.max_change_ignore = ignore;
                 }
+                "--leapsecmode" => {
+                    opts.discipline.leap_mode = match value()?.as_str() {
+                        "slew" => LeapMode::Slew,
+                        "step" => LeapMode::Step,
+                        "ignore" => LeapMode::Ignore,
+                        other => {
+                            return Err(format!(
+                                "--leapsecmode: expected slew, step or ignore, got '{other}'"
+                            ));
+                        }
+                    };
+                }
                 "--no-makestep" => opts.discipline.makestep_threshold = None,
                 "--no-iburst" => opts.discipline.iburst = false,
                 other if other.starts_with("--") => {
@@ -173,6 +185,10 @@ struct Source {
     has_estimate: bool,
     exchanges: u64,
     lost: u64,
+    /// Whether this source announced a leap second in its last reply. The
+    /// indicator is set for the whole UTC day the leap falls in, so it arrives
+    /// long before the step does.
+    leap_pending: bool,
 }
 
 pub fn run(opts: &SyncOptions) -> i32 {
@@ -323,7 +339,14 @@ pub fn run(opts: &SyncOptions) -> i32 {
                         Err(_) => continue,
                     };
                     let source = &mut sources[index];
-                    let step = source.controller.on_sample(mono_now, sample);
+                    // `exchange` has just recorded whether this reply carried a
+                    // leap announcement, so the discipline can treat the second
+                    // as expected rather than as a source misbehaving.
+                    let leap_pending = source.leap_pending;
+                    let step =
+                        source
+                            .controller
+                            .on_sample_with_leap(mono_now, sample, leap_pending);
                     source.exchanges += 1;
                     source.last_offset_s = step.estimate_offset_s;
                     source.last_root_distance_s = root_distance;
@@ -501,6 +524,7 @@ fn open_source(
         has_estimate: false,
         exchanges: 0,
         lost: 0,
+        leap_pending: false,
     })
 }
 
@@ -616,6 +640,11 @@ fn exchange(
     if delay < 0.0 {
         return None;
     }
+
+    source.leap_pending = matches!(
+        packet.leap,
+        LeapIndicator::LastMinute61 | LeapIndicator::LastMinute59
+    );
 
     let dispersion = packet.root_dispersion.to_seconds();
     let root_distance = packet.root_delay.to_seconds() / 2.0 + dispersion + delay / 2.0;

@@ -1,3 +1,8 @@
+> **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_time-core` to put an NTP timestamp on every chunk.
+> It makes personal and work files AI-readable without them leaving the machine:
+> the whole conversion runs as WebAssembly in the browser tab, with nothing
+> uploaded and nothing to install.
+
 # rusty_time-core
 
 Portable NTPv4 protocol and clock-discipline algorithms.

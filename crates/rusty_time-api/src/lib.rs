@@ -133,8 +133,19 @@ pub struct QueryReport {
 }
 
 /// Daemon tracking state (the `status.tracking` op).
+///
+/// **Read `synchronized` first.** It is true only when a correction actually
+/// reached the clock, and the other fields are only meaningful when it is: an
+/// unsynchronized daemon is running an OPEN loop (a dry run never steers, and
+/// an acquiring loop has not converged), so its `freq_ppm` is not a drift
+/// measurement and its `offset_s` is an estimate nothing has acted on. A
+/// consumer deciding anything on this report — a capability expiry, a
+/// settlement timestamp — should treat `synchronized == false` as "no usable
+/// time from here" rather than reading the numbers beside it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TrackingReport {
+    /// Whether a correction actually reached the clock. See the type docs:
+    /// every other field is conditioned on this.
     pub synchronized: bool,
     pub offset_s: f64,
     pub freq_ppm: f64,
@@ -181,6 +192,13 @@ pub enum ControlRequest {
     Clients { limit: usize },
     /// `status.ntsdata` — key ids only, never key material.
     NtsData,
+    /// `status.tracking` — the client discipline loop's current estimate:
+    /// how far off this clock believes it is, how well it knows that, and
+    /// whether it is synchronized at all.
+    ///
+    /// Answered by `rtimed sync`; a `rtimed serve` daemon has no discipline
+    /// loop and reports that rather than inventing a number.
+    Tracking,
     /// Liveness.
     Ping,
 }
@@ -203,6 +221,11 @@ pub enum ControlResponse {
         /// the keys are.
         master_key_ids: Vec<u32>,
     },
+    /// A newtype over a STRUCT, which the internally-tagged representation
+    /// flattens to `{"result":"tracking", <fields>}` — the same shape
+    /// `ServerStats` already produces. (Contrast `Clients` above, which cannot
+    /// be a newtype because it wraps a sequence.)
+    Tracking(TrackingReport),
     Pong {
         version: String,
     },

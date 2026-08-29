@@ -269,7 +269,9 @@ pub fn run(opts: &ServeOptions) -> i32 {
         let ctl_state = Arc::clone(&state);
         let ctl_path = opts.control_path.clone();
         std::thread::spawn(move || {
-            if let Err(e) = crate::control::serve(&ctl_path, ctl_state) {
+            if let Err(e) =
+                crate::control::serve(&ctl_path, crate::control::ControlState::for_server(ctl_state))
+            {
                 eprintln!("rtimed serve: control plane unavailable: {e}");
             }
         });

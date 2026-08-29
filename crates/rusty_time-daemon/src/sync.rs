@@ -16,6 +16,7 @@ use rusty_time_core::ntp::{self, HEADER_LEN, LeapIndicator, Mode, NtpPacket, Ntp
 use rusty_time_core::select::select;
 use rusty_time_core::{ClockCommand, DisciplineConfig, LeapMode, Sample, SourceEstimate};
 use std::net::{ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct SyncOptions {
@@ -31,6 +32,10 @@ pub struct SyncOptions {
     pub timeout_ms: u64,
     /// Print one line per exchange, for the corpus harness to parse.
     pub verbose: bool,
+    /// Where the control socket lives. Same default and same resolution as
+    /// `rtimed serve`, so `rtimec` finds either role without being told which
+    /// is running.
+    pub control_path: String,
 }
 
 impl SyncOptions {
@@ -43,6 +48,7 @@ impl SyncOptions {
             discipline: DisciplineConfig::default(),
             timeout_ms: 2000,
             verbose: false,
+            control_path: crate::control::default_path(),
         };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
@@ -50,6 +56,7 @@ impl SyncOptions {
                 it.next().cloned().ok_or(format!("{arg} needs a value"))
             };
             match arg.as_str() {
+                "--control" => opts.control_path = value()?,
                 "--dry-run" => opts.dry_run = true,
                 "--verbose" | "-v" => opts.verbose = true,
                 "--port" => {
@@ -209,6 +216,23 @@ pub fn run(opts: &SyncOptions) -> i32 {
         eprintln!("             needs {}", caps.discipline_requirement);
         eprintln!("             (use --dry-run to measure without adjusting)");
         return 1;
+    }
+
+    // The discipline loop's estimate, published for the control socket. Until
+    // the first accepted correction this reports unsynchronized with an
+    // infinite error bound, so a consumer that asks early is told "do not
+    // decide anything with me" rather than handed a zero offset.
+    let tracking = Arc::new(Mutex::new(crate::control::TrackingState::unsynchronized()));
+    {
+        let ctl_state = crate::control::ControlState::for_sync(Arc::clone(&tracking));
+        let ctl_path = opts.control_path.clone();
+        std::thread::spawn(move || {
+            // A control socket that cannot bind must never stop the clock from
+            // being steered — report and carry on disciplining.
+            if let Err(e) = crate::control::serve(&ctl_path, ctl_state) {
+                eprintln!("rtimed sync: control plane unavailable: {e}");
+            }
+        });
     }
 
     // Never plan a slew the driver cannot deliver. The discipline's bookkeeping
@@ -445,11 +469,13 @@ pub fn run(opts: &SyncOptions) -> i32 {
                         eprintln!("rtimed sync: majority restored — steering again");
                         holding = false;
                     }
+                    let mut steered = false;
                     if !opts.dry_run {
                         match driver.apply(&step.plan.command) {
                             Ok(()) => {
                                 applied_any = true;
                                 refused_in_a_row = 0;
+                                steered = true;
                                 ctl.confirm_last_plan();
                             }
                             Err(e) => {
@@ -476,6 +502,22 @@ pub fn run(opts: &SyncOptions) -> i32 {
                         if let ClockCommand::Step { add_seconds } = step.plan.command {
                             println!("rtimed sync: stepped clock by {add_seconds:+.6} s");
                         }
+                    }
+
+                    // Publish for the control socket. `synchronized` is true
+                    // only when a correction actually REACHED the clock —
+                    // the same rule the refusal path above enforces: never
+                    // report a synchronisation that is not happening. So a
+                    // dry run reports unsynchronized however good its estimate
+                    // is, because nothing is steering this clock.
+                    if let Ok(mut t) = tracking.lock() {
+                        t.publish(
+                            steered && matches!(step.verdict, ChangeVerdict::Accepted),
+                            step.estimate_offset_s,
+                            step.estimate_freq_ppm.unwrap_or(0.0),
+                            step.estimate_sd_s,
+                            step.plan.next_poll_s,
+                        );
                     }
                 }
                 None => {

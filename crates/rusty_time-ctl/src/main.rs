@@ -36,6 +36,7 @@ fn main() {
         Some("ping") => op(&socket, ControlRequest::Ping, json),
         Some("serverstats") => op(&socket, ControlRequest::ServerStats, json),
         Some("ntsdata") => op(&socket, ControlRequest::NtsData, json),
+        Some("tracking") => op(&socket, ControlRequest::Tracking, json),
         Some("clients") => {
             let limit = rest.get(1).and_then(|v| v.parse().ok()).unwrap_or(16usize);
             op(&socket, ControlRequest::Clients { limit }, json)
@@ -55,6 +56,7 @@ fn main() {
 fn usage() {
     eprintln!("usage: rtimec [--socket PATH] [--json] <command>");
     eprintln!();
+    eprintln!("  tracking        this clock's offset, error bound, and whether it is synchronized");
     eprintln!("  serverstats     request/response counters, drops, interleaved count");
     eprintln!("  clients [N]     most recently seen clients (default 16)");
     eprintln!("  ntsdata         NTS master key ids currently held");
@@ -89,6 +91,19 @@ fn print_human(response: &ControlResponse) -> i32 {
     match response {
         ControlResponse::Pong { version } => {
             println!("rtimed {version} is answering");
+            0
+        }
+        ControlResponse::Tracking(t) => {
+            // The bound is the number a caller decides on, so lead with the
+            // verdict and print the bound next to the offset it qualifies.
+            println!(
+                "synchronized       : {}",
+                if t.synchronized { "yes" } else { "no" }
+            );
+            println!("offset             : {:+.9} s", t.offset_s);
+            println!("error bound        : {:.9} s", t.error_bound_s);
+            println!("frequency          : {:+.3} ppm", t.freq_ppm);
+            println!("poll interval      : 2^{} s", t.poll_log2);
             0
         }
         ControlResponse::ServerStats(s) => {

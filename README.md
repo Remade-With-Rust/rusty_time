@@ -1,3 +1,4 @@
+### In The Wild with 2,154 Active Installs
 > **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_time` to put an NTP timestamp on every chunk.
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing

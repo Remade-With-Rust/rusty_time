@@ -1,0 +1,18 @@
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-nostartfiles",
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+]
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[env]
+ESP_LOG = "info"
+
+# The esp toolchain ships no prebuilt `core` for `-none-elf`; it is built from
+# source. Note there is no `alloc` here and that is the point: the rusty_time
+# leaf allocates nothing, so this firmware links no heap at all.
+[unstable]
+build-std = ["core"]

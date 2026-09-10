@@ -12,6 +12,14 @@ readme = "README.md"
 keywords = ["ntp", "nts", "time", "clock", "sntp"]
 categories = ["date-and-time", "network-programming", "no-std"]
 
+[features]
+default = ["std"]
+# The `no_std` leaf is `ntp.rs` alone: the NTPv4 packet codec and the RFC 5905
+# offset/delay arithmetic, with no `alloc`, no clock and no socket -- what an
+# SNTP client on a Cortex-M4F / RV32 part needs and nothing more. Everything
+# that reaches for `Vec`/`String`/`HashMap` or OS entropy stays behind `std`.
+std = []
+
 [dependencies]
 
 # The server hot path as a deterministic instruction-count workload. `harness =
@@ -21,15 +29,21 @@ categories = ["date-and-time", "network-programming", "no-std"]
 [[bench]]
 name = "hot_path"
 harness = false
+# Drives the std-only server/filter/client paths.
+required-features = ["std"]
 
 # The MRU status report. `harness = false`: a plain binary, not libtest.
 [[bench]]
 name = "mru_report"
 harness = false
+# Drives the std-only server/filter/client paths.
+required-features = ["std"]
 
 [[bench]]
 name = "client_path"
 harness = false
+# Drives the std-only server/filter/client paths.
+required-features = ["std"]
 
 [lints]
 workspace = true

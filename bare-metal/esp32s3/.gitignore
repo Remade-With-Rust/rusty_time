@@ -1,0 +1,7 @@
+# This firmware is excluded from the workspace, so the root `/target` rule --
+# which is anchored at the repo root -- does not reach its build directory.
+/target
+
+# The captured board run. The RESULT block that matters is transcribed into
+# README.md, which is the durable ledger row; the raw log is a working file.
+/run.log

@@ -33,6 +33,36 @@ jobs:
       - run: cargo check -p rusty_time-core -p rusty_time-nts -p rusty_time-wasm -p rusty_time-api --target ${{ matrix.target }}
         if: ${{ startsWith(matrix.target, 'wasm32') }}
 
+  # The `no_std` leaf (build-me-bare.md B2). `rusty_time-core` carries the
+  # `no-std` category, and a category on crates.io is not a claim -- a target
+  # that compiles is. These two are the Kairos targets (Cortex-M4F and RV32),
+  # so `rusty_rtos_sntp` can wrap the NTP codec instead of remaking coreSNTP.
+  no-std-leaf:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - thumbv7em-none-eabihf
+          - riscv32imac-unknown-none-elf
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      # Neither target has `std` at all, so this fails loudly the moment
+      # anything outside `ntp.rs` escapes the `std` feature gate.
+      - run: cargo check -p rusty_time-core --no-default-features --target ${{ matrix.target }}
+
+  # ...and the leaf's own tests, on the host, compiled against the SAME
+  # `no_std` code path. The bare-metal rungs above prove it builds; this proves
+  # it is right. (The board row lives in bare-metal/esp32s3 and is hand-run:
+  # it needs Espressif's Rust fork, which no CI runner has.)
+  no-std-leaf-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test -p rusty_time-core --no-default-features
+      - run: cargo clippy -p rusty_time-core --no-default-features --all-targets -- -D warnings
+
   test:
     strategy:
       fail-fast: false

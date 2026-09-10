@@ -156,7 +156,7 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
 /// The fixed NTPv4 header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,24 +491,56 @@ mod tests {
         assert!((delay - 0.050).abs() < 1e-9, "delay {delay}");
     }
 
+    /// Header + one valid EF + trailing garbage.
+    ///
+    /// Built in a fixed array rather than a `Vec` so the whole suite compiles
+    /// under `--no-default-features`, which is how the `no_std` code path is
+    /// exercised on the host.
     #[test]
     fn extension_iteration_handles_garbage() {
-        // Header + one valid EF + trailing garbage.
-        let mut buf = vec![0u8; 48];
+        let mut buf = [0u8; HEADER_LEN + 16 + 3];
         buf[0] = (4 << 3) | 3;
-        buf.extend_from_slice(&0x0104u16.to_be_bytes()); // type
-        buf.extend_from_slice(&16u16.to_be_bytes()); // len 16
-        buf.extend_from_slice(&[0xAB; 12]); // value
-        buf.extend_from_slice(&[1, 2, 3]); // garbage tail
-        let items: Vec<_> = extension_fields(&buf).collect();
-        assert_eq!(items.len(), 2);
-        match items[0] {
-            Trailer::Extension(ef) => {
+        buf[48..50].copy_from_slice(&0x0104u16.to_be_bytes()); // type
+        buf[50..52].copy_from_slice(&16u16.to_be_bytes()); // total len 16
+        buf[52..64].copy_from_slice(&[0xAB; 12]); // value
+        buf[64..67].copy_from_slice(&[1, 2, 3]); // garbage tail
+
+        let mut it = extension_fields(&buf);
+        match it.next() {
+            Some(Trailer::Extension(ef)) => {
                 assert_eq!(ef.field_type, 0x0104);
                 assert_eq!(ef.value, &[0xAB; 12][..]);
             }
-            _ => panic!("expected extension"),
+            other => panic!("expected an extension field, got {other:?}"),
         }
-        assert!(matches!(items[1], Trailer::Opaque(&[1, 2, 3])));
+        assert!(matches!(it.next(), Some(Trailer::Opaque(&[1, 2, 3]))));
+        assert!(it.next().is_none(), "iteration ends after the opaque tail");
+    }
+
+    /// The `no_std` leaf's kill test (`build-me-bare.md` B2): a 48-byte client
+    /// request survives `to_bytes` -> `parse` unchanged.
+    ///
+    /// This is the whole contract `rusty_rtos_sntp` wraps -- build a request,
+    /// put it on the wire, read one back -- and it runs with no `alloc`, no
+    /// clock and no socket, so it holds identically on a Cortex-M4F, an RV32
+    /// and the Xtensa part it was signed off on.
+    #[test]
+    fn client_request_round_trips_in_48_bytes() {
+        let nonce = NtpTimestamp(0x1234_5678_9ABC_DEF0);
+        let req = NtpPacket::client_request(4, nonce);
+
+        let wire = req.to_bytes();
+        assert_eq!(wire.len(), HEADER_LEN, "an SNTP request is 48 bytes");
+
+        let back = NtpPacket::parse(&wire).expect("our own request must parse");
+        assert_eq!(req, back, "round trip changed the packet");
+
+        // The fields an SNTP client actually depends on, spelled out: mode 3 so
+        // a server answers, version 4, and the nonce echoed back untouched --
+        // it is the only spoofing defence an unauthenticated client has.
+        assert_eq!(back.mode, Mode::Client);
+        assert_eq!(back.version, 4);
+        assert_eq!(back.transmit_ts, nonce);
+        assert!(back.origin_ts.is_zero() && back.receive_ts.is_zero());
     }
 }

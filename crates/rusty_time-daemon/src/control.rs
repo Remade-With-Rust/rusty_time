@@ -12,8 +12,7 @@
 
 use crate::server::ServerState;
 use rusty_time_api::{
-    ClientRow, ControlEndpoint, ControlRequest, ControlResponse, ServerStatsReport,
-    TrackingReport,
+    ClientRow, ControlEndpoint, ControlRequest, ControlResponse, ServerStatsReport, TrackingReport,
 };
 // `Read`/`Write` are reached through the generic bounds on `serve_connection`,
 // so they need no import here; `BufRead` is needed for `read_line`.
@@ -295,11 +294,7 @@ fn serve_loopback(port: u16, state: ControlState) -> Result<(), String> {
 /// One request, one response, then the connection closes. Reader and writer
 /// are passed separately because the two socket types clone differently
 /// (`try_clone` is fallible and belongs at the call site).
-fn serve_connection<R, W>(
-    read: R,
-    mut writer: W,
-    state: &ControlState,
-) -> Result<(), String>
+fn serve_connection<R, W>(read: R, mut writer: W, state: &ControlState) -> Result<(), String>
 where
     R: std::io::Read,
     W: std::io::Write,
@@ -387,7 +382,10 @@ mod tests {
         assert!(t.snapshot().synchronized);
         t.updated = std::time::Instant::now() - std::time::Duration::from_secs(600);
         let stale = t.snapshot();
-        assert!(!stale.synchronized, "a stalled loop must not report synchronized");
+        assert!(
+            !stale.synchronized,
+            "a stalled loop must not report synchronized"
+        );
         assert!(stale.error_bound_s > 0.02, "and its bound must have grown");
     }
 

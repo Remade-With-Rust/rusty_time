@@ -10,7 +10,9 @@
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 chrony, remade with Rust. A pure-Rust, memory-safe NTP/NTS client + server targeting
-Linux, macOS, Windows, and wasm.
+Linux, macOS, Windows, wasm — and, since 0.2.0, **bare-metal microcontrollers**:
+the NTP codec runs `no_std` with no heap on Cortex-M4F, RV32 and Xtensa, and has
+been run on an ESP32-S3.
 
 - Mission plan: [docs/plans/time_mission.md](docs/plans/time_mission.md)
 - Performance ledger: [corpus/LEDGER.md](corpus/LEDGER.md)
@@ -29,7 +31,8 @@ SpaceDB-backed persistence, **interleaved mode** (RFC 9769), per-client and
 global rate limiting, `recvmmsg` batching, an ops control plane, platform clock
 drivers with service integration and packaging, a **wasm client** for browsers
 and edge functions, and reference clocks over gpsd SHM, chrony SOCK and PTP
-hardware clocks.
+hardware clocks. The protocol layer also builds as a **`no_std` leaf with no
+`alloc`** for microcontrollers — see [On a microcontroller](#on-a-microcontroller).
 
 Interop is verified against chrony in both directions and all three modes:
 chronyd selects an `rtimed` server as its synchronisation source over plain NTP
@@ -141,8 +144,8 @@ As a library:
 
 ```toml
 [dependencies]
-rusty_time-core = "0.1"    # protocol + discipline, no I/O, wasm-clean
-rusty_time-nts  = "0.1"    # NTS (RFC 8915)
+rusty_time-core = "0.2"    # protocol + discipline, no I/O, wasm-clean
+rusty_time-nts  = "0.2"    # NTS (RFC 8915)
 ```
 
 ```sh
@@ -190,6 +193,65 @@ client.now_ms(Date.now(), performance.now());   // corrected, never steps back
 client.confidence_ms(performance.now());        // error bound, widens if stale
 ```
 
+## On a microcontroller
+
+A chip has no allocator to spare, so `rusty_time-core`'s protocol layer builds
+with **no `std` and no `alloc`**: the NTPv4 packet codec, RFC 7822 extension
+fields, and the RFC 5905 §8 offset/delay arithmetic. It reads no clock, opens no
+socket and owns no buffer, so an SNTP client needs nothing else from us.
+
+```toml
+rusty_time-core = { version = "0.2", default-features = false }
+```
+
+```rust
+use rusty_time_core::ntp::{NtpPacket, NtpTimestamp, offset_delay};
+
+// Build a request. The nonce SHOULD be unpredictable rather than the real
+// clock: it is echoed back as origin_ts and is the only spoofing defence an
+// unauthenticated client has.
+let req = NtpPacket::client_request(4, NtpTimestamp(nonce));
+let wire: [u8; 48] = req.to_bytes();          // no allocation
+
+// ...send `wire`, receive 48 bytes back...
+let resp = NtpPacket::parse(&reply)?;          // never panics on untrusted bytes
+let (offset, delay) = offset_delay(t1, t2, t3, t4);
+```
+
+Everything above the wire — the sample filter, falseticker selection, the
+discipline loop, the server — needs `Vec`/`String` and stays behind the
+default-on `std` feature. Default builds are unchanged.
+
+| platform | status |
+|---|---|
+| `thumbv7em-none-eabihf` (Cortex-M4F) | **compile-gated in CI**, every push |
+| `riscv32imac-unknown-none-elf` (RV32) | **compile-gated in CI**, every push |
+| `xtensa-esp32s3-none-elf` (ESP32-S3) | **run on the part** — 30/30 checks, [`bare-metal/esp32s3/`](bare-metal/esp32s3/) |
+
+The CI rungs prove it builds; the leaf's own test suite runs against the same
+`no_std` code path on the host (`cargo test -p rusty_time-core
+--no-default-features`) to prove it is right. The ESP32-S3 row is the third
+claim — that it runs on silicon — and it is hand-run, because it needs
+Espressif's Rust fork that no CI runner has:
+
+```text
+=== rusty_time-core leaf on ESP32-S3 (xtensa, no_std, NO alloc) ===
+[1] client request                    5 checks   ok
+[2] server response (literal image)  14 checks   ok
+[3] offset / delay (RFC 5905 §8)      5 checks   ok
+      offset 0.09999999997671694 s   delay 0.05000000004656613 s
+      2 s across the 2036 era wrap measured as 2 s
+[4] extension fields and rejections    6 checks   ok
+
+checks passed 30 / 30
+RESULT: PASS -- the rusty_time-core leaf ran on the board
+```
+
+That firmware parses a **hand-written 48-byte wire image** rather than the
+codec's own output — parsing what we wrote would only prove the codec is
+self-consistent — and runs the arithmetic where `f64` is soft-float, which is
+the half a host test cannot stand in for. It links no heap at all.
+
 ## Verifying a build
 
 `tools/smoke/smoke.sh` runs the built binaries end to end on the current
@@ -212,6 +274,7 @@ crates/rusty_time-ctl/     deliverable: rtimec
 crates/rusty_time-wasm/    virtual clock for wasm targets
 crates/rusty_time-alloc/   the allocator seam
 crates/rusty_time-sim/     deliverable: timecorp — deterministic corpus runner
+bare-metal/esp32s3/        on-board proof of the no_std leaf (excluded from the workspace)
 corpus/                    scenarios, results, LEDGER.md
 fuzz/                      cargo-fuzz targets (packet, config, NTS records)
 ```

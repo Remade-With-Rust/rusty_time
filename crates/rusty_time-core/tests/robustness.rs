@@ -2,7 +2,14 @@
 //! libFuzzer targets (which need nightly + libFuzzer and run in CI). Same
 //! property: no input may panic the parsers.
 
-use rusty_time_core::{config, ntp};
+use rusty_time_core::ntp;
+
+// `config` parses text and needs `String`, so it lives behind `std`. The `ntp`
+// half below deliberately does NOT: it is the leaf that goes on a chip, so its
+// no-panic sweep must keep running under `--no-default-features`, which is the
+// configuration a Cortex-M4F build actually compiles.
+#[cfg(feature = "std")]
+use rusty_time_core::config;
 
 /// Tiny deterministic generator (xorshift64*) — no dependency, same sequence on
 /// every platform.
@@ -39,6 +46,7 @@ fn ntp_parse_never_panics() {
     }
 }
 
+#[cfg(feature = "std")]
 #[test]
 fn config_parse_never_panics() {
     let mut rng = X(0xC0FF_EE00);

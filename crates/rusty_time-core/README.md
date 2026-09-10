@@ -22,6 +22,60 @@ can drive it, and it compiles for `wasm32` unchanged.
 Sign convention throughout: an offset is **the number of seconds to add to the local
 clock** to match the source (RFC 5905 theta). Positive offset means the local clock is behind.
 
+## The `no_std` leaf
+
+`ntp` builds on every target with **no `std` and no `alloc`** — the NTPv4 packet
+codec, RFC 7822 extension iteration, and the RFC 5905 §8 offset/delay
+arithmetic. It reads no clock, opens no socket and owns no buffer, so an SNTP
+client on a Cortex-M4F or RV32 part needs nothing else:
+
+```toml
+rusty_time-core = { version = "0.2", default-features = false }
+```
+
+Everything above the wire — `filter`, `select`, `discipline`, `client`,
+`server`, `config`, `refclock`, `vclock` — needs `Vec`/`String` and stays behind
+the default-on `std` feature.
+
+```rust
+use rusty_time_core::ntp::{NtpPacket, NtpTimestamp, offset_delay};
+
+// The nonce SHOULD be unpredictable rather than the real clock: it is echoed
+// back as origin_ts and is the only spoofing defence an unauthenticated
+// client has.
+let req = NtpPacket::client_request(4, NtpTimestamp(nonce));
+let wire: [u8; 48] = req.to_bytes();     // no allocation
+
+// ...send `wire`, receive 48 bytes back...
+let resp = NtpPacket::parse(&reply)?;     // never panics on untrusted bytes
+let (offset, delay) = offset_delay(t1, t2, t3, t4);
+```
+
+### Embedded platforms
+
+| platform | status |
+|---|---|
+| `thumbv7em-none-eabihf` (Cortex-M4F) | **compile-gated in CI**, every push |
+| `riscv32imac-unknown-none-elf` (RV32) | **compile-gated in CI**, every push |
+| `xtensa-esp32s3-none-elf` (ESP32-S3) | **run on the part** — 30/30 checks |
+
+Three separate claims, deliberately. The CI rungs prove the leaf **builds**, so
+the `no-std` category on this crate is measured rather than a label. The leaf's
+own test suite runs on the host against the same `no_std` code path
+(`cargo test -p rusty_time-core --no-default-features`) to prove it is
+**right**. And a hand-run firmware proves it **runs on silicon** — an ESP32-S3
+building a request, parsing a response off a hand-written wire image and
+computing the RFC 5905 offset in soft-float, with no heap linked at all:
+
+```text
+checks passed 30 / 30
+RESULT: PASS -- the rusty_time-core leaf ran on the board
+```
+
+The firmware, the full board output and what it does *not* claim are in
+[bare-metal/esp32s3/](https://github.com/remade-with-rust/rusty_time/tree/main/bare-metal/esp32s3).
+It is hand-run because it needs Espressif's Rust fork, which no CI runner has.
+
 ## Part of rusty_time
 
 [rusty_time](https://github.com/remade-with-rust/rusty_time) is chrony, remade with Rust:

@@ -1,0 +1,27 @@
+[package]
+name = "s3time"
+version = "0.1.0"
+edition = "2021"
+
+# On-board proof for rusty_time-core's `no_std` leaf: an ESP32-S3 (Xtensa LX7,
+# 32-bit) building an SNTP request, parsing a server response and computing the
+# RFC 5905 offset with NO heap and NO clock. Deliberately outside the workspace:
+# it needs Espressif's Rust fork, which CI does not have, so it is a hand-run
+# instrument, not a gate.
+
+[dependencies]
+esp-hal = { version = "1.2.1", features = ["esp32s3", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
+esp-println = { version = "0.18.0", default-features = false, features = ["esp32s3", "jtag-serial"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32s3", "println", "panic-handler"] }
+
+# The leaf, and only the leaf. `default-features = false` is the whole point:
+# it turns off `std` and with it the filter, discipline, server and config
+# modules, leaving the NTPv4 codec and the offset arithmetic.
+rusty_time-core = { path = "../../crates/rusty_time-core", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = 2

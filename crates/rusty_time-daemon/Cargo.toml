@@ -36,7 +36,7 @@ rusty_time-nts = { workspace = true, features = ["ke"] }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 serde_json = { workspace = true }
 oxitls-rcgen = "0.3.0"
-spacedb-sdk = { version = "0.5.2", default-features = false }
+spacedb-sdk = { version = "0.6.0", default-features = false }
 argon2 = "0.5.3"
 aes-gcm = "0.11.1"
 

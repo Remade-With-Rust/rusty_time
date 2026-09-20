@@ -2008,6 +2008,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusty_zstd"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc2318a1441e10cf436f0bf98615216b0a5410b6f546548b50faa170c7b4a1a6"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2202,9 +2208,9 @@ dependencies = [
 
 [[package]]
 name = "spacedb-access"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a109d0f044a19e4c31ee8e04a72629290ac2c48dfaaefe28177b9b06d8ac35c4"
+checksum = "3b48aac6afb204e3d2de4e9e0915ce4d974e50d17ff3e671cd830131fc9b74fc"
 dependencies = [
  "blake3",
  "getrandom 0.3.4",
@@ -2216,18 +2222,18 @@ dependencies = [
 
 [[package]]
 name = "spacedb-consistency"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b78eb34d357514ec94a2e23c7ef09a7fc3966ae8e4e5019ce598dcf5f45171f4"
+checksum = "69d50bfea5c6c6606872b97d93572f32f896e50acd189a725284452edcc651ed"
 dependencies = [
  "spacedb-crdt",
 ]
 
 [[package]]
 name = "spacedb-crdt"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65ecfab39719ce6c56e4498e7f2a29cfd7a88fd872e2a2ec45632f745ae0e997"
+checksum = "ea256df6fc984e5cbcf796620bea988a312ef4df95ad3dfddaa2a45995cc0390"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -2239,9 +2245,9 @@ dependencies = [
 
 [[package]]
 name = "spacedb-meter"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c3b16039931f675c70121742d3910877828bd17fc87fc43c155dde9d227fc1e"
+checksum = "cc1cc28e66b905a3d636d1fd1fdb63700ebb7415b8d636ac5912380d249fb69f"
 dependencies = [
  "postcard",
  "serde",
@@ -2250,9 +2256,9 @@ dependencies = [
 
 [[package]]
 name = "spacedb-sdk"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffe654798d055da32c3516fc57163cf81c4820c31340945e8896c431429f73e8"
+checksum = "876accc5ac9c9ca6c3635f87f3866288c8be758b930de6dde7e19f8a61de5a8d"
 dependencies = [
  "spacedb-access",
  "spacedb-consistency",
@@ -2263,9 +2269,9 @@ dependencies = [
 
 [[package]]
 name = "spacedb-store"
-version = "0.5.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "750ffd093e84a072b8cc3e3a1aca5588e597f52220f1ebd188a4d6758285901b"
+checksum = "e655fa4dda0398b4f358a19ba25861bc19e62ac5426b1d4d3a2cedf607b04782"
 dependencies = [
  "aes-gcm 0.10.3",
  "blake3",
@@ -2273,6 +2279,7 @@ dependencies = [
  "postcard",
  "rand",
  "redb",
+ "rusty_zstd",
  "serde",
  "thiserror 1.0.69",
  "zeroize",

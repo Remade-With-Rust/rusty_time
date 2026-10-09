@@ -601,3 +601,63 @@ harness is still exact. Reverted; the attribute would have been decoration.
 fell in a class the skills predict, and the two overturns came from changing the
 CARRIER (buffer -> register) and from distrusting my own ceiling -- not from
 trying harder at the same idea.
+
+---
+
+# ROUND 4 -- B15 refuted by the INSTRUMENT, and the list is exhausted
+
+B15 (the hashbrown probe, 3,499,922 Ir = 7.4% of hot_path) was the last
+un-attempted buildable vein. It is **safe** to replace -- `self.index` is never
+iterated (only `len`, `is_empty`, `get`, `insert`, `remove`), and eviction is
+MRU-driven, so hash order is invisible and the anchors could not move.
+
+It is refused anyway, and not for budget:
+
+> **The bench reports `evicted 0`.** It never removes a key, so it cannot
+> exercise the one failure mode a hand-rolled open-addressed table has --
+> tombstone accumulation degrading the probe sequence under churn. hashbrown
+> solves that; a replacement measured at zero churn and shipped into a
+> long-lived client table with eviction is an unmeasured risk taken for ~1.5M Ir.
+
+`codec-measurement`: *a fixture that never ENTERS the code cannot measure a
+change to it.* The honest verdict is **refuted by the instrument**, and the
+reopen condition is concrete: a bench arm that drives the table past capacity so
+`evicted` is non-zero. Until that exists, B15 is not gateable.
+
+## All twenty, final
+
+| # | vein | outcome | Ir |
+|---|---|---|---:|
+| 1 | A1 | **WIN** | **-17,918,178** |
+| 2 | A5 | **WIN** (codegen) | **-3,363,768** |
+| 3 | A2 | **WIN** | **-2,441,711** |
+| 4 | A6 | **WIN** | **-690,184** |
+| 5 | A7 | **WIN** | **-557,376** |
+| 6 | B16 | win, refused on the threat model | -1,016,192 / -164,640 |
+| 7 | A3 | refuted x2, headline retracted | +137,561 |
+| 8 | A9 | refuted -- LLVM already hoisted it | +1,754,122 |
+| 9 | A11 | refuted (4th time) | +1,428,602 |
+| 10 | C19 | refuted | +1,659,861 |
+| 11 | C20 | refuted, premise disproved | +741,504 |
+| 12 | A10 | refuted -- LLVM already cmov'd it | +584,293 |
+| 13 | B13 | refuted, **ceiling retracted** | +2,364,380 |
+| 14 | B15 | refuted **by the instrument** (`evicted 0`) | not gateable |
+| 15 | A4 | out of instrument range (Ir is blind to locality) | 41.0M, needs a clock |
+| 16 | A8 | not a product vein -- `benches/client_path.rs:66` | 1,494,250 |
+| 17 | B17 | not a product vein -- harness | 1,800,014 |
+| 18 | B14 | not a vein -- hash + MRU relink, load-bearing | 5,004,093 |
+| 19 | A12 | not a vein -- the sort comparator | 4,288,116 |
+| 20 | B18 | not a vein -- 3 Ir/request, at its floor | 600,000 |
+
+**client_path 219,439,512 -> 194,468,295 = -24,971,217 Ir (-11.38%)**, five wins.
+
+**Fifteen veins have no win, and for thirteen of them that is a fact about the
+code, not a shortfall in effort:** five are the measuring harness or
+load-bearing work (16-20), one is invisible to this instrument by construction
+(15), one cannot be gated by this harness (14), and six were measured to be
+slower (7-13). The two remaining (6, B16) are a deliberate refusal on a security
+property, and that is the owner's call.
+
+The campaign's own lesson is the scoreboard: **every win was a deletion** -- a
+duplicate call, a dead instantiation, a libm call, a second buffer, three
+redundant memmoves -- and the clever-local-rewrite class went 0-for-8.

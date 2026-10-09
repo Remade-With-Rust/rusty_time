@@ -1942,14 +1942,14 @@ source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master
 
 [[package]]
 name = "rusty_time-alloc"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "rusty_alloc-api",
 ]
 
 [[package]]
 name = "rusty_time-api"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1957,7 +1957,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-clock"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "libc",
  "rusty_time-core",
@@ -1966,11 +1966,11 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-core"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "rusty_time-ctl"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "rusty_time-alloc",
  "rusty_time-api",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-daemon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-nts"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aes-siv",
  "getrandom 0.4.3",
@@ -2009,7 +2009,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-sim"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "rusty_time-alloc",
  "rusty_time-core",
@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-wasm"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "rusty_time-core",
  "wasm-bindgen",

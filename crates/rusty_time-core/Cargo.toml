@@ -40,6 +40,11 @@ harness = false
 required-features = ["std"]
 
 [[bench]]
+name = "codec"
+harness = false
+# The no_std leaf priced on its own -- no table, no filter, no clock.
+
+[[bench]]
 name = "client_path"
 harness = false
 # Drives the std-only server/filter/client paths.

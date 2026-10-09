@@ -345,16 +345,26 @@ impl MultiController {
     ///
     /// Regression once it has enough spread; before that the lowest-delay
     /// single sample, which is the least contaminated reading available.
+    /// Single caller (`observe`), single callee (`regress`), and 37.2 Ir per
+    /// call of its own work: the edge census prices it as a pass-through frame.
+    /// `rusty-compiler-leverage` A3 — a single-caller function that is not
+    /// inlined pays a frame for nothing.
+    #[inline(always)]
     pub fn estimate(&mut self, index: usize, mono_now_s: f64) -> Estimate {
-        let samples = self.registers[index].len();
-        match self.registers[index].regress(mono_now_s) {
+        // Bound ONCE. This was three separate `self.registers[index]`
+        // expressions -- three bounds checks and three address computations for
+        // one register (`rusty-curiosity`: bind the thing once and use it
+        // twice, rather than re-deriving the target).
+        let reg = &mut self.registers[index];
+        let samples = reg.len();
+        match reg.regress(mono_now_s) {
             Some(e) => Estimate {
                 offset_s: e.offset,
                 freq_ppm: e.freq_ppm,
                 sd_s: e.offset_sd.max(1e-7),
                 samples,
             },
-            None => match self.registers[index].best() {
+            None => match reg.best() {
                 Some(best) => Estimate {
                     offset_s: best.offset,
                     freq_ppm: None,

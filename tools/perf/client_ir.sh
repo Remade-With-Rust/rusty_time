@@ -34,6 +34,12 @@ esac
 
 # Build the BINARY with symbols and take the freshest. Measuring a stale binary
 # is the classic way to report on code that no longer exists.
+# `touch` is load-bearing on this rig. Cargo's fingerprint across the /mnt
+# drvfs mount does not reliably notice an edit, so a run can measure a STALE
+# binary while the change sits in the tree -- caught live: three consecutive
+# "identical" A/B results, and a run that read the pre-fix Ir with the fix
+# applied. A stale binary measures code that no longer exists.
+touch crates/rusty_time-core/src/filter.rs crates/rusty_time-core/src/client.rs crates/rusty_time-core/src/discipline.rs crates/rusty_time-core/benches/client_path.rs 2>/dev/null
 CARGO_PROFILE_RELEASE_DEBUG=true CARGO_TARGET_DIR="$TARGET" \
     cargo build --release --bench client_path 2>&1 | grep -E '^(error|warning: unused)' -A5
 bin=$(ls -t "$TARGET"/release/deps/client_path-* 2>/dev/null | grep -v '\.d$' | head -1)

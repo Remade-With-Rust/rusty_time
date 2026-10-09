@@ -757,3 +757,99 @@ The campaign's two transferable lessons:
    limits** (B15 twice, A4 once). Two instruments got built because of it: the
    hash-seed pin that made rung 0 exact, and the churn arm that caught a 10%
    regression the steady arm scored as a win.
+
+---
+
+# ROUND 6 — ten MORE veins (N1–N10), 2026-10-08
+
+The twenty above were closed. These ten came from the two censuses the first
+five rounds never took — **call counts and caller-callee EDGES**
+(`instruction-counting` §5b/§5c) — plus a reading of the `no_std` codec leaf.
+
+A third instrument was built for them, because `ntp.rs` had none:
+`benches/codec.rs` + `tools/perf/codec_ir.sh`. Bytes in, bytes out, no table,
+no filter, no clock — the different corpus shape §4 asks for.
+
+## Kept
+
+| vein | change | instrument | Ir |
+|---|---|---|---:|
+| **N3** | `ClientRecord`'s three `Option<NtpTimestamp>` to `NtpTimestamp`, zero = unset | hot_path | **-808,139 (-1.77%)** |
+| **N2a** | `#[inline(always)]` on `MultiController::estimate` — single caller, single callee, 37.2 Ir/call of frame | client_path | **-317,822 (-0.16%)** |
+
+`hot_path` 228.3 to **224.3 Ir/request**. Both gates byte-identical
+(`0xc0452ab605328800`, `f456d8bf8ff664d5`); 218 tests, clippy `-D warnings`,
+fmt, and the `no_std` leaf on both bare-metal targets.
+
+**N3 is the B5 pattern again:** a 16-byte `Option` over a type with no niche,
+where the protocol already spells "unset" as all-zero. The origin-zero
+rejection (`!request_origin.is_zero()`) was *already* explicit and independent
+of the `Option`, which is what made the sentinel safe rather than merely
+convenient — that check is the security property, not the discriminant.
+
+## Refuted — measured, numbers recorded
+
+| vein | probe | Ir | why |
+|---|---|---:|---|
+| **N9** | `Mode`/`LeapIndicator` `from_bits` as a total lookup table | **+2,048,014 (+4.79%)** | LLVM already compiles the ladder to arithmetic — the discriminants ARE the wire values — so the table only added a real load. `rusty-compiler-leverage` B5 predicts this, and the magnitude matched its recorded bitmask refutation (+2.03M) |
+| **N8** | `read_u32`/`read_u64` to one `&[u8; 48]` via `first_chunk` | **+0, exactly** | §6: a byte-identical total means the compiler already did it. Cost moved buckets (ntp.rs -1,024,000, `slice/mod.rs` +1,600,000) with the total bit-identical. **B18's "already at its floor" was right** |
+| **N9'** | `#[repr(u8)]` + `self as u8` for `bits()` | +0 | LLVM had already made the match a cast. Kept for clarity, not as a win |
+| **N2b** | bind `self.registers[index]` once instead of three times | +0 | already CSE'd, like `admit_handle` in round 1 |
+| **N1** | `#[inline(always)]` on `residual_sd` (one caller, 777 Ir/call) | +0 alone, +0 combined | LLVM had already made the call. An attribute that buys nothing is still a constraint; removed |
+
+**The "clever local rewrite" class is now 0-for-8 on this codebase** (rounds
+1–5 went 0-for-6; N8 and N9 make eight). Every win in six rounds has been a
+deletion, a representation change, or a libm swap.
+
+## Instrument fixes
+
+- **N7** — `benches/codec.rs` + `codec_ir.sh`, the third shape. Its own tap was
+  **63% of its first measurement** (19 FNV folds per packet); `write` is the
+  inverse of `parse`, so folding the six OUTPUT words covers all thirteen
+  fields transitively. 19 mixes to 9, total 67,297,513 to 42,721,512, and
+  `ntp.rs` became the second-largest row at 23.6 Ir/packet.
+- **N4** — `ir.sh` and `client_ir.sh` now `touch` their sources before building.
+  **Caught live:** three consecutive identical A/B results, and one run that
+  read the pre-A1 Ir with A1 sitting in the tree. Cargo's fingerprint across
+  the `/mnt` drvfs mount does not reliably see an edit, so a run can measure a
+  stale binary. `codec_ir.sh` shipped with the fix.
+- **N6** — the `client_path` harness tax, which C19 computed for `hot_path` and
+  never for this one: **3,661,681 Ir = 1.67% = 229 Ir/step** (main's own
+  1,943,431 plus the 1,718,250 of `log` it calls). Small, so section A's shares
+  stand.
+
+## Corrections to rounds 1–5
+
+- **A8 is not a vein and its figure was half.** `benches/client_path.rs:66` is
+  `-u.ln()` and there is **no `ln`/`log` call anywhere in the product source**.
+  32,000 calls (2/step), 1,718,250 Ir — double the recorded 16,000 / 859,160 —
+  and all of it the harness's noise generator. Folded into N6. (Round 2's commit
+  message said "A8 is the harness"; the ceiling table still priced it as real.)
+- **B18 overstated its conclusion.** "`ntp.rs` is already at its floor" was read
+  off an instrument where `parse`/`write` inline into `hot_path::main` with 52%
+  of events unattributed. N8 then confirmed the *claim* by measurement — but it
+  needed the codec instrument to be a claim rather than an assumption.
+
+## Also landed
+
+- **N5** — the density branch built a parallel `Vec<f64>` of every timestamp to
+  index what `window[i].t` answers directly: one allocation and one full copy
+  pass per estimate, deleted. Off-default (`slope_density_weighting: false`), so
+  no instrument can price it — and it had **no test at all**, which is how a
+  rewrite of its inner loop passed a 217-test suite without executing a line.
+  `density_weighting_factors_span_the_window` now pins the half-gap rule and
+  enters the branch.
+
+## Still priced, not built
+
+- **N10** — `to_bytes()`'s `[0u8; 48]` is fully overwritten by `write`. Reached
+  on the daemon's plain-reply path (`server.rs:1019`), which neither core
+  instrument covers; a 48-byte memset under const-index stores is near-certain
+  to be elided already. Needs `server_ir.sh` to settle.
+
+## One law worth carrying forward
+
+**N3 won 1.77% on `hot_path` and cost ~50K on `client_path`** — same crate, an
+unrelated function, codegen shifted. `instruction-counting` §10 says measure
+every change on every instrument, and this is that law firing on this codebase.
+Quote both numbers or neither.

@@ -118,15 +118,25 @@ pub struct ClientRecord {
     pub dropped: u64,
     /// Dropped requests since the last Kiss-o'-Death, for deterministic leak.
     drops_since_kod: u32,
-    /// T2 of the last request we accepted.
-    pub last_receive: Option<NtpTimestamp>,
+    /// T2 of the last request we accepted. [`NtpTimestamp::ZERO`] until there
+    /// has been one.
+    ///
+    /// Zero rather than `Option` deliberately: `NtpTimestamp` is a bare `u64`
+    /// with no niche, so `Option<NtpTimestamp>` is SIXTEEN bytes for eight
+    /// bytes of payload and every read tests a discriminant. An all-zero
+    /// timestamp is already how RFC 5905 spells "unset" on the wire, so the
+    /// sentinel is the protocol's own, not one invented here
+    /// (`rusty-compiler-leverage` B5: the one win in that table was a
+    /// representation change, not a bit trick).
+    pub last_receive: NtpTimestamp,
     /// The true transmit timestamp of our last response, once the driver
-    /// reports it. `None` until then, which is why interleaved mode cannot
-    /// answer the very first request.
-    pub last_transmit: Option<NtpTimestamp>,
+    /// reports it. [`NtpTimestamp::ZERO`] until then, which is why interleaved
+    /// mode cannot answer the very first request.
+    pub last_transmit: NtpTimestamp,
     /// The receive timestamp we put in our last response. A client asks for
-    /// interleaved mode by echoing exactly this.
-    pub last_receive_sent: Option<NtpTimestamp>,
+    /// interleaved mode by echoing exactly this. [`NtpTimestamp::ZERO`] until
+    /// we have answered once.
+    pub last_receive_sent: NtpTimestamp,
     /// Whether the last answered request was actually served interleaved.
     ///
     /// Distinct from "we *could* serve it interleaved": every client we have
@@ -144,9 +154,9 @@ impl ClientRecord {
             responses: 0,
             dropped: 0,
             drops_since_kod: 0,
-            last_receive: None,
-            last_transmit: None,
-            last_receive_sent: None,
+            last_receive: NtpTimestamp::ZERO,
+            last_transmit: NtpTimestamp::ZERO,
+            last_receive_sent: NtpTimestamp::ZERO,
             interleaved_now: false,
         }
     }
@@ -847,11 +857,15 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
             return ResponseMode::Basic;
         };
         let record = &mut self.slots[i].record;
-        let (Some(sent_receive), Some(prev_transmit)) =
-            (record.last_receive_sent, record.last_transmit)
-        else {
+        let (sent_receive, prev_transmit) = (record.last_receive_sent, record.last_transmit);
+        // "Unset" is zero for both. Note the zero-origin rejection below is
+        // INDEPENDENT of this test and was already there: a client echoing an
+        // all-zero origin cannot match an unset record even if this guard were
+        // removed, which is what makes the sentinel safe here rather than
+        // merely convenient.
+        if sent_receive.is_zero() || prev_transmit.is_zero() {
             return ResponseMode::Basic;
-        };
+        }
         // The client names a specific earlier response by echoing the receive
         // timestamp we reported for it. We keep one slot, so only the most
         // recent qualifies; anything older falls back to basic rather than
@@ -883,8 +897,8 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     ) {
         if let Some(i) = self.resolve(handle) {
             let record = &mut self.slots[i].record;
-            record.last_receive = Some(receive);
-            record.last_receive_sent = Some(receive_sent);
+            record.last_receive = receive;
+            record.last_receive_sent = receive_sent;
         }
     }
 
@@ -894,7 +908,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     /// left yet when its own transmit field is written.
     pub fn note_transmit(&mut self, key: &K, transmit: NtpTimestamp) {
         if let Some(i) = self.index.get(key, &self.slots) {
-            self.slots[i as usize].record.last_transmit = Some(transmit);
+            self.slots[i as usize].record.last_transmit = transmit;
         }
     }
 
@@ -906,7 +920,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     /// on whoever inherited the slot.
     pub fn note_transmit_at(&mut self, handle: ClientHandle, transmit: NtpTimestamp) {
         if let Some(i) = self.resolve(handle) {
-            self.slots[i].record.last_transmit = Some(transmit);
+            self.slots[i].record.last_transmit = transmit;
         }
     }
 

@@ -727,23 +727,37 @@ impl SampleRegister {
         // samples against a stale self-consistent history and lock the loop into
         // a constant error — TIMECORP S1 found exactly that failure before this
         // pass existed.
+        // A cursor, not four drains. `drain(..k)` memmoves the whole remainder,
+        // and this loop can fire up to four times — so the rows that survive
+        // were being shifted down again on every pass. Advancing `lo` and
+        // reclaiming ONCE at the end moves the same bytes a single time.
+        //
+        // This is the fix `SampleRegister` already uses for `samples`/`weights`
+        // (the `head` cursor at the top of this file, documented there as "the
+        // same total movement spread over sixty-four times fewer operations");
+        // the trim loop never got it.
+        let mut lo = 0usize;
         for _ in 0..4 {
-            if used.len() < 8 {
+            let win = &used[lo..];
+            if win.len() < 8 {
                 break;
             }
-            if residuals_well_mixed(&used, &fit) {
+            if residuals_well_mixed(win, &fit) {
                 break; // residuals look well mixed: one regime
             }
-            let (half_gap, mad, _) = residual_half_gap_and_mad(&used, &fit);
+            let (half_gap, mad, _) = residual_half_gap_and_mad(win, &fit);
             if half_gap <= 3.0 * (1.4826 * mad).max(1e-9) {
                 break; // a lone spike, not a regime change — pass 2's job
             }
-            let drop = (used.len() / 4).max(2);
-            used.drain(..drop);
-            match wls_fit(&used) {
+            let drop = (win.len() / 4).max(2);
+            lo += drop;
+            match wls_fit(&used[lo..]) {
                 Some(refit) => fit = refit,
                 None => break,
             }
+        }
+        if lo > 0 {
+            used.drain(..lo);
         }
 
         // Pass 2 — interior spike trim (a delayed packet), thresholded on the

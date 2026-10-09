@@ -687,9 +687,16 @@ impl SampleRegister {
             // beat it. Starting from infinity meant any candidate won by
             // default and the window always narrowed — which is not adaptive,
             // it is just short.
-            let mut best = match wls_fit(&used) {
-                Some(f) if f.sxx > 0.0 && f.sw > 0.0 => se_offset(&used, &f),
-                _ => f64::INFINITY,
+            // `fit` IS `wls_fit(&used)` -- it was computed above and nothing
+            // since has touched `used`. Calling it again here re-walked the
+            // whole window twice (wls_fit is two passes) to arrive at a value
+            // already in hand: the most expensive helper in the hottest
+            // function in the crate, run for nothing, on every estimate that
+            // reaches the adaptive block.
+            let mut best = if fit.sxx > 0.0 && fit.sw > 0.0 {
+                se_offset(&used, &fit)
+            } else {
+                f64::INFINITY
             };
             let mut best_len = used.len();
             let mut len = MIN_ADAPTIVE;
@@ -815,9 +822,15 @@ impl SampleRegister {
             let sharp_floor = if self.offset_weight_dispersion_k > 0.0 {
                 // Median excess delay: the path's own noise scale, robust to
                 // the long tail that a mean would follow.
+                // A full sort to read the middle element orders every other
+                // element for nothing. `select_nth_unstable_by` places exactly
+                // the k-th element at k, so the median is the SAME `f64` --
+                // byte-identical -- for an O(n) partition instead of an
+                // O(n log n) driftsort instantiation.
                 let mut d: Vec<f64> = used.iter().map(|r| r.delay).collect();
-                d.sort_by(f64::total_cmp);
-                let median = d[d.len() / 2];
+                let mid = d.len() / 2;
+                d.select_nth_unstable_by(mid, f64::total_cmp);
+                let median = d[mid];
                 (self.offset_weight_dispersion_k * (median - min_delay))
                     .max(min_delay * 1e-4)
                     .max(1e-9)
@@ -904,6 +917,14 @@ impl SampleRegister {
 /// is paid on every element of every pass; the allocation is paid once per
 /// estimate and glibc serves it from a hot bin. Settled, and not to be
 /// re-litigated without a fourth reason.
+///
+/// A FOURTH attempt was made (2026-10-08) on the sibling site in
+/// `spike_threshold`, because removing a duplicate `wls_fit` had just moved
+/// 17.9M Ir and with it every inlining boundary here — which
+/// `instruction-counting` §9 says is exactly when to re-test a refutation.
+/// Pooling that buffer through the register measured **+1,428,602 Ir**, inside
+/// the same band as the first three. Four measurements, one sign: the shape
+/// loses on this code. Reverted.
 /// Inlined on purpose. It is called from two places in one function, and
 /// letting it inline lets the residual buffer live in the caller's frame and
 /// its loops merge with the surrounding code — measured 1.7M Ir.

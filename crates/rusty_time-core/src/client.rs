@@ -218,7 +218,7 @@ impl MultiController {
     /// A source that is not steering still has to be scheduled, and the poll
     /// interval belongs to the loop rather than to any one source.
     pub fn poll_interval_s(&self) -> f64 {
-        (2.0f64).powi(self.discipline.poll_log2() as i32)
+        crate::discipline::exp2i(self.discipline.poll_log2() as i32)
     }
 
     pub fn samples(&self) -> usize {

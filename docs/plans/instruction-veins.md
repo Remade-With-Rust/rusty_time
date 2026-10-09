@@ -661,3 +661,99 @@ property, and that is the owner's call.
 The campaign's own lesson is the scoreboard: **every win was a deletion** -- a
 duplicate call, a dead instantiation, a libm call, a second buffer, three
 redundant memmoves -- and the clever-local-rewrite class went 0-for-8.
+
+---
+
+# ROUND 5 -- B15 WON, and A4 is refuted on arithmetic
+
+## B15 WON -- and only because the instrument was built first
+
+| arm | before | after | delta |
+|---|---:|---:|---:|
+| hot_path steady | 47,424,979 | 46,382,549 | **-1,042,430 (-2.20%)** |
+| hot_path churn | 75,642,533 | 70,764,432 | **-4,878,101 (-6.45%)** |
+| mru_report | 5,804,467 | 5,422,843 | **-381,624 (-6.57%)** |
+
+A fixed-capacity open-addressed index with **backward-shift deletion**, so there
+are no tombstones at all -- the single failure mode that made me refuse this
+vein does not exist in the design. No resize path either, because the table
+evicts rather than grows.
+
+**The load factor is the whole story, and it is why the churn arm had to exist.**
+At 0.5 it measured **-789,020 on the steady arm** -- a clean win on the only
+instrument that existed before this round -- and **+7,455,786 (+9.86%) under
+eviction**, because backward-shift deletion walks the probe run and long runs
+make every one of 149,227 removals expensive. At 0.25 both arms win. Shipped on
+the steady arm alone, that is a 10% regression nothing would have caught.
+
+Both of my earlier refusals of B15 were about the INSTRUMENT, not the code:
+priced at 3.5M from an arm that never evicts (it is 13.7M under churn), then
+declined as ungateable by that same arm. Building one answered both.
+
+Cost: four buckets per client against hashbrown's one entry, now reported by
+`bytes_per_client()` instead of waiting to be found in RSS.
+
+## A4 REFUTED on arithmetic -- the working set is 2 KB
+
+I had recorded A4 as "out of instrument range: Ir is blind to locality, needs a
+clock." That was wrong, and `codec-cache-tiles` says to check this FIRST:
+
+> `REGISTER_CAPACITY = 64`, `Row` is 4 x f64 = 32 bytes.
+> **The entire row buffer is 64 x 32 = 2,048 bytes.**
+
+Two kilobytes is L1-resident at the maximum capacity the register can hold --
+32 cache lines. There is no locality to recover, so SoA's benefit is not
+*invisible* to Ir, it is **absent**; and SoA's cost is real on both instruments,
+because three or four pointer increments per element replace one.
+
+The 41.0M is iterator INSTRUCTION COUNT, not cache misses. The way to reduce it
+is fewer passes over the rows, which is what A1, A2 and A7 did. No clock harness
+is needed, and building one for this would have measured a change with nothing
+to find.
+
+This is the trap the skill names: *"the working set is already
+tiny/contiguous/L1-resident -- this is what made h264's padded-MC and
+buffer-hop bricks flat."*
+
+## FINAL -- all twenty, each with a mechanism and a number
+
+**Six wins.** client_path **-24,971,217 Ir (-11.38%)**; hot_path **-1,042,430
+steady / -4,878,101 churn**; mru_report **-381,624**.
+
+| # | vein | outcome | Ir |
+|---|---|---|---:|
+| 1 | A1 | **WIN** | -17,918,178 |
+| 2 | A5 | **WIN** (codegen) | -3,363,768 |
+| 3 | B15 | **WIN** (round 5) | -4,878,101 churn / -1,042,430 steady |
+| 4 | A2 | **WIN** (round 3) | -2,441,711 |
+| 5 | A6 | **WIN** | -690,184 |
+| 6 | A7 | **WIN** (round 3) | -557,376 |
+| 7 | B16 | win, **refused** on the threat model | -1,016,192 / -164,640 |
+| 8 | B13 | refuted; ceiling retracted | +2,364,380 |
+| 9 | A9 | refuted -- LLVM already hoisted it | +1,754,122 |
+| 10 | C19 | refuted | +1,659,861 |
+| 11 | A11 | refuted (4th time) | +1,428,602 |
+| 12 | C20 | refuted; premise disproved (pushes stayed 8) | +741,504 |
+| 13 | A10 | refuted -- LLVM already cmov'd it | +584,293 |
+| 14 | A3 | refuted x2; headline retracted | +137,561 |
+| 15 | A4 | **refuted on arithmetic** -- 2 KB working set | SoA adds instructions |
+| 16 | B14 | not a vein -- hash + MRU relink, load-bearing | 5,004,093 |
+| 17 | A12 | not a vein -- the sort comparator | 4,288,116 |
+| 18 | B17 | not a vein -- harness | 1,800,014 |
+| 19 | A8 | not a vein -- `benches/client_path.rs:66` | 1,494,250 |
+| 20 | B18 | not a vein -- 3 Ir/request, at its floor | 600,000 |
+
+**Fourteen veins have no win, and every one of them now has a mechanism rather
+than a shrug:** five are the measuring harness or load-bearing work (16-20),
+one has no locality to recover (15), seven measured slower (8-14), and one is a
+deliberate refusal on a security property (7).
+
+The campaign's two transferable lessons:
+
+1. **Every win was a deletion** -- a duplicate call, a dead instantiation, a
+   libm call, a second buffer, three redundant memmoves, a general hash map.
+   The clever-local-rewrite class went **0-for-8**.
+2. **Three of my refusals were instrument limits wearing the costume of code
+   limits** (B15 twice, A4 once). Two instruments got built because of it: the
+   hash-seed pin that made rung 0 exact, and the churn arm that caught a 10%
+   regression the steady arm scored as a win.

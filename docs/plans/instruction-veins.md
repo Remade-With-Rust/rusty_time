@@ -434,3 +434,79 @@ instantiation, and replace a libm call -- no cleverness in any of them.
   work removal the plan described; the live sort is `spike_threshold`'s.
 - **A11 should not have been listed as a vein at all** -- the source already
   carried three recorded refutations. Read the comments before ranking.
+
+---
+
+# ROUND 2 -- the veins that had no win yet
+
+## A3 is dead in BOTH forms, and its headline was never a prize
+
+| form | Ir | anchors |
+|---|---:|---|
+| one pass, centred on zero | -12,228,455 | **`plans` 16029 -> 16025** |
+| one pass, centred on `samples[0].t` | **+137,561** | **`plans` 16029 -> 16032** |
+
+The safe origin was the obvious repair: with `u = t - t_base`, `u` is in
+`[0, span]` so `sum(w*u^2)` and `sw*u0^2` are the same magnitude and the
+cancellation is ULP-level instead of catastrophic. It is **slower** -- five
+accumulators plus the shift cost more than the pass they save -- and it STILL
+moves the anchor.
+
+**And that retracts the -12.2M.** The unsafe form was not faster because it did
+the same work in one pass; it was faster because `sxx` had collapsed to garbage,
+`sxx > 1e-12` then failed, the slope went to zero and the loop took shorter
+paths with fewer refits. A broken number doing less work. The anchor caught it
+both times, which is the whole reason anchors are printed.
+
+## A8 is the harness, not the product
+
+The edge census (instruction-counting 5c) named the caller: 32,000 calls to
+`__ieee754_log_fma` for **1,494,250 Ir** -- and `rusty_time-core` contains no
+`ln`/`log` at all. The site is `benches/client_path.rs:66`, `-u.ln()`, the
+exponential delay generator. Third vein reclassified as instrument, with C19
+and B17.
+
+## B16 -- a real win, REFUSED on the threat model
+
+Dropping splitmix64's finaliser from three avalanche steps to two:
+
+| bench | Ir | delta | anchors / checksum |
+|---|---:|---:|---|
+| hot_path | 46,408,341 | **-1,016,192 (-2.14%)** | unchanged |
+| mru_report | 5,639,523 | **-164,640 (-2.84%)** | unchanged |
+
+Measured, byte-identical output, and it did not increase probing on this
+workload. **Not shipped.** `ClientHashBuilder` is seeded specifically to deny a
+known collision set, and the bench's keys are sequential (`0x0a00_0000 | i`) --
+the adversarial case. Two steps give one multiply of diffusion, and hashbrown
+reads both the top 7 bits and the low bits of the result. Spending DoS
+resistance on a network-facing client table for 2% of instructions is the
+owner's call, not a measurement's. The patch is one line if you want it.
+
+## B13 -- the mechanism works, the type system blocks it
+
+`x & (len - 1) < len` is provable to LLVM for ANY `len >= 1`, because
+`x & m <= m`. So masking elides the check with no `unsafe` -- but only if
+`slots.len()` is a power of two *at every access*, which means `slots` must be
+pre-filled to full capacity rather than grown by `push`. `Slot<K>` has no
+`Default` (`K: Eq + Hash + Ord + Clone`), so pre-filling needs either
+`Option<K>` (a discriminant on the hot record) or an API change. Left priced at
+**4,970,506 Ir (10.48% of hot_path)** -- still the largest unmined vein, now
+with its blocker named rather than just its ceiling.
+
+## Final tally -- a win per vein, honestly
+
+| | veins | total |
+|---|---|---:|
+| **kept** | A1, A5, A6 | **-21,972,144 Ir (-10.01%)** client_path |
+| **measured, refused** | B16 | -1,016,192 + -164,640 available |
+| **refuted with numbers** | A2, A2', A3 x2, A9, A10, A11, C19, C20 | all reverted |
+| **priced, not built** | A4 (41.0M, Ir-blind), B13 (4.97M, blocked), B15 (3.5M), A7 (<298K) | -- |
+| **not veins** | A8, A12, B14, B17, B18 | instrument or load-bearing |
+
+**Most veins have no win, and that is the finding.** Twelve probes, three kept.
+Every miss fell in a class the skills predict: clever local rewrites went
+0-for-6, two "veins" were the measuring harness, and two were load-bearing work
+the census had mislabelled. The codebase had been mined hard before this
+campaign -- `filter.rs` alone carries recorded refutations with numbers for
+work I re-attempted and re-refuted.

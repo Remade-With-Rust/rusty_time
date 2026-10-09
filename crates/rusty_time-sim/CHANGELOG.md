@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-08
+
+### Changed
+
+- Version moved to 0.2.1 with the rest of the workspace. **Nothing in this
+  crate's own API or behaviour changed.** The release is a performance pass in
+  `rusty_time-core`; see that crate's changelog.
+
 ## [0.2.0] - 2026-09-09
 
 ### Changed

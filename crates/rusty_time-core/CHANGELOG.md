@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-08
+
+### Performance
+
+Six deterministic wins in the client filter and the server's client table,
+measured with callgrind Ir (exact: the same binary re-runs to zero) and gated
+byte-identical throughout.
+
+| instrument | before | after | delta |
+|---|---:|---:|---:|
+| `client_path` | 219,439,512 | 194,470,797 | **-24,968,715 (-11.38%)** |
+| `hot_path` (steady) | 47,424,979 | 45,664,884 | **-1,760,095 (-3.71%)** |
+| `hot_path` (churn) | 75,642,533 | 67,786,128 | **-7,856,405 (-10.39%)** |
+| `mru_report` | 5,804,467 | 5,234,883 | **-569,584 (-9.81%)** |
+
+- `regress` called `wls_fit` twice on identical data (-17,918,178).
+- The spike filter recomputed residuals `spike_threshold` had already produced;
+  they travel as a `u64` keep mask now (-2,441,711).
+- A median taken by full sort now uses `select_nth_unstable_by` (-3,363,768).
+- `2f64.powi(k)` builds the exponent field directly instead of calling
+  `__powidf2` 16,000 times a run (-690,184).
+- The regime-change trim advances a cursor instead of front-draining up to four
+  times (-557,376).
+- The client index is open-addressed with backward-shift deletion (so no
+  tombstones) and does not duplicate the key, which `HashMap` had to. Costs
+  +10 bytes/client (150 -> 160).
+
+**No behaviour changed.** TIMECORP S1/S6/S8 at 31 seeds are byte-identical to
+0.2.0, and S12a/b/c server-load counts are identical including 1,021,672
+evictions in S12b. `cargo semver-checks`: no semver update required.
+
+### Changed
+
+- `ClientTable::bytes_per_client()` reports 160 rather than 150, because the
+  index now holds four buckets per client instead of one entry. The signature
+  is unchanged; the number is honest.
+
+### Added
+
+- `HOT_PATH_EVICT`, a churn arm for the `hot_path` bench. The default arm never
+  evicts, so it could not gate any change to the client index -- and at a 0.5
+  load factor the new index measured a clean win there while costing +9.86%
+  under eviction. The arm is what caught it.
+
 ## [0.2.0] - 2026-09-09
 
 ### Added

@@ -510,3 +510,94 @@ Every miss fell in a class the skills predict: clever local rewrites went
 the census had mislabelled. The codebase had been mined hard before this
 campaign -- `filter.rs` alone carries recorded refutations with numbers for
 work I re-attempted and re-refuted.
+
+---
+
+# ROUND 3 -- two refutations overturned, two corrected
+
+Going back at the veins that had no win. Two of my own "blocked"/"pruned" calls
+were wrong, and both became wins.
+
+## A2 OVERTURNED -- **-2,441,711 Ir (-1.24%)**
+
+Refuted twice in round 1 (+629,281 indexed, +1,331,400 zipped). Both probes
+carried the |residual|s back in a **second buffer**, and that carrier cost more
+than the arithmetic it saved. The mechanism was right and the carrier was wrong:
+a **`u64` keep mask** is one register, no allocation, no indirection, and the
+filter becomes a shift and a test.
+
+Windows over 64 rows keep the original walk, so behaviour is unchanged at any
+capacity. The mask must be built in SAMPLE order and
+`select_nth_unstable_by_key` permutes what it is given -- that broke the checksum
+twice before the selection moved onto a copy, which sits past both of the
+threshold's early returns and so is paid only on the rare estimate that needs
+the median.
+
+## A7 OVERTURNED -- **-557,376 Ir (-0.29%)**
+
+I pruned this on arithmetic at a "<298K" ceiling taken from the `memcpy` symbol
+alone. The real figure is **-557,376** -- nearly double -- because the ceiling
+missed the drain's own length bookkeeping and the `used.len()` reloads a cursor
+also removes. **A ceiling is only as wide as the terms you put in it.**
+
+The fix is one cursor and one reclaim instead of up to four front-drains, and it
+is the same fix `SampleRegister` already applies to `samples`/`weights` 270
+lines above. Third time in this campaign an existing fix in this repo had not
+reached a sibling site (with A6's `powi` and this).
+
+## B13's ceiling was WRONG -- the vein is smaller than its attribution
+
+`.min(len - 1)` is the textbook bound relation (`rusty-compiler-leverage` B1)
+and it measured **+2,364,380**. `slots.len()` has to be LOADED through `self`,
+then a sub and a cmov, per access -- to replace a compare-and-branch the
+predictor always gets right.
+
+So the **4,970,506 Ir I quoted as B13's ceiling is not a ceiling.**
+`slice/index.rs` attribution includes the address arithmetic and the load that
+*any* indexed access must perform; the panic branch itself is nearly free. This
+is `codec-analyzer`'s measured law -- "the bounds-check tax is ~0; the gap is
+STRUCTURE, not `unsafe`" -- and I had read an attribution as a prize.
+
+## A4 cannot be won on this instrument, and that is a verdict
+
+Per-pass field usage: `wls_fit`/`residual_sd` touch 24 of `Row`'s 32 bytes,
+`residuals_well_mixed`/`spike_resid_abs`/`residual_half_gap_and_mad` touch 16.
+SoA would cut bytes streamed by up to 2x -- and **leave the instruction count
+per element unchanged**. Ir would read ~0 for a change that could matter on a
+clock. Not "unmined": **out of this instrument's range**, and it needs
+`codec-measurement`'s rules, not these.
+
+## wls_fit inlining was already optimal
+
+| probe | Ir |
+|---|---:|
+| `#[inline(always)]` | **+452,629** |
+| `#[inline]` (hint) | **-10** (inside the rebuild rung) |
+
+The -10 is a no-op, which per `instruction-counting` section 6 proves LLVM was
+already making this choice -- and doubles as a free null arm confirming the
+harness is still exact. Reverted; the attribute would have been decoration.
+
+## FINAL TALLY
+
+**client_path 219,439,512 -> 194,468,295 = -24,971,217 Ir (-11.38%)**
+
+| vein | outcome | Ir |
+|---|---|---:|
+| A1 | **WIN** | -17,918,178 |
+| A5 | **WIN** (codegen) | -3,363,768 |
+| A2 | **WIN** (round 3) | -2,441,711 |
+| A6 | **WIN** | -690,184 |
+| A7 | **WIN** (round 3) | -557,376 |
+| B16 | win, **REFUSED** on the threat model | -1,016,192 + -164,640 |
+| A3 | refuted x2; headline retracted | +137,561 safe form |
+| B13 | refuted; **ceiling retracted** | +2,364,380 |
+| A9, A10, A11, C19, C20 | refuted | +584k..+1.75M each |
+| A4 | out of instrument range | 41.0M, needs a clock |
+| B15 | priced, not built | 3.5M |
+| A8, A12, B14, B17, B18 | not product veins | harness or load-bearing |
+
+**Five wins of twenty veins, −11.38%.** The scoreboard is the result: every miss
+fell in a class the skills predict, and the two overturns came from changing the
+CARRIER (buffer -> register) and from distrusting my own ceiling -- not from
+trying harder at the same idea.

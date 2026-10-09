@@ -132,7 +132,7 @@ impl RefclockSample {
     /// The dispersion this sample implies, from the reference's own precision
     /// claim.
     pub fn dispersion_s(&self) -> f64 {
-        2f64.powi(self.precision_log2 as i32)
+        crate::discipline::exp2i(self.precision_log2 as i32)
     }
 }
 

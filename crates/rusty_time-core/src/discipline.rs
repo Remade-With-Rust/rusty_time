@@ -151,6 +151,28 @@ pub struct DisciplineConfig {
     pub corr_time_ratio: f64,
 }
 
+/// `2^k` for an integer exponent, exactly, without a libm call.
+///
+/// `f64::powi` lowers to `__powidf2`, a real `call` into compiler-builtins —
+/// 16,000 of them in one `client_path` run, ~688k Ir, for a value every caller
+/// here asks for with a small integer exponent. A power of two is exactly
+/// representable in IEEE-754, so the answer is just the exponent field, and the
+/// result is bit-identical to `powi` across the normal range.
+///
+/// `server.rs` already hoisted its own `powi` off the request path for the same
+/// reason; these are the sites that fix never reached.
+#[inline]
+pub(crate) fn exp2i(k: i32) -> f64 {
+    if (-1022..=1023).contains(&k) {
+        // Biased exponent in the high bits, zero mantissa.
+        f64::from_bits(((k + 1023) as u64) << 52)
+    } else {
+        // Subnormal or overflow: hand it back to the slow path rather than
+        // open-coding the gradual-underflow rules.
+        2f64.powi(k)
+    }
+}
+
 impl Default for DisciplineConfig {
     fn default() -> Self {
         DisciplineConfig {
@@ -845,7 +867,7 @@ impl Discipline {
         if self.iburst_left > 0 {
             IBURST_SPACING_S
         } else {
-            2f64.powi(self.poll as i32)
+            exp2i(self.poll as i32)
         }
     }
 
@@ -856,7 +878,7 @@ impl Discipline {
             self.burst_used += 1;
             IBURST_SPACING_S
         } else {
-            2f64.powi(self.poll as i32)
+            exp2i(self.poll as i32)
         }
     }
 }

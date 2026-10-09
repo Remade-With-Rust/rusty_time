@@ -56,13 +56,18 @@ run "cargo clippy --workspace --all-targets -- -D warnings" \
 run "cargo fmt --all --check"                cargo fmt --all --check
 
 # --- 4. every target CI ships ---------------------------------------------
-echo "-- shipping targets (mission plan 6.5) --"
+# BUILD, not just check. `cargo check` skips codegen, and the const-eval lints
+# (`arithmetic_overflow` among them) fire during const-prop -- so a target
+# matrix gated with `check` passes code that cannot build. Measured: this
+# validator reported PASS on wasm32 for an `(u32::MAX as usize) + 1` that
+# `cargo build` rejects with exit 101, and CI's wasm-pack job caught it instead.
+echo "-- shipping targets (mission plan 6.5) -- BUILT, not checked --"
 for t in x86_64-pc-windows-msvc wasm32-unknown-unknown; do
   if rustup target list --installed | grep -q "^$t$"; then
     if [ "$t" = "wasm32-unknown-unknown" ]; then
-      run "check $t (libs)" cargo check -p rusty_time-core -p rusty_time-nts -p rusty_time-wasm -p rusty_time-api --target "$t"
+      run "build $t (libs)" cargo build -p rusty_time-core -p rusty_time-nts -p rusty_time-wasm -p rusty_time-api --target "$t"
     else
-      run "check $t (workspace)" cargo check --workspace --all-targets --target "$t"
+      run "build $t (workspace)" cargo build --workspace --all-targets --target "$t"
     fi
   else
     warn "target $t not installed locally (CI covers it)"
@@ -110,7 +115,22 @@ run "cargo package -p rusty_time-core --allow-dirty=false" cargo package -p rust
 run "cargo doc -p rusty_time-core --no-deps" cargo doc -p rusty_time-core --no-deps
 
 # --- 8. semver against what is already published -------------------------
-echo "-- semver vs the published version --"
+# cargo-semver-checks has NO LINT for a public field's TYPE changing, and this
+# release contained three of them (ClientRecord's Option<NtpTimestamp> ->
+# NtpTimestamp). It reported "no semver update required" for a breaking change,
+# which under Cargo's 0.x rules would have shipped as a PATCH. So read the diff
+# as well as the tool.
+echo "-- public API surface vs the published version --"
+BASE=$(git describe --tags --abbrev=0 2>/dev/null || echo origin/main)
+APICHG=$(git diff "$BASE"..HEAD -- 'crates/*/src/*.rs'          | grep -E "^[-+] *pub (fn|struct|enum|trait|const|type|mod|[a-z_]+ *:)" | wc -l)
+if [ "$APICHG" -eq 0 ]; then
+  ok "no public API lines changed since $BASE"
+else
+  warn "$APICHG public API line(s) changed since $BASE -- a field TYPE change is BREAKING and semver-checks will not see it"
+  git diff "$BASE"..HEAD -- 'crates/*/src/*.rs'     | grep -E "^[-+] *pub (fn|struct|enum|trait|const|type|mod|[a-z_]+ *:)" | sort | head -10 | sed 's/^/          /'
+fi
+
+echo "-- semver vs the published version (advisory only, see above) --"
 if command -v cargo-semver-checks >/dev/null 2>&1; then
   if cargo semver-checks check-release -p rusty_time-core >/tmp/sv.$$ 2>&1; then
     ok "semver: $(grep -oE 'no semver update required|minor|major' /tmp/sv.$$ | tail -1)"

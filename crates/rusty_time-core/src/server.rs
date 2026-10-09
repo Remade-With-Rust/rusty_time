@@ -354,8 +354,14 @@ const EMPTY: u32 = u32::MAX;
 impl Index {
     fn with_capacity(capacity: usize, hasher: ClientHashBuilder) -> Self {
         let n = capacity.max(1).saturating_mul(4).next_power_of_two();
+        // Compare the MASK, not the count. `(u32::MAX as usize) + 1` overflows
+        // at compile time on a 32-bit `usize` -- wasm32 is a shipping target --
+        // and `arithmetic_overflow` is deny-by-default, so it is a build error
+        // rather than a runtime one. Phrased against `n - 1` it is always true
+        // on a 32-bit target (nothing can exceed `usize::MAX` buckets) and a
+        // real bound on a 64-bit one.
         assert!(
-            n <= (u32::MAX as usize) + 1,
+            n - 1 <= u32::MAX as usize,
             "bucket count exceeds the 32-bit hash word"
         );
         Index {

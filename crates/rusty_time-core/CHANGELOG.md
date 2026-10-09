@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-10-08
+## [0.3.0] - 2026-10-08
+
+### BREAKING
+
+- `ClientRecord`'s three timestamp fields change type:
+  `pub last_receive`, `pub last_transmit` and `pub last_receive_sent` are now
+  `NtpTimestamp` rather than `Option<NtpTimestamp>`, with
+  `NtpTimestamp::ZERO` meaning "unset" — which is how RFC 5905 already spells
+  it on the wire. `Option<NtpTimestamp>` was sixteen bytes for eight bytes of
+  payload, because `NtpTimestamp` is a bare `u64` with no niche, and every read
+  tested a discriminant.
+
+  **Migration:** `if let Some(ts) = rec.last_receive` becomes
+  `if !rec.last_receive.is_zero()`, and `rec.last_receive` is the value
+  directly.
+
+  This is why the release is 0.3.0 and not 0.2.1. Note that
+  `cargo semver-checks` reports *no semver update required* for it — it has no
+  lint for a public field's TYPE changing — so the bump was decided by reading
+  the diff, not by the tool. Do not trust that tool alone on a field-type
+  change.
 
 ### Performance
 

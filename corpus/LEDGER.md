@@ -2696,3 +2696,102 @@ long window: it can see the slope's variance and cannot see its bias.
 
 Closing that needs a criterion with a bias signal in it, not another sweep.
 Recorded as the open item, with the measurement that will falsify it.
+
+## Round 6: ten more veins on the two censuses nobody had taken
+
+`docs/plans/instruction-veins.md` (round 6), `tools/perf/codec_ir.sh` (new).
+
+The twenty veins of rounds 1-5 were closed. Ten more came from the two censuses
+those rounds never ran — **call counts and caller-callee EDGES**
+(`instruction-counting` §5b/§5c, where rounds 1-5 used self-cost only) — plus a
+reading of the `no_std` codec leaf, which had no instrument at all.
+
+### Kept, both gated byte-identical
+
+| vein | change | instrument | Ir |
+|---|---|---|---:|
+| N3 | `ClientRecord`'s three `Option<NtpTimestamp>` to `NtpTimestamp`, zero = unset | hot_path | **-808,139 (-1.77%)** |
+| N2a | `#[inline(always)]` on `MultiController::estimate` — one caller, one callee, 37.2 Ir/call of frame | client_path | **-317,822 (-0.16%)** |
+
+**Server: 228.3 -> 224.3 Ir per served request. Client: 12,154.3 -> 12,137.5 Ir
+per discipline step.** Gates: `hot_path` `0xc0452ab605328800`, `client_path`
+`f456d8bf8ff664d5`, `codec` `0x99f61c51fcc31496` — all unchanged; work parity
+exact on all three; 218 tests, clippy `-D warnings`, fmt, and the `no_std` leaf
+on `thumbv7em-none-eabihf` and `riscv32imac-unknown-none-elf`.
+
+N3 is a representation change, not a rewrite: `NtpTimestamp` is a bare `u64`
+with no niche, so `Option<NtpTimestamp>` is sixteen bytes for eight of payload
+and every read tests a discriminant. RFC 5905 already spells "unset" as an
+all-zero timestamp. What makes the sentinel safe rather than merely convenient
+is that the interleaved path's zero-origin rejection
+(`!request_origin.is_zero()`) was **already explicit and independent of the
+`Option`** — that test is the security property, not the discriminant. 24 bytes
+off every record as a side effect.
+
+### Refuted, measured, numbers left in the source
+
+| probe | Ir | why |
+|---|---:|---|
+| N9 `from_bits` as a total lookup table | **+2,048,014 (+4.79%)** | LLVM already emits arithmetic — the discriminants ARE the wire values — so the table only added a load. The magnitude matched `rusty-compiler-leverage` B5's recorded bitmask refutation (+2.03M) |
+| N8 `parse` via one `&[u8; 48]` (`first_chunk`) | **+0, exactly** | §6: a byte-identical total means the compiler already did it. Cost moved buckets (ntp.rs -1,024,000, `core/src/slice/mod.rs` +1,600,000), total bit-identical. **B18's "already at its floor" was right** |
+| N9' `#[repr(u8)]` + `self as u8` for `bits()` | +0 | already a cast |
+| N2b bind `registers[index]` once, not three times | +0 | already CSE'd, as `admit_handle` was in round 1 |
+| N1 `#[inline(always)]` on `residual_sd` | +0 alone, +0 combined | LLVM had already made the call; attribute removed |
+
+**The clever-local-rewrite class is now 0-for-8 across six rounds** (1-5 went
+0-for-6; N8 and N9 make eight). Every win in six rounds has been a deletion, a
+representation change, or a libm swap.
+
+### Instruments
+
+- **A third one exists now.** `benches/codec.rs` + `tools/perf/codec_ir.sh`
+  prices `ntp.rs` on its own — bytes in, bytes out, no table, no filter, no
+  clock, which is the different corpus shape §4 asks for. It matters because
+  `ntp.rs` is the `no_std` leaf: on a Cortex-M4F, an RV32 part or in the wasm
+  client it is not 1.27% of the work, it is ~all of it.
+- **Its own tap was 63% of its first measurement.** Nineteen FNV folds per
+  packet. The fix was not cheaper mixing but fewer mixed values: `write` is the
+  inverse of `parse` and re-emits all 48 bytes from all 13 fields, so folding
+  the six OUTPUT words covers every field transitively. 19 mixes to 9, total
+  67,297,513 to 42,721,512, and the product's own code went from the fourth row
+  to the second (23.6 Ir/packet).
+- **`ir.sh` and `client_ir.sh` now `touch` their sources before building.**
+  Caught live: three consecutive identical A/B results, and one run that read
+  the pre-A1 Ir with A1 sitting in the tree. Cargo's fingerprint across the
+  `/mnt` drvfs mount does not reliably notice an edit, so a run can measure a
+  stale binary — the trap `codec-memory-copies` §4 names, on this rig.
+- **The `client_path` harness tax, never computed:** 3,661,681 Ir = **1.67%** =
+  229 Ir/step (main's own 1,943,431 plus the 1,718,250 of `log` it calls).
+  C19 did this for `hot_path` (13.92%) and gated section B on it; section A had
+  no equivalent. It is small, so section A's shares stand.
+
+### Two corrections to rounds 1-5
+
+- **A8 was not a vein, and its figure was half.** `benches/client_path.rs:66`
+  is `-u.ln()`, and there is **no `ln`/`log` call anywhere in the product
+  source**. 32,000 calls (two per step), 1,718,250 Ir — double the recorded
+  16,000 / 859,160 — and all of it the harness's own noise generator. The
+  caller-callee edge said so in one line (`client_path::main -> log`); self-cost
+  alone cannot name an owner. Round 2's commit message already said "A8 is the
+  harness" while the ceiling table still priced it as real work.
+- **B18 overstated its conclusion.** "`ntp.rs` is already at its floor" was read
+  off an instrument where `parse`/`write` inline into `hot_path::main` with 52%
+  of events unattributed. N8 has now turned that into a measurement rather than
+  an assumption — and it came out right.
+
+### A coverage hole worth more than either win
+
+The two most tempting veins in the file — a surviving full `sort_by` and a
+double allocation — sit behind config knobs that default to `0.0` and `false`.
+Checking reach demoted both correctly. The deeper find was that one of those
+branches had **no test at all**, so a twelve-line rewrite of its inner loop was
+green against 217 tests without executing a line of it.
+`density_weighting_factors_span_the_window` now pins the half-gap rule
+(computed independently in the test, not recorded from the code) and enters the
+branch.
+
+### One law carried forward
+
+N3 won 1.77% on `hot_path` and cost ~50,000 Ir on `client_path` — same crate,
+an unrelated function, codegen shifted. `instruction-counting` §10 says measure
+every change on every instrument; quote both numbers or neither.

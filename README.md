@@ -66,8 +66,14 @@ error of the **predicted offset** rather than of the slope, which took S8 from
 chrony before that and are now level.
 
 Instruction cost, deterministic and internal (not a chrony comparison):
-**237 Ir per served request**, **13,613 Ir per client discipline step** — within
-1 Ir of `0.1.7` despite the multi-source rework.
+**224.3 Ir per served request**, **12,137.5 Ir per client discipline step**,
+measured with callgrind on three seeded harnesses whose checksums gate every
+change. Six rounds of instruction-count work took the server from 3,053.6 and
+the client from 25,627; the last round's two wins were a representation change
+(three `Option<NtpTimestamp>` fields to a zero sentinel, −1.77% on the server)
+and one inlined pass-through frame (−0.16% on the client). Across those rounds
+the "clever local rewrite" class went **0-for-8** — every win was a deletion, a
+representation change, or a libm swap.
 
 Three honest notes. Earlier per-scenario accuracy wins reported here were
 **withdrawn**: they came from comparing medians on a rig whose unchanged control

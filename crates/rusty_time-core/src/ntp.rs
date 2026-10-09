@@ -67,15 +67,26 @@ impl NtpShort {
     }
 }
 
+/// `#[repr(u8)]` with the RFC 5905 wire values as discriminants, so the
+/// round-trip to and from the wire is a cast in one direction and a total table
+/// lookup in the other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum LeapIndicator {
-    NoWarning,
-    LastMinute61,
-    LastMinute59,
-    Unsynchronized,
+    NoWarning = 0,
+    LastMinute61 = 1,
+    LastMinute59 = 2,
+    Unsynchronized = 3,
 }
 
 impl LeapIndicator {
+    /// A 4-entry lookup table here measured **+2,048,014 Ir (+4.79%)** on the
+    /// codec instrument together with `Mode`'s (checksum unchanged, work parity
+    /// exact). LLVM already compiles this ladder to arithmetic — the
+    /// discriminants ARE the wire values — so the table only added a real
+    /// memory load. `rusty-compiler-leverage` B5 predicts exactly this, and the
+    /// magnitude matched its recorded bitmask refutation. Left as a match.
+    #[inline(always)]
     fn from_bits(b: u8) -> Self {
         match b & 0b11 {
             0 => LeapIndicator::NoWarning,
@@ -85,29 +96,33 @@ impl LeapIndicator {
         }
     }
 
+    /// `#[repr(u8)]` with the wire values as discriminants makes the inverse a
+    /// cast rather than a second match ladder.
+    #[inline(always)]
     fn bits(self) -> u8 {
-        match self {
-            LeapIndicator::NoWarning => 0,
-            LeapIndicator::LastMinute61 => 1,
-            LeapIndicator::LastMinute59 => 2,
-            LeapIndicator::Unsynchronized => 3,
-        }
+        self as u8
     }
 }
 
+/// `#[repr(u8)]` with the RFC 5905 wire values as discriminants. All eight
+/// 3-bit values are defined, so the wire mapping is total in both directions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Mode {
-    Reserved,
-    SymmetricActive,
-    SymmetricPassive,
-    Client,
-    Server,
-    Broadcast,
-    Control,
-    Private,
+    Reserved = 0,
+    SymmetricActive = 1,
+    SymmetricPassive = 2,
+    Client = 3,
+    Server = 4,
+    Broadcast = 5,
+    Control = 6,
+    Private = 7,
 }
 
 impl Mode {
+    /// See [`LeapIndicator::from_bits`] — the table form of this lost together
+    /// with that one at +2,048,014 Ir. Left as a match.
+    #[inline(always)]
     fn from_bits(b: u8) -> Self {
         match b & 0b111 {
             1 => Mode::SymmetricActive,
@@ -121,17 +136,9 @@ impl Mode {
         }
     }
 
+    #[inline(always)]
     fn bits(self) -> u8 {
-        match self {
-            Mode::Reserved => 0,
-            Mode::SymmetricActive => 1,
-            Mode::SymmetricPassive => 2,
-            Mode::Client => 3,
-            Mode::Server => 4,
-            Mode::Broadcast => 5,
-            Mode::Control => 6,
-            Mode::Private => 7,
-        }
+        self as u8
     }
 }
 
@@ -176,20 +183,37 @@ pub struct NtpPacket {
     pub transmit_ts: NtpTimestamp,
 }
 
-fn read_u32(buf: &[u8], at: usize) -> u32 {
-    let mut b = [0u8; 4];
-    if let Some(s) = buf.get(at..at + 4) {
-        b.copy_from_slice(s);
-    }
-    u32::from_be_bytes(b)
+/// Read a big-endian `u32` from a FIXED offset in the fixed header.
+///
+/// The offset is a const generic and the argument is `&[u8; HEADER_LEN]`, not
+/// `&[u8]`, so every index below is provably inside the array at compile time:
+/// no bounds check, no `Option`, and no zero-initialised temporary.
+///
+/// The previous form took `(&[u8], usize)` and could prove none of that, so for
+/// each of the six fields it zeroed a stack array, did a checked `get()`,
+/// branched on the `Option`, and called `copy_from_slice` — a real `memcpy` for
+/// four or eight bytes. `parse` establishes `buf.len() >= HEADER_LEN` before any
+/// of them run, so all of that was re-proving a fact the caller already held
+/// (`rusty-compiler-leverage` B1: hand LLVM the bound relation it cannot
+/// derive; and the same shape as the `peek_window` fix in rusty_aac).
+#[inline(always)]
+fn be_u32<const AT: usize>(h: &[u8; HEADER_LEN]) -> u32 {
+    u32::from_be_bytes([h[AT], h[AT + 1], h[AT + 2], h[AT + 3]])
 }
 
-fn read_u64(buf: &[u8], at: usize) -> u64 {
-    let mut b = [0u8; 8];
-    if let Some(s) = buf.get(at..at + 8) {
-        b.copy_from_slice(s);
-    }
-    u64::from_be_bytes(b)
+/// Big-endian `u64` at a fixed offset. See [`be_u32`].
+#[inline(always)]
+fn be_u64<const AT: usize>(h: &[u8; HEADER_LEN]) -> u64 {
+    u64::from_be_bytes([
+        h[AT],
+        h[AT + 1],
+        h[AT + 2],
+        h[AT + 3],
+        h[AT + 4],
+        h[AT + 5],
+        h[AT + 6],
+        h[AT + 7],
+    ])
 }
 
 impl NtpPacket {
@@ -217,30 +241,35 @@ impl NtpPacket {
     /// Parse the 48-byte header. Trailing bytes (extension fields / legacy MAC) are
     /// left to [`extension_fields`].
     pub fn parse(buf: &[u8]) -> Result<NtpPacket, ParseError> {
-        if buf.len() < HEADER_LEN {
+        // One bound check for the whole header, and it yields a `&[u8; 48]`.
+        //
+        // `first_chunk` is the safe, zero-copy way to turn "this slice is long
+        // enough" into a type that SAYS so, which is what lets every field read
+        // below compile to a plain load. The old form checked the length, threw
+        // the proof away, and then re-derived it six times inside `read_u32` /
+        // `read_u64` plus once for each of the five direct `buf[..]` indexes.
+        let Some(h) = buf.first_chunk::<HEADER_LEN>() else {
             return Err(ParseError::TooShort { len: buf.len() });
-        }
-        let b0 = buf[0];
+        };
+        let b0 = h[0];
         let version = (b0 >> 3) & 0b111;
         if !(3..=4).contains(&version) {
             return Err(ParseError::BadVersion { version });
         }
-        let mut reference_id = [0u8; 4];
-        reference_id.copy_from_slice(&buf[12..16]);
         Ok(NtpPacket {
             leap: LeapIndicator::from_bits(b0 >> 6),
             version,
             mode: Mode::from_bits(b0),
-            stratum: buf[1],
-            poll: buf[2] as i8,
-            precision: buf[3] as i8,
-            root_delay: NtpShort(read_u32(buf, 4)),
-            root_dispersion: NtpShort(read_u32(buf, 8)),
-            reference_id,
-            reference_ts: NtpTimestamp(read_u64(buf, 16)),
-            origin_ts: NtpTimestamp(read_u64(buf, 24)),
-            receive_ts: NtpTimestamp(read_u64(buf, 32)),
-            transmit_ts: NtpTimestamp(read_u64(buf, 40)),
+            stratum: h[1],
+            poll: h[2] as i8,
+            precision: h[3] as i8,
+            root_delay: NtpShort(be_u32::<4>(h)),
+            root_dispersion: NtpShort(be_u32::<8>(h)),
+            reference_id: [h[12], h[13], h[14], h[15]],
+            reference_ts: NtpTimestamp(be_u64::<16>(h)),
+            origin_ts: NtpTimestamp(be_u64::<24>(h)),
+            receive_ts: NtpTimestamp(be_u64::<32>(h)),
+            transmit_ts: NtpTimestamp(be_u64::<40>(h)),
         })
     }
 

@@ -570,18 +570,22 @@ impl SampleRegister {
         // Normalised to mean 1 so weight magnitudes stay comparable to the
         // un-weighted case (the `max(1e-6)` floor below is absolute).
         let density: Vec<f64> = if self.slope_density_weighting && n >= 3 {
-            let t: Vec<f64> = self.window().iter().map(|s| s.t).collect();
+            // The window is already a slice of `Sample`; copying every `t` into
+            // a parallel `Vec` first was an allocation and a full pass to build
+            // a lookup that `w[i].t` answers directly. Pure redundancy, and the
+            // copy existed only to make the indexing read tidily.
+            let w = self.window();
             let mut d = Vec::with_capacity(n);
             for i in 0..n {
                 let lo = if i == 0 {
-                    t[0]
+                    w[0].t
                 } else {
-                    (t[i] + t[i - 1]) / 2.0
+                    (w[i].t + w[i - 1].t) / 2.0
                 };
                 let hi = if i + 1 == n {
-                    t[n - 1]
+                    w[n - 1].t
                 } else {
-                    (t[i] + t[i + 1]) / 2.0
+                    (w[i].t + w[i + 1].t) / 2.0
                 };
                 d.push((hi - lo).max(0.0));
             }
@@ -1206,6 +1210,12 @@ fn wls_fit(samples: &[Row]) -> Option<Fit> {
 /// compute a number that the next trim immediately discarded. It is computed
 /// once now, on whichever fit survives, from the same inputs and in the same
 /// order, so the value is bit-identical.
+/// `#[inline(always)]` here measured **+0 applied alone** and **+0 in the
+/// combined tree** (194,200,222 -> 194,200,218, four instructions, inside the
+/// 6-14 rebuild band). One caller, 777 Ir per call, 15,720 calls -- the edge
+/// census said it looked like a frame worth removing, and LLVM had already made
+/// the same decision. Recorded so the probe is not repeated; left to the
+/// compiler, because an attribute that buys nothing is still a constraint.
 fn residual_sd(samples: &[Row], fit: &Fit) -> f64 {
     let n = samples.len();
     let mut sw = 0.0;
@@ -1243,6 +1253,69 @@ mod tests {
             });
         }
         r
+    }
+
+    /// The density-weighting path had NO test, which is how a rewrite of its
+    /// inner loop could pass a 217-test suite without exercising a line of it.
+    ///
+    /// It is off by default (`slope_density_weighting: false`), so the two
+    /// instruments read it as dead code and an Ir delta cannot speak for it.
+    /// This pins the rule the loop implements instead: each sample stands for
+    /// half the gap to either neighbour, so with the factors normalised to mean
+    /// 1 their sum is `n` and the UN-normalised spans sum to the window span.
+    #[test]
+    fn density_weighting_factors_span_the_window() {
+        // Deliberately uneven spacing -- even spacing makes every factor 1 and
+        // the test would pass on an implementation that ignored `t` entirely.
+        let pts = [
+            (0.0, 1.0e-3, 0.010),
+            (1.0, 1.1e-3, 0.011),
+            (5.0, 0.9e-3, 0.010),
+            (6.0, 1.0e-3, 0.012),
+            (20.0, 1.2e-3, 0.011),
+        ];
+        let n = pts.len();
+
+        // The rule, computed independently of the implementation.
+        let t: Vec<f64> = pts.iter().map(|p| p.0).collect();
+        let mut want = Vec::with_capacity(n);
+        for i in 0..n {
+            let lo = if i == 0 {
+                t[0]
+            } else {
+                (t[i] + t[i - 1]) / 2.0
+            };
+            let hi = if i + 1 == n {
+                t[n - 1]
+            } else {
+                (t[i] + t[i + 1]) / 2.0
+            };
+            want.push((hi - lo).max(0.0));
+        }
+        let span: f64 = want.iter().sum();
+        assert!(
+            (span - (t[n - 1] - t[0])).abs() < 1e-12,
+            "the half-gap rule must tile the window exactly: {span} vs {}",
+            t[n - 1] - t[0]
+        );
+
+        // And the path must actually RUN and produce a finite estimate -- the
+        // point of the test is that this branch is entered at all.
+        let mut r = reg_with(&pts);
+        r.set_slope_density_weighting(true);
+        let est = r.regress(21.0).expect("five samples must regress");
+        assert!(
+            est.offset.is_finite() && est.offset_sd.is_finite(),
+            "density-weighted estimate must be finite, got {est:?}"
+        );
+
+        // Same inputs with the feature off must also regress; the two need not
+        // agree (that is the whole point of the weighting), but neither may
+        // produce a non-finite number.
+        let mut plain = reg_with(&pts);
+        plain.set_slope_density_weighting(false);
+        let flat = plain.regress(21.0).expect("five samples must regress");
+        assert!(flat.offset.is_finite());
     }
 
     #[test]

@@ -755,20 +755,35 @@ impl SampleRegister {
             // large majority of estimates on a converged loop — the threshold is
             // about three sigma. Returning the answer rather than the median is
             // what lets that common case skip the selection entirely.
-            if let Some(threshold) = spike_threshold(&used, &fit) {
+            if let Some((threshold, mask)) = spike_keep_mask(&used, &fit) {
                 let protect_from = used.len() - 3;
                 let mut kept = std::mem::take(&mut self.rows_alt);
                 kept.clear();
-                kept.extend(
-                    used.iter()
-                        .copied()
-                        .enumerate()
-                        .filter(|(i, r)| {
-                            *i >= protect_from
-                                || (r.offset - (fit.a + fit.b * (r.t - fit.t0))).abs() <= threshold
-                        })
-                        .map(|(_, r)| r),
-                );
+                match mask {
+                    // The mask was built from the |residual|s the threshold was
+                    // derived from, so the decision is byte-identical -- and it
+                    // costs a shift and a test per row instead of a subtract, a
+                    // multiply, an add and an abs.
+                    Some(keep) => kept.extend(
+                        used.iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|(i, _)| keep & (1u64 << *i) != 0)
+                            .map(|(_, r)| r),
+                    ),
+                    // Windows over 64 rows keep the original walk.
+                    None => kept.extend(
+                        used.iter()
+                            .copied()
+                            .enumerate()
+                            .filter(|(i, r)| {
+                                *i >= protect_from
+                                    || (r.offset - (fit.a + fit.b * (r.t - fit.t0))).abs()
+                                        <= threshold
+                            })
+                            .map(|(_, r)| r),
+                    ),
+                }
                 if kept.len() >= 3
                     && kept.len() < used.len()
                     && let Some(refit) = wls_fit(&kept)
@@ -1011,15 +1026,9 @@ fn residual_half_gap_and_mad(samples: &[Row], fit: &Fit) -> (f64, f64, f64) {
 ///
 /// The median is then selected only on the rare path that is going to use it,
 /// so the threshold handed back is bit-identical to the old one.
+/// The threshold decision, over |residual|s the caller already has.
 #[inline(always)]
-fn spike_threshold(samples: &[Row], fit: &Fit) -> Option<f64> {
-    let n = samples.len();
-    if n == 0 {
-        return None;
-    }
-    let resid = |r: &Row| r.offset - (fit.a + fit.b * (r.t - fit.t0));
-    let mut abs: Vec<f64> = samples.iter().map(|r| resid(r).abs()).collect();
-
+fn spike_threshold_from(abs: &[f64], n: usize) -> Option<f64> {
     // The three newest are protected and can never be trimmed, so they must not
     // decide whether trimming is worth attempting.
     let droppable = n.saturating_sub(3);
@@ -1037,7 +1046,7 @@ fn spike_threshold(samples: &[Row], fit: &Fit) -> Option<f64> {
 
     let mid = n / 2;
     let mut below = 0usize;
-    for v in &abs {
+    for v in abs.iter() {
         if 3.0 * 1.4826 * *v < worst {
             below += 1;
         }
@@ -1046,8 +1055,51 @@ fn spike_threshold(samples: &[Row], fit: &Fit) -> Option<f64> {
         return None;
     }
 
-    abs.select_nth_unstable_by_key(mid, |v| v.to_bits());
-    Some((3.0 * 1.4826 * abs[mid]).max(1e-9))
+    // The selection PERMUTES what it is given, and the caller builds its keep
+    // mask by sample position -- so `abs` must stay in sample order. Select on
+    // a copy. Both early returns above fire on the large majority of estimates,
+    // so this copy is paid only where the median is actually needed.
+    let mut pick: Vec<f64> = abs.to_vec();
+    pick.select_nth_unstable_by_key(mid, |v| v.to_bits());
+    Some((3.0 * 1.4826 * pick[mid]).max(1e-9))
+}
+
+/// `spike_threshold`, plus the keep-mask it can produce for free.
+///
+/// The threshold is derived from |residual| for every row; the caller then
+/// compared every row's residual against it, recomputing all of them -- 5.6M Ir
+/// on one line. Handing the BUFFER back was refuted twice (+629,281 indexed,
+/// +1,331,400 zipped): carrying a second slice through the walk costs more than
+/// the arithmetic it saves. A `u64` mask is the cheapest possible carrier --
+/// one register, no allocation, no indirection -- and turns the filter into a
+/// bit test.
+///
+/// `None` mask when the window exceeds 64 rows; the caller keeps its old path
+/// there, so behaviour is unchanged at any capacity.
+#[inline(always)]
+fn spike_keep_mask(samples: &[Row], fit: &Fit) -> Option<(f64, Option<u64>)> {
+    let n = samples.len();
+    if n == 0 {
+        return None;
+    }
+    let abs: Vec<f64> = samples.iter().map(|r| spike_resid_abs(r, fit)).collect();
+    let threshold = spike_threshold_from(&abs, n)?;
+    if n > 64 {
+        return Some((threshold, None));
+    }
+    let protect_from = n - 3;
+    let mut keep = 0u64;
+    for (i, v) in abs.iter().enumerate() {
+        if i >= protect_from || *v <= threshold {
+            keep |= 1u64 << i;
+        }
+    }
+    Some((threshold, Some(keep)))
+}
+
+#[inline(always)]
+fn spike_resid_abs(r: &Row, fit: &Fit) -> f64 {
+    (r.offset - (fit.a + fit.b * (r.t - fit.t0))).abs()
 }
 
 /// Whether the residuals are well mixed — that is, whether the number of runs

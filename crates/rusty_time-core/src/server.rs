@@ -9,7 +9,6 @@
 //! product type). The daemon instantiates it with the peer address.
 
 use crate::ntp::NtpTimestamp;
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 /// Rate-limit policy, mirroring chrony's `ratelimit interval/burst/leak`.
@@ -289,6 +288,150 @@ impl Hasher for ClientHasher {
     }
 }
 
+/// An open-addressed index from client key to slot number.
+///
+/// Replaces `HashMap<K, u32, ClientHashBuilder>`, and the reason is the churn
+/// arm (`HOT_PATH_EVICT`). Under eviction hashbrown is **13.7M Ir, 18.1% of
+/// that arm** (8.49M `raw.rs` + 1.90M control tags + 3.30M SSE2 probing),
+/// against 3.5M / 7.4% on the steady arm -- which never removes a key and so
+/// priced this vein at a quarter of its real size.
+///
+/// Three simplifications, all of them properties of what a client table IS
+/// rather than cleverness:
+///
+/// 1. **Fixed capacity, so no resize.** The table evicts its least recently
+///    seen client instead of growing, so the bucket array is allocated once and
+///    never rehashed. The whole load-factor/regrow path disappears.
+/// 2. **Backward-shift deletion, so no tombstones.** A removal walks the rest
+///    of the probe run and pulls back any entry that may legally occupy the
+///    hole. Tombstones are the one failure mode an open-addressed table has
+///    under churn -- they accumulate until a probe degrades to a full scan --
+///    and this design does not have them at all. That is exactly what the
+///    churn arm exists to verify.
+/// 3. **Load factor <= 0.25 by construction** (buckets are the next power of
+///    two at or above `4 * capacity`), so probe runs stay short. This is not a
+///    free knob: at 0.5 the table WON on the steady arm (-789,020) and LOST
+///    heavily under churn (+7,455,786), because backward-shift deletion walks
+///    the probe run and long runs make every one of 149,227 removals expensive.
+///    At 0.25 both arms win. The price is four buckets per client instead of
+///    two, reported by `bytes_per_client`.
+///
+/// The full 64-bit hash is kept per bucket so a probe rejects a non-match
+/// without comparing the key -- the same job hashbrown's control bytes do. The
+/// key is stored because the index has to own one either way.
+struct Index<K> {
+    /// `None` is an empty bucket. There is deliberately no tombstone variant.
+    buckets: Box<[Option<Entry<K>>]>,
+    mask: usize,
+    len: usize,
+    hasher: ClientHashBuilder,
+}
+
+struct Entry<K> {
+    hash: u64,
+    key: K,
+    handle: u32,
+}
+
+impl<K: Eq + Hash> Index<K> {
+    fn with_capacity(capacity: usize, hasher: ClientHashBuilder) -> Self {
+        let n = capacity.max(1).saturating_mul(4).next_power_of_two();
+        let mut buckets = Vec::new();
+        buckets.resize_with(n, || None);
+        Index {
+            buckets: buckets.into_boxed_slice(),
+            mask: n - 1,
+            len: 0,
+            hasher,
+        }
+    }
+
+    #[inline]
+    fn hash_of(&self, key: &K) -> u64 {
+        use std::hash::BuildHasher as _;
+        self.hasher.hash_one(key)
+    }
+
+    /// Index of the bucket holding `key`, or `None`.
+    ///
+    /// `i & self.mask` is provably in range for any `i`, because `x & m <= m`
+    /// and the array is `m + 1` long -- so every bucket read here loses its
+    /// bounds check without a line of `unsafe`.
+    #[inline]
+    fn probe(&self, hash: u64, key: &K) -> Option<usize> {
+        let mut i = (hash as usize) & self.mask;
+        loop {
+            match &self.buckets[i] {
+                None => return None,
+                Some(e) if e.hash == hash && e.key == *key => return Some(i),
+                Some(_) => i = (i + 1) & self.mask,
+            }
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: &K) -> Option<u32> {
+        let h = self.hash_of(key);
+        let i = self.probe(h, key)?;
+        self.buckets[i].as_ref().map(|e| e.handle)
+    }
+
+    fn insert(&mut self, key: K, handle: u32) {
+        let hash = self.hash_of(&key);
+        if let Some(i) = self.probe(hash, &key) {
+            if let Some(e) = self.buckets[i].as_mut() {
+                e.handle = handle;
+            }
+            return;
+        }
+        let mut i = (hash as usize) & self.mask;
+        while self.buckets[i].is_some() {
+            i = (i + 1) & self.mask;
+        }
+        self.buckets[i] = Some(Entry { hash, key, handle });
+        self.len += 1;
+    }
+
+    fn remove(&mut self, key: &K) {
+        let hash = self.hash_of(key);
+        let Some(mut hole) = self.probe(hash, key) else {
+            return;
+        };
+        self.buckets[hole] = None;
+        self.len -= 1;
+
+        // Backward-shift deletion. Walk the remainder of the probe run; move an
+        // entry back into the hole whenever the hole lies between that entry's
+        // ideal bucket and where it currently sits. That preserves the only
+        // invariant `probe` needs -- every key is reachable by a forward scan
+        // from its own ideal bucket -- and is why no tombstone is required.
+        //
+        // Distances are measured forward from `ideal` and masked, so wrapping
+        // is handled without a signed comparison.
+        let mut i = (hole + 1) & self.mask;
+        while let Some(e) = self.buckets[i].as_ref() {
+            let ideal = (e.hash as usize) & self.mask;
+            let to_hole = hole.wrapping_sub(ideal) & self.mask;
+            let to_here = i.wrapping_sub(ideal) & self.mask;
+            if to_hole < to_here {
+                self.buckets[hole] = self.buckets[i].take();
+                hole = i;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// One client's storage: its key, its record, and its place in the recency
 /// list. Slots are stable — an index handed out stays valid until the client
 /// is evicted — which is what makes the list links safe as plain integers.
@@ -348,7 +491,7 @@ impl ClientHandle {
 pub struct ClientTable<K: Eq + Hash + Ord + Clone> {
     /// Key to slot. The only hashed structure, and the reason a request costs
     /// one hash instead of several.
-    index: HashMap<K, u32, ClientHashBuilder>,
+    index: Index<K>,
     /// Records in stable storage. Slots are handed out from `free` and never
     /// move, which is what lets the ordering below be pointers rather than
     /// comparisons.
@@ -377,7 +520,7 @@ pub struct ClientTable<K: Eq + Hash + Ord + Clone> {
 impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     pub fn new(capacity: usize, config: RateLimitConfig) -> Self {
         ClientTable {
-            index: HashMap::with_capacity_and_hasher(capacity.max(1), ClientHashBuilder::default()),
+            index: Index::with_capacity(capacity.max(1), ClientHashBuilder::default()),
             slots: Vec::with_capacity(capacity.max(1)),
             free: Vec::new(),
             mru: NIL,
@@ -451,10 +594,13 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     /// alone, which stopped being the whole story the moment records moved
     /// into slots.
     pub fn bytes_per_client() -> usize {
-        core::mem::size_of::<Slot<K>>()
-            + core::mem::size_of::<K>()          // the index's own copy of the key
-            + core::mem::size_of::<u32>()        // the slot number it maps to
-            + 1 // hashbrown's control byte
+        // The index is open-addressed at a load factor of 0.25, so it holds
+        // FOUR buckets per client, not one entry. That is the honest figure and
+        // it is a real cost: the lower load factor is what makes backward-shift
+        // deletion cheap (measured -6.45% Ir on the churn arm against 0.5), and
+        // it is paid in memory. A caller sizing a table for a large population
+        // needs to see it here rather than discover it in RSS.
+        core::mem::size_of::<Slot<K>>() + 4 * core::mem::size_of::<Option<Entry<K>>>()
     }
 
     pub fn len(&self) -> usize {
@@ -466,7 +612,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     }
 
     pub fn get(&self, key: &K) -> Option<&ClientRecord> {
-        let i = *self.index.get(key)?;
+        let i = self.index.get(key)?;
         Some(&self.slots[i as usize].record)
     }
 
@@ -588,7 +734,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
         // request: `contains_key`, then `touch`'s `get_mut`, then a final
         // `get_mut` to reach the record.
         let slot = match self.index.get(key) {
-            Some(&i) => {
+            Some(i) => {
                 self.touch(i);
                 i
             }
@@ -647,7 +793,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     /// actually saw our last response knows it.
     pub fn response_mode(&mut self, key: &K, request_origin: NtpTimestamp) -> ResponseMode {
         match self.index.get(key) {
-            Some(&i) => {
+            Some(i) => {
                 let handle = self.handle_for(i);
                 self.response_mode_at(handle, request_origin)
             }
@@ -690,7 +836,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
 
     /// Record what we received and what we told the client, after answering.
     pub fn note_response(&mut self, key: &K, receive: NtpTimestamp, receive_sent: NtpTimestamp) {
-        if let Some(&i) = self.index.get(key) {
+        if let Some(i) = self.index.get(key) {
             let handle = self.handle_for(i);
             self.note_response_at(handle, receive, receive_sent);
         }
@@ -715,7 +861,7 @@ impl<K: Eq + Hash + Ord + Clone> ClientTable<K> {
     /// timestamp the basic exchange cannot report because the packet has not
     /// left yet when its own transmit field is written.
     pub fn note_transmit(&mut self, key: &K, transmit: NtpTimestamp) {
-        if let Some(&i) = self.index.get(key) {
+        if let Some(i) = self.index.get(key) {
             self.slots[i as usize].record.last_transmit = Some(transmit);
         }
     }

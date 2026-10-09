@@ -94,7 +94,26 @@ fn main() {
         global_rate_hz: 0.0,
         global_burst: 1e9,
     };
-    let mut table: ClientTable<IpAddr> = ClientTable::new(CLIENTS as usize * 2, config);
+    // Two arms. The default sizes the table at 2x the client population, so it
+    // never evicts -- which is the steady state a real server spends its life
+    // in, and the right arm for pricing the admit path.
+    //
+    // `HOT_PATH_EVICT` sizes it at a QUARTER of the population instead, so the
+    // recency list churns and `evicted` is large. That arm exists because the
+    // default one reports `evicted 0`, and a harness that never removes a key
+    // cannot gate any change to the client index: tombstone accumulation and
+    // probe degradation are invisible to it. A fixture that never enters the
+    // code cannot measure a change to it.
+    // `is_ok()` would be true for an EMPTY value, and a harness that exports
+    // `HOT_PATH_EVICT=` to mean "off" would then silently run both arms in
+    // churn mode -- which is exactly what happened the first time.
+    let evict_arm = std::env::var("HOT_PATH_EVICT").is_ok_and(|v| !v.is_empty());
+    let capacity = if evict_arm {
+        (CLIENTS as usize / 4).max(1)
+    } else {
+        CLIENTS as usize * 2
+    };
+    let mut table: ClientTable<IpAddr> = ClientTable::new(capacity, config);
 
     let mut lcg = Lcg(0x0123_4567_89ab_cdef);
     let mut checksum: u64 = 0;
@@ -189,6 +208,8 @@ fn main() {
     }
 
     let stats = table.stats;
+    println!("arm        {}", if evict_arm { "evict" } else { "steady" });
+    println!("capacity   {capacity}");
     println!("requests   {requests}");
     println!("answered   {answered}");
     println!("kod        {kod}");

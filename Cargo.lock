@@ -1614,6 +1614,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
+
+[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1905,19 +1911,20 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty_alloc"
-version = "1.1.6"
+version = "2.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c93620fee9935a120a50df2086fe48fa072f7d391f129a5e04bf20ea9b83097d"
+checksum = "318c1ca44267aa30e631ed57f8c1db3e25991374bdadc35d97db11b65faba496"
 dependencies = [
  "libc",
+ "portable-atomic",
  "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "rusty_alloc-api"
-version = "1.1.6"
+version = "2.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05ce52d7f72842a590e4588013d70ea02d27edbf6b6af9bc193f6e1ac173845a"
+checksum = "613568557b57208dff4fa2cdb1ada1bc98339d3cc3ab9533edd712c4946165b4"
 dependencies = [
  "rusty_alloc",
 ]
@@ -2024,6 +2031,12 @@ dependencies = [
  "rusty_time-core",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "rusty_zstd"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "145055be9e2940b6b6ad3e5d5bcb09083db51f0112837a89658fd44ca2bf0c40"
 
 [[package]]
 name = "scopeguard"
@@ -2215,9 +2228,9 @@ dependencies = [
 
 [[package]]
 name = "spacedb-access"
-version = "0.5.2"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a109d0f044a19e4c31ee8e04a72629290ac2c48dfaaefe28177b9b06d8ac35c4"
+checksum = "e854dabccceb1589aa80fe09317b5ae39621637d521c42f460c3e80abd856109"
 dependencies = [
  "blake3",
  "getrandom 0.3.4",
@@ -2229,18 +2242,18 @@ dependencies = [
 
 [[package]]
 name = "spacedb-consistency"
-version = "0.5.2"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b78eb34d357514ec94a2e23c7ef09a7fc3966ae8e4e5019ce598dcf5f45171f4"
+checksum = "27fd130cb60bb047b94dba7a8e0286622e46bb77fded9a59afee0fe65d011a1e"
 dependencies = [
  "spacedb-crdt",
 ]
 
 [[package]]
 name = "spacedb-crdt"
-version = "0.5.2"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65ecfab39719ce6c56e4498e7f2a29cfd7a88fd872e2a2ec45632f745ae0e997"
+checksum = "e3d391f89680e8b76da516310a2e33afcd7dd07d0b1def5a6c37c432add2ae5a"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -2252,9 +2265,9 @@ dependencies = [
 
 [[package]]
 name = "spacedb-meter"
-version = "0.5.2"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c3b16039931f675c70121742d3910877828bd17fc87fc43c155dde9d227fc1e"
+checksum = "33e1adcea579e1c7f057768f60837108580e506040f7a68c544de7d46b729062"
 dependencies = [
  "postcard",
  "serde",
@@ -2263,9 +2276,9 @@ dependencies = [
 
 [[package]]
 name = "spacedb-sdk"
-version = "0.5.2"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffe654798d055da32c3516fc57163cf81c4820c31340945e8896c431429f73e8"
+checksum = "eb0efd12f279d2face256018f2b36e4d86f9a2187f555413a06fb02431e0a450"
 dependencies = [
  "spacedb-access",
  "spacedb-consistency",
@@ -2276,9 +2289,9 @@ dependencies = [
 
 [[package]]
 name = "spacedb-store"
-version = "0.5.2"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "750ffd093e84a072b8cc3e3a1aca5588e597f52220f1ebd188a4d6758285901b"
+checksum = "d27a2e85739cc7ff86c3b116aa2204bd8dc1d438741828761ee05c0dcd3dfac5"
 dependencies = [
  "aes-gcm 0.10.3",
  "blake3",
@@ -2286,6 +2299,7 @@ dependencies = [
  "postcard",
  "rand",
  "redb",
+ "rusty_zstd",
  "serde",
  "thiserror 1.0.69",
  "zeroize",

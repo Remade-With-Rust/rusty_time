@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/Remade-With-Rust/rusty_time/compare/rusty_time-sim-v0.3.0...rusty_time-sim-v0.3.1) - 2026-10-18
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.3.0] - 2026-10-08
 
 ### Changed

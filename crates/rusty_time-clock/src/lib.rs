@@ -140,6 +140,9 @@ pub mod refclock;
 #[cfg(any(unix, windows))]
 pub mod net;
 
+/// SIGTERM and SIGINT, including as a PID namespace's init process.
+pub mod stop;
+
 /// Probe this machine's clock capabilities.
 pub fn capabilities() -> ClockCapabilities {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]

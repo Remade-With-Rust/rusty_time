@@ -9,13 +9,14 @@
 //! number here means anything: the alternative — a simulator with its own copy
 //! of the loop — measures code that never ships.
 
+use crate::nts_session::{NtsSession, NtsSessionError};
 use rusty_time_clock::{ClockDrive, ClockRead, SystemClock, net};
 use rusty_time_core::client::MultiController;
 use rusty_time_core::discipline::ChangeVerdict;
 use rusty_time_core::ntp::{self, HEADER_LEN, LeapIndicator, Mode, NtpPacket, NtpTimestamp};
 use rusty_time_core::select::select;
 use rusty_time_core::{ClockCommand, DisciplineConfig, LeapMode, Sample, SourceEstimate};
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,7 +37,30 @@ pub struct SyncOptions {
     /// `rtimed serve`, so `rtimec` finds either role without being told which
     /// is running.
     pub control_path: String,
+    /// Also answer NTP on this address with the clock being steered — a
+    /// router serving its LAN. Replies say unsynchronised (leap 3, stratum 16)
+    /// until a correction has reached the clock, then carry the selected
+    /// source's stratum + 1 and reference id.
+    pub serve_bind: Option<String>,
+    /// Authenticate every source with NTS (RFC 8915): each server name is an
+    /// NTS-KE host, and a reply that does not verify is never used.
+    pub nts: bool,
+    /// NTS-KE port; only consulted when `nts` is set.
+    pub ke_port: u16,
+    /// Extra trust anchors (PEM) for NTS-KE: a private CA or a pinned server.
+    pub nts_ca_pem: Option<String>,
+    /// chrony's `nocerttimecheck`, for a machine with no battery clock: until
+    /// this process has put its first correction on the clock, judge NTS-KE
+    /// certificate dates at the chain's own time rather than the local clock,
+    /// which is known to be wrong. Chain, signatures and name are verified
+    /// regardless; after the first correction, dates are checked as usual.
+    pub nocerttimecheck: bool,
 }
+
+/// Whether this process has put a correction on the clock. Until then a clock
+/// with no battery behind it (a router at its image's build date) is no basis
+/// for judging certificate dates.
+static CLOCK_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl SyncOptions {
     pub fn parse(args: &[String]) -> Result<SyncOptions, String> {
@@ -49,6 +73,11 @@ impl SyncOptions {
             timeout_ms: 2000,
             verbose: false,
             control_path: crate::control::default_path(),
+            serve_bind: None,
+            nts: false,
+            ke_port: rusty_time_nts::KE_PORT,
+            nts_ca_pem: None,
+            nocerttimecheck: false,
         };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
@@ -57,6 +86,17 @@ impl SyncOptions {
             };
             match arg.as_str() {
                 "--control" => opts.control_path = value()?,
+                "--serve" => opts.serve_bind = Some(value()?),
+                "--nts" => opts.nts = true,
+                "--nocerttimecheck" => opts.nocerttimecheck = true,
+                "--ke-port" => {
+                    opts.ke_port = value()?.parse().map_err(|_| "--ke-port: not a number")?;
+                }
+                "--nts-ca" => {
+                    let path = value()?;
+                    opts.nts_ca_pem =
+                        Some(std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?);
+                }
                 "--dry-run" => opts.dry_run = true,
                 "--verbose" | "-v" => opts.verbose = true,
                 "--port" => {
@@ -187,6 +227,9 @@ impl SyncOptions {
 struct Source {
     name: String,
     socket: UdpSocket,
+    /// The NTS session when `--nts` is set: every request spends one of its
+    /// cookies, and only a reply that verifies under its keys is used.
+    nts: Option<NtsSession>,
     /// Monotonic instant of the next due poll.
     due: Instant,
     /// Latest estimate, for selection across sources.
@@ -242,17 +285,58 @@ pub fn run(opts: &SyncOptions) -> i32 {
     let mut discipline = opts.discipline;
     discipline.max_slew_ppm = discipline.max_slew_ppm.min(caps.max_slew_ppm);
 
-    let mut sources = Vec::new();
-    for name in &opts.servers {
-        match open_source(name, &discipline, opts) {
-            Ok(source) => sources.push(source),
-            Err(e) => eprintln!("rtimed sync: {name}: {e}"),
+    // SIGTERM and SIGINT are honoured from here on: by the wait below, and by
+    // the discipline loop, which never waits longer than 500 ms between
+    // checks. Without a handler, a jailed or containerised rtimed (PID 1 of
+    // its namespace) ignores SIGTERM entirely.
+    rusty_time_clock::stop::on_stop_signal(rusty_time_clock::stop::StopMode::Flag);
+
+    // A router starts its time daemon before its uplink is up: no name
+    // resolves and no route exists, so every source fails to open. Wait for
+    // one, as chronyd and BusyBox ntpd do, rather than exit. With `--seconds`
+    // the wait counts against the run, so a bounded run still ends.
+    let waiting_since = Instant::now();
+    let mut retry = Duration::from_secs(2);
+    let mut attempts: u32 = 0;
+    let mut sources = loop {
+        attempts += 1;
+        let mut opened = Vec::new();
+        let mut failures = Vec::new();
+        for name in &opts.servers {
+            match open_source(name, &discipline, opts) {
+                Ok(source) => opened.push(source),
+                Err(e) => failures.push(format!("rtimed sync: {name}: {e}")),
+            }
         }
-    }
-    if sources.is_empty() {
-        eprintln!("rtimed sync: no usable sources");
-        return 1;
-    }
+        if !opened.is_empty() {
+            for failure in &failures {
+                eprintln!("{failure}");
+            }
+            if attempts > 1 {
+                println!("rtimed sync: a source opened after {attempts} attempts");
+            }
+            break opened;
+        }
+        if attempts == 1 {
+            for failure in &failures {
+                eprintln!("{failure}");
+            }
+            eprintln!("rtimed sync: no usable sources yet; retrying");
+        }
+        if opts.run_seconds > 0 && waiting_since.elapsed().as_secs() >= opts.run_seconds {
+            eprintln!("rtimed sync: no usable sources");
+            return 1;
+        }
+        let resume = Instant::now() + retry;
+        while Instant::now() < resume {
+            if rusty_time_clock::stop::stop_requested() {
+                println!("rtimed sync: stopping");
+                return 0;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        retry = (retry * 2).min(Duration::from_secs(64));
+    };
 
     // Measured on the same clock the samples use, so "how long until the first
     // exchange" is answerable from the log rather than inferred.
@@ -263,6 +347,29 @@ pub fn run(opts: &SyncOptions) -> i32 {
         if opts.dry_run { " (dry run)" } else { "" },
         mono_start
     );
+
+    // The LAN side, when asked for: starts unsynchronised and follows the loop.
+    let served = match &opts.serve_bind {
+        None => None,
+        Some(bind) => match crate::server::serve_following(bind) {
+            Ok(state) => {
+                println!(
+                    "rtimed sync: serving NTP on {bind} (unsynchronised until the clock is steered)"
+                );
+                Some(state)
+            }
+            Err(e) => {
+                eprintln!("rtimed sync: {e}");
+                return 1;
+            }
+        },
+    };
+    // When the served view last came from an accepted correction. A loop
+    // that has heard nothing for four maximum poll intervals stops vouching
+    // for the clock to the LAN, as ntpd and chronyd do.
+    let mut served_synced_at: Option<Instant> = None;
+    let served_stale_after =
+        Duration::from_secs_f64(4.0 * 2f64.powi(opts.discipline.max_poll.into()));
 
     // Measurement arm, resolved once: RUSTY_TIME_NO_DRAIN_STOP=1 leaves drains
     // running until the next plan replaces them, which is what this daemon did
@@ -291,9 +398,28 @@ pub fn run(opts: &SyncOptions) -> i32 {
     let mut driver = SystemClock;
     let mut applied_any = false;
 
+    let mut stopped = false;
+
     loop {
         if opts.run_seconds > 0 && started.elapsed().as_secs() >= opts.run_seconds {
             break;
+        }
+        if rusty_time_clock::stop::stop_requested() {
+            println!("rtimed sync: stopping");
+            stopped = true;
+            break;
+        }
+        if let (Some(served), Some(at)) = (&served, served_synced_at)
+            && at.elapsed() > served_stale_after
+        {
+            if let Ok(mut s) = served.lock() {
+                s.stratum = crate::server::STRATUM_UNSYNCHRONIZED;
+                s.upstream = crate::server::Upstream::UNSYNCHRONIZED;
+            }
+            served_synced_at = None;
+            eprintln!(
+                "rtimed sync: no accepted correction for {served_stale_after:?}; serving as unsynchronised"
+            );
         }
 
         // Retire any drain whose budget is spent.
@@ -474,6 +600,7 @@ pub fn run(opts: &SyncOptions) -> i32 {
                         match driver.apply(&step.plan.command) {
                             Ok(()) => {
                                 applied_any = true;
+                                CLOCK_SET.store(true, std::sync::atomic::Ordering::Relaxed);
                                 refused_in_a_row = 0;
                                 steered = true;
                                 ctl.confirm_last_plan();
@@ -510,14 +637,38 @@ pub fn run(opts: &SyncOptions) -> i32 {
                     // report a synchronisation that is not happening. So a
                     // dry run reports unsynchronized however good its estimate
                     // is, because nothing is steering this clock.
+                    let synchronized = steered && matches!(step.verdict, ChangeVerdict::Accepted);
                     if let Ok(mut t) = tracking.lock() {
                         t.publish(
-                            steered && matches!(step.verdict, ChangeVerdict::Accepted),
+                            synchronized,
                             step.estimate_offset_s,
                             step.estimate_freq_ppm.unwrap_or(0.0),
                             step.estimate_sd_s,
                             step.plan.next_poll_s,
                         );
+                    }
+                    // The LAN sees the same rule: only a correction that reached
+                    // the clock lets it vouch for the time, one stratum below
+                    // the source that steered it.
+                    if synchronized
+                        && let Some(served) = &served
+                        && let Ok(peer) = sources[index].socket.peer_addr()
+                        && let Ok(mut s) = served.lock()
+                    {
+                        s.stratum = sources[index]
+                            .last_stratum
+                            .saturating_add(1)
+                            .min(crate::server::STRATUM_UNSYNCHRONIZED);
+                        s.upstream = crate::server::Upstream {
+                            leap: LeapIndicator::NoWarning,
+                            reference_id: crate::refid::reference_id(peer.ip()),
+                            root_delay_s: 0.0,
+                            // The selected source's root distance, which already
+                            // includes half its root delay and this path's
+                            // uncertainty: what a client should add for us.
+                            root_dispersion_s: sources[index].last_root_distance_s,
+                        };
+                        served_synced_at = Some(Instant::now());
                     }
                 }
                 None => {
@@ -553,7 +704,8 @@ pub fn run(opts: &SyncOptions) -> i32 {
              the frequency figure is not a drift measurement)"
         );
     }
-    if !opts.dry_run && !applied_any {
+    // Asked to stop before the first correction is a stop, not a failure.
+    if !opts.dry_run && !applied_any && !stopped {
         eprintln!("rtimed sync: no clock command was ever applied");
         return 1;
     }
@@ -666,7 +818,39 @@ fn open_source(
     _discipline: &DisciplineConfig,
     opts: &SyncOptions,
 ) -> Result<Source, String> {
-    let addr = (name, opts.port)
+    // With NTS the name is the key-establishment host, and KE says where NTP
+    // actually is (RFC 8915 §4.1.7: it may delegate to another host or port).
+    let nts = if opts.nts {
+        Some(establish_nts(name, opts)?)
+    } else {
+        None
+    };
+    let (host, port) = match &nts {
+        Some(session) => (session.ntp_server.clone(), session.ntp_port),
+        None => (name.to_string(), opts.port),
+    };
+    let socket = connect_ntp(&host, port, opts)?;
+
+    Ok(Source {
+        name: name.to_string(),
+        socket,
+        nts,
+        due: Instant::now(),
+        last_offset_s: 0.0,
+        last_root_distance_s: 1.0,
+        lost_in_a_row: 0,
+        last_stratum: 16,
+        has_estimate: false,
+        exchanges: 0,
+        lost: 0,
+        leap_pending: false,
+    })
+}
+
+/// A UDP socket connected to `host:port`, with the read timeout and kernel
+/// receive timestamps every exchange relies on.
+fn connect_ntp(host: &str, port: u16, opts: &SyncOptions) -> Result<UdpSocket, String> {
+    let addr: SocketAddr = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("resolving: {e}"))?
         .next()
@@ -686,20 +870,60 @@ fn open_source(
     // Kernel receive timestamps where the platform has them: the difference
     // between "when it arrived" and "when we were scheduled to read it".
     let _ = net::enable_rx_timestamps(&socket);
+    Ok(socket)
+}
 
-    Ok(Source {
-        name: name.to_string(),
-        socket,
-        due: Instant::now(),
-        last_offset_s: 0.0,
-        last_root_distance_s: 1.0,
-        lost_in_a_row: 0,
-        last_stratum: 16,
-        has_estimate: false,
-        exchanges: 0,
-        lost: 0,
-        leap_pending: false,
-    })
+/// Run NTS-KE with `host`, as `rtimed query --nts` does.
+fn establish_nts(host: &str, opts: &SyncOptions) -> Result<NtsSession, String> {
+    let extra_roots = match &opts.nts_ca_pem {
+        Some(pem) => {
+            use rusty_time_nts::tls::pki_types::{CertificateDer, pem::PemObject};
+            CertificateDer::pem_slice_iter(pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("parsing --nts-ca: {e}"))?
+        }
+        None => Vec::new(),
+    };
+    let timeout = Duration::from_millis(opts.timeout_ms.max(1) * 5);
+    let unset = !CLOCK_SET.load(std::sync::atomic::Ordering::Relaxed);
+    if opts.nocerttimecheck && unset {
+        NtsSession::establish_ignoring_cert_dates(host, opts.ke_port, timeout, &extra_roots)
+            .map_err(|e| {
+                format!(
+                    "NTS key establishment (certificate dates not checked: clock not yet set): {e}"
+                )
+            })
+    } else {
+        NtsSession::establish(host, opts.ke_port, timeout, &extra_roots)
+            .map_err(|e| format!("NTS key establishment: {e}"))
+    }
+}
+
+/// A fresh NTS session for `source` once its cookies are spent (each request
+/// spends one; a reply that fails to verify returns none). Reconnects if key
+/// establishment now names a different NTP server.
+fn renew_nts(source: &mut Source, opts: &SyncOptions) -> bool {
+    let session = match establish_nts(&source.name, opts) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("rtimed sync: {}: {e}", source.name);
+            return false;
+        }
+    };
+    let same_server = source.nts.as_ref().is_some_and(|old| {
+        old.ntp_server == session.ntp_server && old.ntp_port == session.ntp_port
+    });
+    if !same_server {
+        match connect_ntp(&session.ntp_server, session.ntp_port, opts) {
+            Ok(socket) => source.socket = socket,
+            Err(e) => {
+                eprintln!("rtimed sync: {}: {e}", source.name);
+                return false;
+            }
+        }
+    }
+    source.nts = Some(session);
+    true
 }
 
 /// One NTP exchange. Returns the sample plus what the server said about itself.
@@ -709,7 +933,30 @@ fn exchange(
     clock: &SystemClock,
 ) -> Option<(Sample, u8, f64)> {
     let nonce = NtpTimestamp(nonce_value(source.exchanges));
-    let request = NtpPacket::client_request(4, nonce).to_bytes();
+    let header = NtpPacket::client_request(4, nonce).to_bytes();
+    // NTS: the header goes out wrapped in a cookie and an authenticator. With
+    // every cookie spent, key establishment runs again first.
+    let protected = match source.nts.as_mut().map(|s| s.protect(&header)) {
+        None => None,
+        Some(Ok(packet)) => Some(packet),
+        Some(Err(NtsSessionError::CookiesExhausted)) => {
+            if !renew_nts(source, opts) {
+                return None;
+            }
+            match source.nts.as_mut()?.protect(&header) {
+                Ok(packet) => Some(packet),
+                Err(e) => {
+                    eprintln!("rtimed sync: {}: {e}", source.name);
+                    return None;
+                }
+            }
+        }
+        Some(Err(e)) => {
+            eprintln!("rtimed sync: {}: {e}", source.name);
+            return None;
+        }
+    };
+    let request: &[u8] = protected.as_deref().unwrap_or(&header);
 
     // Kept as INTEGER nanoseconds, not seconds-as-f64.
     //
@@ -726,9 +973,11 @@ fn exchange(
     // would break loudly; the daemon would simply get less accurate, on a date.
     let t1_ns = clock.wall_ns().ok()?;
     let t1_mono = clock.mono_s().ok()?;
-    source.socket.send(&request).ok()?;
+    source.socket.send(request).ok()?;
 
     let deadline = Instant::now() + Duration::from_millis(opts.timeout_ms.max(1));
+    // An NTS reply fits: it refills only the cookies spent since the last
+    // full store, normally the one this request used.
     let mut bufs = [[0u8; 1024]; 4];
     let mut received = Vec::with_capacity(4);
     let mut scratch = net::BatchScratch::new();
@@ -761,6 +1010,30 @@ fn exchange(
             }
             match NtpPacket::parse(&bufs[index][..message.len]) {
                 Ok(p) if p.origin_ts == nonce && p.mode == Mode::Server => {
+                    // Under NTS a reply counts only if it verifies against the
+                    // request in flight; that also banks its fresh cookies. An
+                    // unauthenticated one is dropped, and the exchange waits on
+                    // for the real reply.
+                    if let Some(session) = source.nts.as_mut()
+                        && session.verify(&bufs[index][..message.len]).is_err()
+                    {
+                        // Except an NTS NAK answering this very request (RFC
+                        // 8915 §5.7, kiss code NTSN): the server cannot redeem
+                        // our cookies any more, so renew at the next poll
+                        // instead of losing one exchange per cookie left, as
+                        // chronyd does. Forging one needs the request's origin
+                        // timestamp, i.e. an on-path attacker, who could drop
+                        // our packets anyway.
+                        if p.stratum == 0 && p.reference_id == *b"NTSN" {
+                            eprintln!(
+                                "rtimed sync: {}: NTS NAK; key establishment at the next poll",
+                                source.name
+                            );
+                            session.forget_cookies();
+                            return None;
+                        }
+                        continue;
+                    }
                     // The kernel stamp is taken when the packet reached the
                     // stack; the userspace read is taken after we were
                     // scheduled. Prefer the former — the difference is
@@ -887,6 +1160,7 @@ mod tests {
         Source {
             name: "stub".into(),
             socket: UdpSocket::bind("127.0.0.1:0").expect("bind"),
+            nts: None,
             due: Instant::now(),
             last_offset_s: offset_s,
             last_root_distance_s: root_distance_s,

@@ -239,6 +239,13 @@ pub fn fresh_key_ring() -> Result<KeyRing, String> {
 }
 
 pub fn run(opts: &ServeOptions) -> i32 {
+    // The serving threads block in receive and have no loop to poll a flag
+    // from, so SIGTERM and SIGINT end the process at once, as the default
+    // action does. The handler is what makes that true as PID 1 of a
+    // namespace (a jail or a container), where a default action is not
+    // applied and rtimed otherwise ignored SIGTERM.
+    rusty_time_clock::stop::on_stop_signal(rusty_time_clock::stop::StopMode::Exit);
+
     // Load the key ring from durable state when we have some, so cookies
     // minted before a restart still redeem. Without this every restart
     // strands every client holding a cookie, forcing a full NTS-KE round.
@@ -253,6 +260,7 @@ pub fn run(opts: &ServeOptions) -> i32 {
         clients: ClientTable::new(CLIENT_TABLE_CAPACITY, opts.rate_limit),
         ring,
         stratum: opts.stratum,
+        upstream: Upstream::REFERENCE,
         started_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -585,7 +593,68 @@ pub struct ServerState {
     pub clients: ClientTable<std::net::IpAddr>,
     pub ring: KeyRing,
     pub stratum: u8,
+    /// What replies say about the clock behind them.
+    pub upstream: Upstream,
     pub started_unix: u64,
+}
+
+/// The reply header fields that describe this server's own clock rather than
+/// the exchange: leap, reference id and root distance.
+///
+/// `rtimed serve` is a reference clock of its own and always answers
+/// [`Upstream::REFERENCE`]. A server following `rtimed sync` (a router serving
+/// its LAN) starts at [`Upstream::UNSYNCHRONIZED`], so clients do not select
+/// it before its clock has been steered, and then answers with the selected
+/// source's reference id and distance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Upstream {
+    pub leap: LeapIndicator,
+    pub reference_id: [u8; 4],
+    pub root_delay_s: f64,
+    pub root_dispersion_s: f64,
+}
+
+impl Upstream {
+    /// What `rtimed serve` has always answered.
+    pub const REFERENCE: Upstream = Upstream {
+        leap: LeapIndicator::NoWarning,
+        reference_id: *b"RSTY",
+        root_delay_s: 0.0,
+        root_dispersion_s: 0.000_1,
+    };
+
+    /// RFC 5905's unsynchronised server: leap 3 (with stratum 16 alongside),
+    /// which every client refuses to select. Reference id `INIT`, as ntpd shows
+    /// before its first synchronisation.
+    pub const UNSYNCHRONIZED: Upstream = Upstream {
+        leap: LeapIndicator::Unsynchronized,
+        reference_id: *b"INIT",
+        root_delay_s: 0.0,
+        root_dispersion_s: 0.0,
+    };
+}
+
+/// The stratum that goes with [`Upstream::UNSYNCHRONIZED`].
+pub const STRATUM_UNSYNCHRONIZED: u8 = 16;
+
+/// Answer NTP on `bind` with the clock `rtimed sync` steers: the replies follow
+/// the returned state, which starts unsynchronised and is updated by the sync
+/// loop. Plain NTP only (no NTS-KE listener), with the default rate limit.
+pub fn serve_following(bind: &str) -> Result<Arc<Mutex<ServerState>>, String> {
+    let socket = UdpSocket::bind(bind).map_err(|e| format!("binding NTP {bind}: {e}"))?;
+    let state = Arc::new(Mutex::new(ServerState {
+        clients: ClientTable::new(CLIENT_TABLE_CAPACITY, RateLimitConfig::default()),
+        ring: fresh_key_ring()?,
+        stratum: STRATUM_UNSYNCHRONIZED,
+        upstream: Upstream::UNSYNCHRONIZED,
+        started_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    }));
+    let loop_state = Arc::clone(&state);
+    std::thread::spawn(move || ntp_serve_loop(&socket, &loop_state));
+    Ok(state)
 }
 
 fn ntp_serve_loop(socket: &UdpSocket, state: &Arc<Mutex<ServerState>>) {
@@ -763,6 +832,18 @@ fn kiss_of_death(request: &NtpPacket, recv_ts: NtpTimestamp) -> [u8; HEADER_LEN]
     .to_bytes()
 }
 
+/// An NTS NAK (RFC 8915 §5.7): a Kiss-o'-Death with code NTSN, echoing the
+/// request's Unique Identifier so the client can tie it to its request. It
+/// carries no authenticator: we hold no keys this client can verify.
+fn nts_nak(request: &NtpPacket, recv_ts: NtpTimestamp, unique_id: &[u8]) -> Vec<u8> {
+    let mut header = kiss_of_death(request, recv_ts);
+    header[12..16].copy_from_slice(b"NTSN");
+    let mut out = Vec::with_capacity(HEADER_LEN + 4 + unique_id.len());
+    out.extend_from_slice(&header);
+    ef::write_field(&mut out, ef::field_type::UNIQUE_IDENTIFIER, unique_id);
+    out
+}
+
 /// Whether interleaved-mode debug output is on. Read from the environment
 /// once; it cannot change while the process runs.
 fn debug_xleave() -> bool {
@@ -890,12 +971,14 @@ pub fn build_reply_in(
                 handle,
                 ResponseMode::Basic,
                 0u8,
+                Upstream::REFERENCE,
                 recv_ts,
                 recv_ts,
             )
         } else {
             let mode = guard.clients.response_mode_at(handle, parsed.origin_ts);
             let stratum = guard.stratum;
+            let upstream = guard.upstream;
             // Interleaved mode reports the PREVIOUS exchange's transmit, whose
             // value was read after that packet actually went out. Receive is
             // always THIS exchange's -- that is what lets the client
@@ -920,12 +1003,13 @@ pub fn build_reply_in(
                 handle,
                 mode,
                 stratum,
+                upstream,
                 receive_field,
                 transmit_field,
             )
         }
     };
-    let (disposition, handle, mode, stratum, receive_field, transmit_field) = locked;
+    let (disposition, handle, mode, stratum, upstream, receive_field, transmit_field) = locked;
     match disposition {
         Disposition::Respond => {}
         Disposition::KissOfDeath => {
@@ -987,15 +1071,15 @@ pub fn build_reply_in(
     };
 
     let mut header = NtpPacket {
-        leap: LeapIndicator::NoWarning,
+        leap: upstream.leap,
         version: parsed.version,
         mode: Mode::Server,
         stratum,
         poll: parsed.poll,
         precision: -20,
-        root_delay: ntp::NtpShort(0),
-        root_dispersion: ntp::NtpShort::from_seconds(0.000_1),
-        reference_id: *b"RSTY",
+        root_delay: ntp::NtpShort::from_seconds(upstream.root_delay_s),
+        root_dispersion: ntp::NtpShort::from_seconds(upstream.root_dispersion_s),
+        reference_id: upstream.reference_id,
         reference_ts: recv_ts,
         origin_ts: origin_field,
         receive_ts: receive_field,
@@ -1024,7 +1108,16 @@ pub fn build_reply_in(
     // NTS path: the cookie must redeem and the authenticator must verify
     // before we say anything at all about the time.
     let (cookie, unique_id) = (cookie?, unique_id?);
-    let keys = rusty_time_nts::cookie::redeem(&guard.ring, cookie).ok()?;
+    let Ok(keys) = rusty_time_nts::cookie::redeem(&guard.ring, cookie) else {
+        // RFC 8915 §5.7: a cookie we cannot redeem (our master keys have
+        // changed since it was minted, or it was never ours) gets an NTS NAK,
+        // so the client runs key establishment again now instead of spending
+        // every cookie it holds on exchanges we will never answer.
+        return Some(Reply {
+            bytes: ReplyBytes::Extended(nts_nak(&parsed, recv_ts, unique_id)),
+            handle,
+        });
+    };
     verify_client_authenticator(request, auth_field, &keys.c2s)?;
 
     // Fresh cookies: one to replace the cookie just spent, plus the

@@ -23,6 +23,7 @@ fn state_with(rate_limit: RateLimitConfig) -> Arc<Mutex<ServerState>> {
         clients: ClientTable::new(64, rate_limit),
         ring,
         stratum: 2,
+        upstream: Upstream::REFERENCE,
         started_unix: 0,
     }))
 }
@@ -51,6 +52,43 @@ fn answers_plain_client_requests() {
     // The origin timestamp must echo the client transmit: that is the client's
     // only anti-spoofing binding.
     assert_eq!(p.origin_ts, NtpTimestamp(0x1234_5678_9ABC_DEF0));
+}
+
+#[test]
+fn a_following_server_is_unselectable_until_its_clock_is_steered() {
+    // A router serving its LAN from `rtimed sync --serve`: before the first
+    // correction, RFC 5905's unsynchronised answer (leap 3, stratum 16), which
+    // every client refuses; afterwards, the selected source's view.
+    let state = test_state();
+    {
+        let mut s = state.lock().expect("lock");
+        s.stratum = STRATUM_UNSYNCHRONIZED;
+        s.upstream = Upstream::UNSYNCHRONIZED;
+    }
+    let req = NtpPacket::client_request(4, NtpTimestamp(0x1234_5678_9ABC_DEF0)).to_bytes();
+    let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
+    let reply = build_reply(&req, peer(1), recv, &state, &SystemClock).expect("reply");
+    let p = NtpPacket::parse(&reply).expect("parse");
+    assert_eq!(p.leap, LeapIndicator::Unsynchronized);
+    assert_eq!(p.stratum, 16);
+    assert_eq!(&p.reference_id, b"INIT");
+
+    {
+        let mut s = state.lock().expect("lock");
+        s.stratum = 3;
+        s.upstream = Upstream {
+            leap: LeapIndicator::NoWarning,
+            reference_id: [203, 0, 113, 2],
+            root_delay_s: 0.0,
+            root_dispersion_s: 0.25,
+        };
+    }
+    let reply = build_reply(&req, peer(2), recv, &state, &SystemClock).expect("reply");
+    let p = NtpPacket::parse(&reply).expect("parse");
+    assert_eq!(p.leap, LeapIndicator::NoWarning);
+    assert_eq!(p.stratum, 3);
+    assert_eq!(p.reference_id, [203, 0, 113, 2]);
+    assert!((p.root_dispersion.to_seconds() - 0.25).abs() < 0.001);
 }
 
 #[test]
@@ -315,7 +353,11 @@ fn forged_authenticator_gets_no_answer() {
 }
 
 #[test]
-fn unknown_cookie_gets_no_answer() {
+fn unknown_cookie_gets_an_nts_nak() {
+    // RFC 8915 §5.7: a cookie the server cannot redeem (its master keys have
+    // changed, as after a restart without --state) is answered with an NTS NAK
+    // so the client renews at once. The NAK says nothing about the time,
+    // carries no authenticator and is never larger than the request.
     let state = test_state();
     let keys = NtsKeys {
         c2s: [0x11; 32],
@@ -332,7 +374,22 @@ fn unknown_cookie_gets_no_answer() {
     let header = NtpPacket::client_request(4, NtpTimestamp(1)).to_bytes();
     let request = session.protect(&header).expect("protect");
     let recv = NtpTimestamp::from_unix(1_756_224_000, 0);
-    assert!(build_reply(&request, peer(7), recv, &state, &SystemClock).is_none());
+    let reply = build_reply(&request, peer(7), recv, &state, &SystemClock).expect("a NAK");
+    let p = NtpPacket::parse(&reply).expect("parse");
+    assert_eq!(p.stratum, 0, "a kiss, not a time source");
+    assert_eq!(&p.reference_id, b"NTSN");
+    assert_eq!(p.origin_ts, NtpTimestamp(1), "tied to the request");
+    assert!(reply.len() <= request.len(), "never an amplifier");
+    let uid = |packet: &[u8]| {
+        ef::fields(packet)
+            .find(|f| f.field_type == ef::field_type::UNIQUE_IDENTIFIER)
+            .map(|f| f.body.to_vec())
+    };
+    assert_eq!(uid(&reply), uid(&request), "echoes the unique identifier");
+    assert!(
+        session.verify(&reply).is_err(),
+        "a NAK is unauthenticated and must never verify"
+    );
 }
 
 #[test]

@@ -97,12 +97,35 @@ pub fn establish_with_roots(
     timeout: Duration,
     extra_roots: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<KeResult, KeError> {
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| KeError::BadServerName(host.to_string()))?;
-
     // The provider choice lives in `tls`, not here (see that module).
     let config = crate::tls::client_config_with_roots(&[ALPN], extra_roots)
         .map_err(|e| KeError::Tls(e.to_string()))?;
+    establish_with_config(host, port, timeout, config)
+}
+
+/// As [`establish_with_roots`], judging the certificates' validity dates at
+/// the chain's own time instead of the local clock
+/// ([`crate::tls::client_config_ignoring_cert_dates`]): for a client whose
+/// clock is known to be wrong because NTS is about to set it.
+pub fn establish_ignoring_cert_dates(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<KeResult, KeError> {
+    let config = crate::tls::client_config_ignoring_cert_dates(&[ALPN], extra_roots)
+        .map_err(|e| KeError::Tls(e.to_string()))?;
+    establish_with_config(host, port, timeout, config)
+}
+
+fn establish_with_config(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    config: rustls::ClientConfig,
+) -> Result<KeResult, KeError> {
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|_| KeError::BadServerName(host.to_string()))?;
 
     let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
         .map_err(|e| KeError::Tls(e.to_string()))?;

@@ -18,6 +18,10 @@ pub mod ke;
 #[cfg(feature = "ke")]
 pub mod tls;
 
+/// Certificate validity windows, for `tls::client_config_ignoring_cert_dates`.
+#[cfg(feature = "ke")]
+mod dates;
+
 /// ALPN identifier for NTS-KE (RFC 8915 §4).
 pub const ALPN: &[u8] = b"ntske/1";
 /// NTS-KE TCP port (RFC 8915 §4).

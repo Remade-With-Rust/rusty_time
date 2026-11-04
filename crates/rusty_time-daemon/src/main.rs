@@ -10,6 +10,7 @@ mod gateway;
 mod nts_session;
 mod query;
 mod refclock_cmd;
+mod refid;
 mod server;
 mod service;
 mod service_cmd;
@@ -72,6 +73,8 @@ fn usage() {
     eprintln!("                    [--gateway ADDR] [--gateway-assets DIR]");
     eprintln!("       rtimed sync <server>... [--dry-run] [--seconds N] [--minpoll N]");
     eprintln!("                   [--maxpoll N] [--makestep T N] [--verbose]");
+    eprintln!("                   [--serve ADDR]  (answer NTP with the clock it steers)");
+    eprintln!("                   [--nts] [--ke-port N] [--nts-ca FILE] [--nocerttimecheck]");
     eprintln!("       rtimed state <show|merge> ...");
     eprintln!("       rtimed service <show|install|path>");
     eprintln!("       rtimed refclock <shm|sock|phc> ...");

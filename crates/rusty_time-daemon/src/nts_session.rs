@@ -59,18 +59,43 @@ impl NtsSession {
     ) -> Result<Self, NtsSessionError> {
         let result = ke::establish_with_roots(ke_host, ke_port, timeout, extra_roots)
             .map_err(NtsSessionError::Ke)?;
-        Ok(NtsSession {
+        Ok(Self::from_ke(ke_host, result))
+    }
+
+    /// As [`establish`](Self::establish), judging the KE certificates' dates at
+    /// the chain's own time: only for a clock not yet set (`--nocerttimecheck`).
+    pub fn establish_ignoring_cert_dates(
+        ke_host: &str,
+        ke_port: u16,
+        timeout: Duration,
+        extra_roots: &[rusty_time_nts::tls::pki_types::CertificateDer<'static>],
+    ) -> Result<Self, NtsSessionError> {
+        let result = ke::establish_ignoring_cert_dates(ke_host, ke_port, timeout, extra_roots)
+            .map_err(NtsSessionError::Ke)?;
+        Ok(Self::from_ke(ke_host, result))
+    }
+
+    fn from_ke(ke_host: &str, result: ke::KeResult) -> Self {
+        NtsSession {
             keys: result.keys,
             cookies: result.cookies.into(),
             pending_unique_id: [0u8; UNIQUE_ID_LEN],
             ntp_server: result.ntp_server,
             ntp_port: result.ntp_port,
             ke_host: ke_host.to_string(),
-        })
+        }
     }
 
     pub fn cookies_held(&self) -> usize {
         self.cookies.len()
+    }
+
+    /// Drop every cookie, so the next [`protect`](Self::protect) asks for key
+    /// establishment. For an NTS NAK: the server can no longer redeem our
+    /// cookies (its master keys changed), so spending the rest one lost
+    /// exchange at a time only delays the inevitable renewal.
+    pub fn forget_cookies(&mut self) {
+        self.cookies.clear();
     }
 
     /// The session keys. Needed to persist a resumable session — a saved

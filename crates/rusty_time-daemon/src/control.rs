@@ -339,6 +339,7 @@ mod tests {
             clients: ClientTable::new(64, RateLimitConfig::default()),
             ring,
             stratum: 2,
+            upstream: crate::server::Upstream::REFERENCE,
             started_unix: 1_000,
         })))
     }

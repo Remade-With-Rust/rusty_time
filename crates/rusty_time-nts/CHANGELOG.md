@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/Remade-With-Rust/rusty_time/compare/rusty_time-nts-v0.3.1...rusty_time-nts-v0.3.2) - 2026-11-04
+
+### Added
+
+- *(daemon)* run as a router's time daemon ([#15](https://github.com/Remade-With-Rust/rusty_time/pull/15))
+
 ## [0.3.0] - 2026-10-08
 
 ### Changed

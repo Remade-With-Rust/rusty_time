@@ -1911,9 +1911,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty_alloc"
-version = "2.4.0"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af775820e14adea82b15c22e9d2815cb85976c12285c30caa327f4d441038969"
+checksum = "fbc3c5d570c6a698fe1329b5abfbadeb3993723dc06af6c0dad541b2a34e1ff9"
 dependencies = [
  "libc",
  "portable-atomic",
@@ -1922,9 +1922,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_alloc-api"
-version = "2.4.0"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a5b07b04e499fe5ff94c9866fd3b39e148b02f978b42ee6f572f92d7e32b9f"
+checksum = "99a38e4517642f7c2123e8a27200b15f06d763b59ab7a33d57a2f82dd958e66d"
 dependencies = [
  "rusty_alloc",
 ]
@@ -1949,14 +1949,14 @@ source = "git+https://github.com/Remade-With-Rust/rusty_json_turbo?branch=master
 
 [[package]]
 name = "rusty_time-alloc"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "rusty_alloc-api",
 ]
 
 [[package]]
 name = "rusty_time-api"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-clock"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "libc",
  "rusty_time-core",
@@ -1973,11 +1973,11 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-core"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "rusty_time-ctl"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "rusty_time-alloc",
  "rusty_time-api",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-daemon"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-nts"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aes-siv",
  "getrandom 0.4.3",
@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-sim"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "rusty_time-alloc",
  "rusty_time-core",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_time-wasm"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "rusty_time-core",
  "wasm-bindgen",
